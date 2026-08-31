@@ -109,6 +109,8 @@ STATE = {
 JOB_Q: queue.Queue[dict] = queue.Queue(maxsize=32)
 SYNC_PENDING_LOCK = threading.RLock()
 SYNC_PENDING = False
+RESTORE_REFRESH_LOCK = threading.RLock()
+RESTORE_REFRESH_RUNNING = False
 CACHE_DIR = Path(os.getenv("WORKER_CACHE_DIR", "/tmp/vys260_worker") or "/tmp/vys260_worker")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_LATEST = CACHE_DIR / "latest_bot_state.sqlite3.gz"
@@ -543,6 +545,25 @@ def mega_warmup_once() -> None:
                 STATE["mega_warmup_at"] = time.time()
             print(f"[WORKER MEGA] warmup failed {type(exc).__name__}", flush=True)
 
+def _restore_refresh_background() -> None:
+    global RESTORE_REFRESH_RUNNING
+    try:
+        mega_warmup_once()
+    finally:
+        with RESTORE_REFRESH_LOCK:
+            RESTORE_REFRESH_RUNNING = False
+
+
+def _schedule_restore_refresh() -> bool:
+    global RESTORE_REFRESH_RUNNING
+    with RESTORE_REFRESH_LOCK:
+        if RESTORE_REFRESH_RUNNING:
+            return False
+        RESTORE_REFRESH_RUNNING = True
+    threading.Thread(target=_restore_refresh_background, name="v260-worker-restore-refresh", daemon=True).start()
+    return True
+
+
 def peer_loop() -> None:
     time.sleep(5)
     while True:
@@ -620,24 +641,24 @@ def internal_restore_latest():
         return {"ok": False}, 404
     cache_max_age = env_int("WORKER_RESTORE_CACHE_MAX_AGE_SEC", 120, 0, 3600)
     use_cache = CACHE_LATEST.exists() and cache_max_age > 0 and time.time() - CACHE_LATEST.stat().st_mtime <= cache_max_age
-    path = CACHE_LATEST if use_cache else None
-    detail = "worker cache"
-    if path is None:
-        with MEGA_LOCK:
-            layout_ok, layout_detail = _mega_prepare_layout_locked()
-            if layout_ok and not mega_path_exists(remote_latest()):
-                _mega_try_migrate_legacy_latest_locked()
-            if layout_ok and mega_path_exists(remote_latest()):
-                path, detail = _mega_download_latest_locked()
-            else:
-                path, detail = None, (layout_detail if not layout_ok else f"no latest snapshot in {mega_root()}")
-    if not path or not path.exists():
-        return {"ok": False, "error": detail}, 503
-    payload = path.read_bytes()
+    if not use_cache:
+        # Never block an HTTP restore request on MEGAcmd login/download. The front
+        # has its own cold-MEGA fallback; keeping this endpoint fast prevents its
+        # 12-second request timeout and avoids stacking concurrent MEGA sessions.
+        started = _schedule_restore_refresh()
+        with STATE_LOCK:
+            detail = str(STATE.get("mega_warmup_detail") or "restore cache not ready")[:180]
+        return {"ok": False, "error": detail, "refresh_queued": bool(started)}, 503
+    path = CACHE_LATEST
+    try:
+        payload = path.read_bytes()
+    except Exception as exc:
+        _schedule_restore_refresh()
+        return {"ok": False, "error": f"restore cache read {type(exc).__name__}"}, 503
     resp = Response(payload, status=200, mimetype="application/gzip")
     resp.headers["Content-Disposition"] = 'attachment; filename="latest_bot_state.sqlite3.gz"'
     resp.headers["X-Worker-Version"] = TRANSPORT_VERSION
-    resp.headers["X-Restore-Source"] = detail
+    resp.headers["X-Restore-Source"] = "worker-cache"
     resp.headers["X-SHA256"] = hashlib.sha256(payload).hexdigest()
     return resp
 
