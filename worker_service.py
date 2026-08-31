@@ -34,6 +34,7 @@ from flask import Flask, request, Response
 
 app = Flask(__name__)
 VERSION = "выс-260-worker"
+TRANSPORT_VERSION = "vys-260-worker"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -118,31 +119,72 @@ def run_cmd(args, timeout=120):
 
 
 def mega_login() -> tuple[bool, str]:
+    """Ensure a MEGAcmd session without leaking credentials into logs.
+
+    Prefer MEGA_SESSION when configured. For email/password login, clear any stale
+    MEGAcmd session and retry once on API_EARGS/Invalid argument. This is safe on
+    the dedicated worker because MEGA commands are serialized by MEGA_LOCK.
+    """
     login_timeout = env_int("MEGA_LOGIN_TIMEOUT", 120, 30, 300)
     try:
         who = run_cmd(["mega-whoami"], timeout=min(20, login_timeout))
     except FileNotFoundError:
         return False, "MEGAcmd not installed"
     except subprocess.TimeoutExpired:
-        return False, "mega-whoami timeout"
-    except Exception as exc:
-        return False, f"mega-whoami {type(exc).__name__}"
-    if who.returncode == 0:
+        who = None
+    except Exception:
+        who = None
+    if who is not None and who.returncode == 0:
         return True, "already logged in"
+
+    session = str(os.getenv("MEGA_SESSION", "") or "").strip()
     email = str(os.getenv("MEGA_EMAIL", "") or "").strip()
     password = str(os.getenv("MEGA_PASSWORD", "") or "").strip()
-    if not email or not password:
-        return False, "MEGA_EMAIL/MEGA_PASSWORD missing"
+    if not session and (not email or not password):
+        return False, "MEGA_SESSION or MEGA_EMAIL/MEGA_PASSWORD missing"
+
+    def _attempt_login():
+        args = ["mega-login", session] if session else ["mega-login", email, password]
+        return run_cmd(args, timeout=login_timeout)
+
+    # A Render process can inherit a half-open MEGAcmd server/cache after a process
+    # restart. Clear it before the first credential login; errors are harmless.
     try:
-        login = run_cmd(["mega-login", email, password], timeout=login_timeout)
+        run_cmd(["mega-logout"], timeout=20)
+    except Exception:
+        pass
+
+    try:
+        login = _attempt_login()
     except subprocess.TimeoutExpired:
-        # Never stringify TimeoutExpired: its command can contain the password.
         return False, f"mega-login timeout after {login_timeout}s"
     except Exception as exc:
         return False, f"mega-login {type(exc).__name__}"
-    if login.returncode != 0:
-        return False, (login.stderr or login.stdout or "mega-login failed")[:240]
-    return True, "login OK"
+
+    if login.returncode == 0:
+        return True, "login OK"
+
+    first_error = (login.stderr or login.stdout or "mega-login failed")[:240]
+    if "invalid argument" in first_error.casefold():
+        # One clean retry deals with a stale daemon/session. Never stringify the
+        # command or credentials in diagnostics.
+        try:
+            run_cmd(["mega-logout"], timeout=20)
+        except Exception:
+            pass
+        time.sleep(1.0)
+        try:
+            retry = _attempt_login()
+        except subprocess.TimeoutExpired:
+            return False, f"mega-login retry timeout after {login_timeout}s"
+        except Exception as exc:
+            return False, f"mega-login retry {type(exc).__name__}"
+        if retry.returncode == 0:
+            return True, "login OK after clean retry"
+        retry_error = (retry.stderr or retry.stdout or first_error)[:240]
+        return False, "mega-login rejected (Invalid argument); check MEGA credentials/MFA or use MEGA_SESSION" if "invalid argument" in retry_error.casefold() else retry_error
+
+    return False, first_error
 
 
 def mega_path_exists(path: str) -> bool:
@@ -594,7 +636,7 @@ def internal_restore_latest():
     payload = path.read_bytes()
     resp = Response(payload, status=200, mimetype="application/gzip")
     resp.headers["Content-Disposition"] = 'attachment; filename="latest_bot_state.sqlite3.gz"'
-    resp.headers["X-Worker-Version"] = VERSION
+    resp.headers["X-Worker-Version"] = TRANSPORT_VERSION
     resp.headers["X-Restore-Source"] = detail
     resp.headers["X-SHA256"] = hashlib.sha256(payload).hexdigest()
     return resp
