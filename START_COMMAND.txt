@@ -1,0 +1,2 @@
+Docker runtime: CMD in Dockerfile runs python worker_service.py
+Manual Start Command (if needed): python worker_service.py

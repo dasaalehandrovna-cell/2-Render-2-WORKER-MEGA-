@@ -65,7 +65,7 @@ def front_base() -> str:
 
 
 def mega_root() -> str:
-    return "/" + str(os.getenv("MEGA_BACKUP_DIR", "TelegramBotBackups") or "TelegramBotBackups").strip("/")
+    return "/" + str(os.getenv("MEGA_BACKUP_DIR", "TelegramBotBackups-2T") or "TelegramBotBackups-2T").strip("/")
 
 
 def remote_db_dir() -> str:
