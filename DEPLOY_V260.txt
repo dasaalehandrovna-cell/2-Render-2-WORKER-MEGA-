@@ -2,6 +2,6 @@
 Runtime on Render: Docker
 Dockerfile installs MEGAcmd for backup/restore.
 No Telegram bot token is required.
-MEGA root: /TelegramBotBackups-2T
+MEGA root: /TelegramBotBackups2-2
 Front: https://render-1-fast.onrender.com
 Start: python worker_service.py (Dockerfile CMD already set)

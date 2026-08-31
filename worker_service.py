@@ -65,7 +65,7 @@ def front_base() -> str:
 
 
 def mega_root() -> str:
-    return "/" + str(os.getenv("MEGA_BACKUP_DIR", "TelegramBotBackups-2T") or "TelegramBotBackups-2T").strip("/")
+    return "/" + str(os.getenv("MEGA_BACKUP_DIR", "TelegramBotBackups2-2") or "TelegramBotBackups2-2").strip("/")
 
 
 def remote_db_dir() -> str:
@@ -77,6 +77,7 @@ def remote_latest() -> str:
 
 
 STATE_LOCK = threading.RLock()
+MEGA_LOCK = threading.RLock()
 STATE = {
     "started_at": time.time(),
     "peer_last_attempt": 0.0,
@@ -97,6 +98,12 @@ STATE = {
     "last_mega_upload_at": 0.0,
     "last_history_at": 0.0,
     "last_restore_download_at": 0.0,
+    "mega_layout_ok": False,
+    "mega_layout_at": 0.0,
+    "mega_root": "",
+    "mega_snapshot_present": False,
+    "mega_migrated_from": "",
+    "mega_migrated_at": 0.0,
 }
 JOB_Q: queue.Queue[dict] = queue.Queue(maxsize=32)
 SYNC_PENDING_LOCK = threading.RLock()
@@ -111,30 +118,153 @@ def run_cmd(args, timeout=120):
 
 
 def mega_login() -> tuple[bool, str]:
+    login_timeout = env_int("MEGA_LOGIN_TIMEOUT", 120, 30, 300)
     try:
-        who = run_cmd(["mega-whoami"], timeout=10)
+        who = run_cmd(["mega-whoami"], timeout=min(20, login_timeout))
     except FileNotFoundError:
         return False, "MEGAcmd not installed"
+    except subprocess.TimeoutExpired:
+        return False, "mega-whoami timeout"
     except Exception as exc:
-        return False, str(exc)[:200]
+        return False, f"mega-whoami {type(exc).__name__}"
     if who.returncode == 0:
         return True, "already logged in"
     email = str(os.getenv("MEGA_EMAIL", "") or "").strip()
     password = str(os.getenv("MEGA_PASSWORD", "") or "").strip()
     if not email or not password:
         return False, "MEGA_EMAIL/MEGA_PASSWORD missing"
-    login = run_cmd(["mega-login", email, password], timeout=45)
+    try:
+        login = run_cmd(["mega-login", email, password], timeout=login_timeout)
+    except subprocess.TimeoutExpired:
+        # Never stringify TimeoutExpired: its command can contain the password.
+        return False, f"mega-login timeout after {login_timeout}s"
+    except Exception as exc:
+        return False, f"mega-login {type(exc).__name__}"
     if login.returncode != 0:
         return False, (login.stderr or login.stdout or "mega-login failed")[:240]
     return True, "login OK"
 
 
-def ensure_mega_dir(path: str) -> None:
-    # mega-mkdir -p is supported by MEGAcmd; if an old build does not support -p,
-    # trying the exact path is still harmless when it already exists.
-    r = run_cmd(["mega-mkdir", "-p", path], timeout=30)
-    if r.returncode != 0:
-        run_cmd(["mega-mkdir", path], timeout=30)
+def mega_path_exists(path: str) -> bool:
+    try:
+        r = run_cmd(["mega-ls", path], timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_mega_dir(path: str) -> tuple[bool, str]:
+    # Create sequentially (root -> database -> history) so this also works on
+    # MEGAcmd builds where `mega-mkdir -p` is unavailable.
+    if mega_path_exists(path):
+        return True, "exists"
+    try:
+        r = run_cmd(["mega-mkdir", path], timeout=45)
+    except subprocess.TimeoutExpired:
+        return False, f"mega-mkdir timeout: {path}"
+    except Exception as exc:
+        return False, f"mega-mkdir {type(exc).__name__}: {path}"
+    if r.returncode == 0 or mega_path_exists(path):
+        return True, "created"
+    return False, f"mega-mkdir failed {path}: {(r.stderr or r.stdout or '')[:180]}"
+
+
+def mega_legacy_roots() -> list[str]:
+    raw = str(os.getenv("MEGA_LEGACY_BACKUP_DIRS", "/TelegramBotBackups-2T,/TelegramBotBackups") or "")
+    out = []
+    current = mega_root()
+    for item in raw.split(","):
+        item = "/" + str(item or "").strip().strip("/")
+        if item != "/" and item != current and item not in out:
+            out.append(item)
+    return out
+
+
+def _mega_prepare_layout_locked() -> tuple[bool, str]:
+    ok, detail = mega_login()
+    if not ok:
+        return False, detail
+    for path in (mega_root(), remote_db_dir(), remote_db_dir() + "/history"):
+        ok_dir, dir_detail = ensure_mega_dir(path)
+        if not ok_dir:
+            return False, dir_detail
+    with STATE_LOCK:
+        STATE["mega_layout_ok"] = True
+        STATE["mega_layout_at"] = time.time()
+        STATE["mega_root"] = mega_root()
+    return True, f"MEGA layout ready: {mega_root()}"
+
+
+def _mega_promote_legacy_remote_locked(src: str, root: str) -> tuple[bool, str]:
+    """Copy an old remote gzip into the new root without deleting the old copy."""
+    name = src.rsplit("/", 1)[-1]
+    try:
+        cp = run_cmd(["mega-cp", src, remote_db_dir()], timeout=120)
+    except subprocess.TimeoutExpired:
+        return False, f"legacy copy timeout from {root}"
+    if cp.returncode != 0:
+        return False, f"legacy copy failed from {root}"
+    copied = remote_db_dir().rstrip("/") + "/" + name
+    if copied != remote_latest():
+        try:
+            mv = run_cmd(["mega-mv", copied, remote_latest()], timeout=60)
+        except subprocess.TimeoutExpired:
+            return False, f"legacy promote timeout from {root}"
+        if mv.returncode != 0 and not mega_path_exists(remote_latest()):
+            return False, f"legacy promote failed from {root}"
+    if mega_path_exists(remote_latest()):
+        with STATE_LOCK:
+            STATE["mega_migrated_from"] = root
+            STATE["mega_migrated_at"] = time.time()
+        return True, f"copied legacy snapshot from {root}"
+    return False, f"legacy snapshot not visible after copy from {root}"
+
+
+def _mega_manifest_generation_remote_locked(root: str) -> str:
+    manifest_remote = root.rstrip("/") + "/database/current_manifest.json"
+    if not mega_path_exists(manifest_remote):
+        return ""
+    workdir = Path(tempfile.mkdtemp(prefix="v260_worker_legacy_manifest_"))
+    try:
+        get = run_cmd(["mega-get", manifest_remote, str(workdir)], timeout=90)
+        if get.returncode != 0:
+            return ""
+        rows = list(workdir.rglob("current_manifest.json")) + list(workdir.rglob("*.json"))
+        if not rows:
+            return ""
+        try:
+            payload = json.loads(rows[0].read_text(encoding="utf-8")) or {}
+        except Exception:
+            return ""
+        remote_generation = str(payload.get("remote_generation") or "").strip()
+        if remote_generation:
+            return remote_generation
+        generation = str(payload.get("generation") or "").strip()
+        if generation:
+            return root.rstrip("/") + "/database/generations/" + generation
+        return ""
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _mega_try_migrate_legacy_latest_locked() -> tuple[bool, str]:
+    # First launch helper: when the new root is empty, copy (never move/delete)
+    # from the old layout. Prefer the legacy mirror, then the v242 immutable
+    # current_manifest -> generation path used by recent bot versions.
+    if mega_path_exists(remote_latest()):
+        return True, "latest already present"
+    for root in mega_legacy_roots():
+        legacy_latest = root.rstrip("/") + "/database/latest_bot_state.sqlite3.gz"
+        if mega_path_exists(legacy_latest):
+            ok, detail = _mega_promote_legacy_remote_locked(legacy_latest, root)
+            if ok:
+                return ok, detail
+        generation_remote = _mega_manifest_generation_remote_locked(root)
+        if generation_remote and mega_path_exists(generation_remote):
+            ok, detail = _mega_promote_legacy_remote_locked(generation_remote, root)
+            if ok:
+                return ok, detail
+    return False, "no legacy latest/current_manifest snapshot found"
 
 
 def quick_check_gzip(gz_path: Path) -> tuple[bool, str, dict]:
@@ -193,13 +323,14 @@ def fetch_front_snapshot() -> tuple[Path | None, str, dict]:
         return None, f"front {type(exc).__name__}: {str(exc)[:220]}", {}
 
 
-def mega_promote_snapshot(local_gz: Path) -> tuple[bool, str]:
+def _mega_promote_snapshot_locked(local_gz: Path) -> tuple[bool, str]:
     ok, detail = mega_login()
     if not ok:
         return False, detail
     dbdir = remote_db_dir()
-    ensure_mega_dir(dbdir)
-    ensure_mega_dir(dbdir + "/history")
+    layout_ok, layout_detail = _mega_prepare_layout_locked()
+    if not layout_ok:
+        return False, layout_detail
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     tmp_name = f"incoming_{stamp}_{os.getpid()}.sqlite3.gz"
     tmp_remote = dbdir + "/" + tmp_name
@@ -234,6 +365,16 @@ def mega_promote_snapshot(local_gz: Path) -> tuple[bool, str]:
     return True, "MEGA latest promoted"
 
 
+
+def mega_promote_snapshot(local_gz: Path) -> tuple[bool, str]:
+    with MEGA_LOCK:
+        try:
+            return _mega_promote_snapshot_locked(local_gz)
+        except subprocess.TimeoutExpired:
+            return False, "MEGA upload command timeout"
+        except Exception as exc:
+            return False, f"MEGA upload {type(exc).__name__}"
+
 def sync_state_job(job: dict) -> tuple[bool, str]:
     snap, detail, meta = fetch_front_snapshot()
     if not snap:
@@ -254,7 +395,7 @@ def sync_state_job(job: dict) -> tuple[bool, str]:
         snap.unlink(missing_ok=True)
 
 
-def mega_download_latest() -> tuple[Path | None, str]:
+def _mega_download_latest_locked() -> tuple[Path | None, str]:
     ok, detail = mega_login()
     if not ok:
         return None, detail
@@ -279,6 +420,16 @@ def mega_download_latest() -> tuple[Path | None, str]:
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
+
+
+def mega_download_latest() -> tuple[Path | None, str]:
+    with MEGA_LOCK:
+        try:
+            return _mega_download_latest_locked()
+        except subprocess.TimeoutExpired:
+            return None, "MEGA download command timeout"
+        except Exception as exc:
+            return None, f"MEGA download {type(exc).__name__}"
 
 def process_job(job: dict) -> None:
     global SYNC_PENDING
@@ -320,6 +471,35 @@ def worker_loop() -> None:
         finally:
             JOB_Q.task_done()
 
+
+
+def mega_warmup_once() -> None:
+    # On a clean MEGA account/root, create the complete directory structure first.
+    # Absence of latest_bot_state.sqlite3.gz is normal on first launch.
+    time.sleep(1.0)
+    with MEGA_LOCK:
+        try:
+            layout_ok, detail = _mega_prepare_layout_locked()
+            path = None
+            if layout_ok:
+                if not mega_path_exists(remote_latest()):
+                    _mega_try_migrate_legacy_latest_locked()
+                if mega_path_exists(remote_latest()):
+                    path, detail = _mega_download_latest_locked()
+                else:
+                    detail = f"MEGA layout ready; no latest snapshot yet in {mega_root()}"
+            with STATE_LOCK:
+                STATE["mega_warmup_ok"] = bool(layout_ok)
+                STATE["mega_snapshot_present"] = bool(path)
+                STATE["mega_warmup_detail"] = str(detail)[:220]
+                STATE["mega_warmup_at"] = time.time()
+            print(f"[WORKER MEGA] warmup layout={layout_ok} snapshot={bool(path)} {detail}", flush=True)
+        except Exception as exc:
+            with STATE_LOCK:
+                STATE["mega_warmup_ok"] = False
+                STATE["mega_warmup_detail"] = f"{type(exc).__name__}: {str(exc)[:180]}"
+                STATE["mega_warmup_at"] = time.time()
+            print(f"[WORKER MEGA] warmup failed {type(exc).__name__}", flush=True)
 
 def peer_loop() -> None:
     time.sleep(5)
@@ -401,7 +581,14 @@ def internal_restore_latest():
     path = CACHE_LATEST if use_cache else None
     detail = "worker cache"
     if path is None:
-        path, detail = mega_download_latest()
+        with MEGA_LOCK:
+            layout_ok, layout_detail = _mega_prepare_layout_locked()
+            if layout_ok and not mega_path_exists(remote_latest()):
+                _mega_try_migrate_legacy_latest_locked()
+            if layout_ok and mega_path_exists(remote_latest()):
+                path, detail = _mega_download_latest_locked()
+            else:
+                path, detail = None, (layout_detail if not layout_ok else f"no latest snapshot in {mega_root()}")
     if not path or not path.exists():
         return {"ok": False, "error": detail}, 503
     payload = path.read_bytes()
@@ -423,6 +610,7 @@ def internal_status():
 
 threading.Thread(target=worker_loop, name="v260-worker-jobs", daemon=True).start()
 threading.Thread(target=peer_loop, name="v260-worker-peer", daemon=True).start()
+threading.Thread(target=mega_warmup_once, name="v260-worker-mega-warmup", daemon=True).start()
 
 if __name__ == "__main__":
     port = env_int("PORT", 10000, 1, 65535)

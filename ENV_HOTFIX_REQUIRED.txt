@@ -1,0 +1,8 @@
+# Render №2 WORKER — add/verify in Render Environment
+PEER_SERVICE_URL=https://fo-ug7k.onrender.com
+FRONT_SERVICE_URL=https://fo-ug7k.onrender.com
+MEGA_BACKUP_DIR=/TelegramBotBackups2-2
+MEGA_LEGACY_BACKUP_DIRS=/TelegramBotBackups-2T,/TelegramBotBackups
+MEGA_TIMEOUT=180
+MEGA_LOGIN_TIMEOUT=120
+# Keep the same PEER_SHARED_SECRET as FAST and your existing MEGA_EMAIL/MEGA_PASSWORD.

@@ -31,3 +31,11 @@ Pilot responsibilities in v260:
 6. return that snapshot to Render №1 during deploy restore.
 
 The generic `/internal/job` envelope is intentionally ready for the next stage (Excel/ZIP/journals), but v260 only accepts `sync_state` so that the first split deployment can be tested safely before moving user-facing file generators.
+
+
+## MEGA restore hotfix
+- MEGA login timeout is configurable with MEGA_LOGIN_TIMEOUT (default 120s).
+- Passwords are not included in timeout error messages.
+- Worker warms the latest MEGA snapshot cache in a background thread after HTTP startup.
+- MEGA operations are serialized to avoid concurrent MEGAcmd command races.
+- MEGA path: /TelegramBotBackups2-2.

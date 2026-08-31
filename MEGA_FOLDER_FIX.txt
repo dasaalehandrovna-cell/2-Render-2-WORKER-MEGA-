@@ -1,0 +1,7 @@
+выс-260 MEGA folder bootstrap fix
+MEGA_BACKUP_DIR=/TelegramBotBackups2-2
+On startup WORKER creates:
+/TelegramBotBackups2-2
+/TelegramBotBackups2-2/database
+/TelegramBotBackups2-2/database/history
+If new root has no latest snapshot, it copies (never moves/deletes) from legacy /TelegramBotBackups-2T or /TelegramBotBackups, supporting both legacy latest and current_manifest -> generation.

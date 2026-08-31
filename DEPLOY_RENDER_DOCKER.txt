@@ -1,0 +1,10 @@
+RENDER №2 WORKER — ОБЯЗАТЕЛЬНО
+1. Render Dashboard -> service render-2-worker-mega -> Settings -> Build -> Source -> Edit.
+2. Runtime = Docker.
+3. Dockerfile Path = ./Dockerfile (если поле показывается).
+4. Docker Command оставить пустым: используется CMD из Dockerfile.
+5. Environment хранить только в Render, .env в публичный GitHub НЕ загружать.
+6. Обязательно задать FRONT_SERVICE_URL=https://render-1-fast.onrender.com
+7. PEER_SERVICE_URL=https://render-1-fast.onrender.com
+8. PEER_SHARED_SECRET должен совпадать с первым Render.
+9. MEGA_BACKUP_DIR=/TelegramBotBackups2-2
