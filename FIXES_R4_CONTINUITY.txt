@@ -1,0 +1,8 @@
+VYS-262 R4 — FULL USER CONTINUITY AFTER DEPLOY
+
+Render #2 additions:
+- authenticated /internal/snapshot/upload for final graceful-deploy snapshot;
+- PRAGMA quick_check before accepting uploaded state;
+- immediate restore-cache install, asynchronous MEGA promotion;
+- monotonic runtime_continuity_v263 revision guard against cache regression;
+- valid stale cache can be served immediately while MEGA refresh runs.

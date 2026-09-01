@@ -18,3 +18,7 @@ Google setup:
 - Google refresh reuses an existing tab with the same period title instead of failing on duplicate `addSheet`.
 - Automatic v167/v261 refreshes now execute here using this service account.
 - State-sync coalescing is dirty-aware: if front changes while a snapshot is being uploaded, one follow-up snapshot is guaranteed.
+
+
+## R4 continuity cache
+Render #2 accepts `/internal/snapshot/upload` from the authenticated front, validates SQLite, installs it into restore cache immediately, then promotes it to MEGA asynchronously. Restore cache never regresses to an older continuity revision and can be served while a stale-cache refresh runs.

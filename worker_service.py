@@ -31,8 +31,8 @@ import requests
 from flask import Flask, request, Response
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r3'
-TRANSPORT_VERSION = 'vys-262-worker-r3'
+VERSION = 'vys-262-worker-r4-continuity'
+TRANSPORT_VERSION = 'vys-262-worker-r4-continuity'
 
 
 def env_bool(name, default=False):
@@ -64,6 +64,7 @@ STATE = {
     'sync_count':0, 'sync_failures':0, 'last_snapshot_sha256':'', 'last_snapshot_size':0, 'last_snapshot_at':0.0,
     'last_mega_upload_at':0.0, 'last_restore_download_at':0.0, 'mega_layout_ok':False, 'mega_warmup_ok':False,
     'google_jobs':0, 'google_failures':0, 'google_last_ok':0.0, 'google_last_error':'',
+    'cache_revision':0.0,
 }
 JOB_Q = queue.Queue(maxsize=32)
 GOOGLE_Q = queue.Queue(maxsize=16)
@@ -150,10 +151,19 @@ def quick_check_gzip(gz_path: Path):
     try:
         with gzip.open(gz_path,'rb') as src, open(raw,'wb') as dst: shutil.copyfileobj(src,dst,1024*1024)
         con = sqlite3.connect(str(raw))
-        try: row = con.execute('PRAGMA quick_check').fetchone()
+        continuity_revision = 0.0
+        try:
+            row = con.execute('PRAGMA quick_check').fetchone()
+            try:
+                meta_row = con.execute("SELECT v FROM meta WHERE kind=? AND k=?", ('runtime_continuity_v263','latest')).fetchone()
+                if meta_row:
+                    meta_payload = json.loads(meta_row[0]) if isinstance(meta_row[0], str) else (meta_row[0] or {})
+                    continuity_revision = float((meta_payload or {}).get('saved_at') or 0.0)
+            except Exception:
+                continuity_revision = 0.0
         finally: con.close()
         if not row or str(row[0]).lower() != 'ok': return False, f'quick_check={row}', {}
-        payload = gz_path.read_bytes(); return True, 'OK', {'sha256_gz':hashlib.sha256(payload).hexdigest(),'size':len(payload)}
+        payload = gz_path.read_bytes(); return True, 'OK', {'sha256_gz':hashlib.sha256(payload).hexdigest(),'size':len(payload),'revision':continuity_revision}
     except Exception as exc: return False, f'{type(exc).__name__}: {str(exc)[:180]}', {}
     finally: shutil.rmtree(work, ignore_errors=True)
 
@@ -224,7 +234,13 @@ def sync_state_job(job):
     try:
         ok, detail = mega_promote_snapshot(snap)
         if not ok: return False, detail
-        shutil.copy2(snap, CACHE_LATEST)
+        incoming_revision = float(meta.get('revision') or 0.0)
+        with STATE_LOCK:
+            current_revision = float(STATE.get('cache_revision') or 0.0)
+        if incoming_revision <= 0.0 or incoming_revision >= current_revision:
+            shutil.copy2(snap, CACHE_LATEST)
+            with STATE_LOCK:
+                STATE['cache_revision'] = max(current_revision, incoming_revision)
         with STATE_LOCK:
             STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or ''); STATE['last_snapshot_size'] = int(meta.get('size') or 0)
             STATE['last_snapshot_at'] = time.time(); STATE['last_mega_upload_at'] = time.time(); STATE['sync_count'] += 1
@@ -255,7 +271,13 @@ def _download_mega_latest():
                 if not check_ok:
                     last_detail = check_detail
                     continue
-                shutil.copy2(rows[0], CACHE_LATEST)
+                incoming_revision = float(meta.get('revision') or 0.0)
+                with STATE_LOCK:
+                    current_revision = float(STATE.get('cache_revision') or 0.0)
+                if incoming_revision <= 0.0 or incoming_revision >= current_revision or not CACHE_LATEST.exists():
+                    shutil.copy2(rows[0], CACHE_LATEST)
+                    with STATE_LOCK:
+                        STATE['cache_revision'] = max(current_revision, incoming_revision)
                 with STATE_LOCK:
                     STATE['last_restore_download_at'] = time.time()
                     STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or '')
@@ -272,8 +294,24 @@ def process_job(job):
     with STATE_LOCK:
         STATE['job_last_id']=jid; STATE['job_last_type']=kind; STATE['job_last_reason']=str(job.get('reason') or '')[:180]; STATE['job_last_started']=time.time(); STATE['job_last_error']=''
     try:
-        if kind == 'sync_state': ok, detail = sync_state_job(job)
-        else: ok, detail = False, f'unsupported job type: {kind}'
+        if kind == 'sync_state':
+            ok, detail = sync_state_job(job)
+        elif kind == 'promote_uploaded':
+            path = Path(str(job.get('path') or ''))
+            try:
+                if not path.exists():
+                    ok, detail = False, 'uploaded snapshot missing before promote'
+                else:
+                    ok, detail = mega_promote_snapshot(path)
+                    if ok:
+                        with STATE_LOCK:
+                            STATE['last_mega_upload_at'] = time.time()
+                            STATE['sync_count'] += 1
+            finally:
+                try: path.unlink(missing_ok=True)
+                except Exception: pass
+        else:
+            ok, detail = False, f'unsupported job type: {kind}'
         with STATE_LOCK:
             STATE['job_last_done']=time.time(); STATE['job_last_error']='' if ok else detail[:260]
             if not ok: STATE['sync_failures'] += 1
@@ -694,14 +732,74 @@ def internal_google_test():
     except Exception as exc:
         return {'ok':False,'error':str(exc)[:700]},502
 
+@app.route('/internal/snapshot/upload', methods=['POST'])
+def internal_snapshot_upload():
+    """Accept the final front SQLite snapshot directly during graceful deploy shutdown.
+
+    Cache is replaced immediately after validation, so a new front instance can restore
+    the exact last user state even while MEGA promotion continues in the worker queue.
+    """
+    if not authorized():
+        return {'ok':False},404
+    max_bytes = env_int('WORKER_SNAPSHOT_UPLOAD_MAX_MB',64,4,512) * 1024 * 1024
+    raw = request.get_data(cache=False, as_text=False) or b''
+    if not raw:
+        return {'ok':False,'error':'empty snapshot'},400
+    if len(raw) > max_bytes:
+        return {'ok':False,'error':f'snapshot too large: {len(raw)} > {max_bytes}'},413
+    fd, name = tempfile.mkstemp(prefix='vys262_uploaded_', suffix='.sqlite3.gz'); os.close(fd)
+    incoming = Path(name)
+    try:
+        incoming.write_bytes(raw)
+        ok, detail, meta = quick_check_gzip(incoming)
+        if not ok:
+            incoming.unlink(missing_ok=True)
+            return {'ok':False,'error':'invalid SQLite snapshot: '+str(detail)[:400]},400
+        incoming_revision = float(meta.get('revision') or 0.0)
+        with STATE_LOCK:
+            current_revision = float(STATE.get('cache_revision') or 0.0)
+        if incoming_revision <= 0.0 or incoming_revision >= current_revision or not CACHE_LATEST.exists():
+            tmp_cache = CACHE_DIR / f'.latest_{secrets.token_hex(6)}.tmp'
+            shutil.copy2(incoming, tmp_cache)
+            os.replace(tmp_cache, CACHE_LATEST)
+            with STATE_LOCK:
+                STATE['cache_revision'] = max(current_revision, incoming_revision)
+        with STATE_LOCK:
+            STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or '')
+            STATE['last_snapshot_size'] = int(meta.get('size') or len(raw))
+            STATE['last_snapshot_at'] = time.time()
+        job = {
+            'id': secrets.token_hex(8), 'type': 'promote_uploaded',
+            'reason': str(request.headers.get('X-Snapshot-Reason') or 'front_direct_upload')[:180],
+            'created_at': time.time(), 'path': str(incoming),
+        }
+        try:
+            JOB_Q.put_nowait(job)
+        except queue.Full:
+            # Cache is already exact; keep the file for a short best-effort promoter thread.
+            def _late_promote(path=str(incoming)):
+                p = Path(path)
+                try:
+                    mega_promote_snapshot(p)
+                finally:
+                    p.unlink(missing_ok=True)
+            threading.Thread(target=_late_promote, name='vys262-upload-promote', daemon=True).start()
+        return {'ok':True,'cached':True,'queued':True,'size':len(raw),'sha256':str(meta.get('sha256_gz') or ''),'revision':float(meta.get('revision') or 0.0)},202
+    except Exception as exc:
+        incoming.unlink(missing_ok=True)
+        return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:400]}'},500
+
+
 @app.route('/internal/restore/latest', methods=['GET'])
 def internal_restore_latest():
     if not authorized(): return {'ok':False},404
     cache_max_age=env_int('WORKER_RESTORE_CACHE_MAX_AGE_SEC',120,0,3600)
-    use_cache=CACHE_LATEST.exists() and cache_max_age>0 and time.time()-CACHE_LATEST.stat().st_mtime<=cache_max_age
-    if not use_cache:
-        started=_schedule_restore_refresh(); return {'ok':False,'error':'restore cache not ready','refresh_queued':bool(started)},503
-    payload=CACHE_LATEST.read_bytes(); resp=Response(payload,status=200,mimetype='application/gzip'); resp.headers['Content-Disposition']='attachment; filename="latest_bot_state.sqlite3.gz"'; resp.headers['X-Worker-Version']=TRANSPORT_VERSION; resp.headers['X-SHA256']=hashlib.sha256(payload).hexdigest(); return resp
+    if CACHE_LATEST.exists():
+        age=max(0.0,time.time()-CACHE_LATEST.stat().st_mtime)
+        if cache_max_age <= 0 or age > cache_max_age:
+            _schedule_restore_refresh()
+        payload=CACHE_LATEST.read_bytes(); resp=Response(payload,status=200,mimetype='application/gzip'); resp.headers['Content-Disposition']='attachment; filename="latest_bot_state.sqlite3.gz"'; resp.headers['X-Worker-Version']=TRANSPORT_VERSION; resp.headers['X-SHA256']=hashlib.sha256(payload).hexdigest(); resp.headers['X-Cache-Age-Sec']=str(int(age)); return resp
+    started=_schedule_restore_refresh(); return {'ok':False,'error':'restore cache not ready','refresh_queued':bool(started)},503
 
 @app.route('/internal/status', methods=['GET'])
 def internal_status():
