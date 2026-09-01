@@ -31,8 +31,8 @@ import requests
 from flask import Flask, request, Response
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r2'
-TRANSPORT_VERSION = 'vys-262-worker-r2'
+VERSION = 'vys-262-worker-r3'
+TRANSPORT_VERSION = 'vys-262-worker-r3'
 
 
 def env_bool(name, default=False):
@@ -69,7 +69,7 @@ JOB_Q = queue.Queue(maxsize=32)
 GOOGLE_Q = queue.Queue(maxsize=16)
 GOOGLE_JOB_LOCK = threading.RLock()
 GOOGLE_JOB_STATUS = {}
-SYNC_PENDING_LOCK = threading.RLock(); SYNC_PENDING = False
+SYNC_PENDING_LOCK = threading.RLock(); SYNC_PENDING = False; SYNC_DIRTY = False; SYNC_DIRTY_REASON = ''
 RESTORE_REFRESH_LOCK = threading.RLock(); RESTORE_REFRESH_RUNNING = False
 CACHE_DIR = Path(os.getenv('WORKER_CACHE_DIR','/tmp/vys262_worker') or '/tmp/vys262_worker'); CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_LATEST = CACHE_DIR / 'latest_bot_state.sqlite3.gz'
@@ -267,7 +267,7 @@ def _download_mega_latest():
 
 
 def process_job(job):
-    global SYNC_PENDING
+    global SYNC_PENDING, SYNC_DIRTY, SYNC_DIRTY_REASON
     jid, kind = str(job.get('id') or ''), str(job.get('type') or '')
     with STATE_LOCK:
         STATE['job_last_id']=jid; STATE['job_last_type']=kind; STATE['job_last_reason']=str(job.get('reason') or '')[:180]; STATE['job_last_started']=time.time(); STATE['job_last_error']=''
@@ -280,7 +280,24 @@ def process_job(job):
         print(f'[WORKER JOB] {jid} {kind} ok={ok} {detail}', flush=True)
     finally:
         if kind == 'sync_state':
-            with SYNC_PENDING_LOCK: SYNC_PENDING = False
+            followup = None
+            with SYNC_PENDING_LOCK:
+                if SYNC_DIRTY:
+                    reason = str(SYNC_DIRTY_REASON or 'coalesced_changes')[:180]
+                    SYNC_DIRTY = False
+                    SYNC_DIRTY_REASON = ''
+                    followup = {'id': secrets.token_hex(8), 'type': 'sync_state', 'reason': reason, 'created_at': time.time()}
+                    # Keep SYNC_PENDING=True while the follow-up is queued/running.
+                else:
+                    SYNC_PENDING = False
+            if followup is not None:
+                try:
+                    JOB_Q.put_nowait(followup)
+                except queue.Full:
+                    with SYNC_PENDING_LOCK:
+                        SYNC_PENDING = False
+                        SYNC_DIRTY = True
+                        SYNC_DIRTY_REASON = str(followup.get('reason') or 'queue_full')
 
 
 def worker_loop():
@@ -386,53 +403,134 @@ def _cat_fill(idx):
     rgb=palette[max(0,idx)%len(palette)]; return {'red':rgb[0],'green':rgb[1],'blue':rgb[2]}
 
 def create_google_sheet(body):
-    rows = body.get('rows') or []; layout = str(body.get('layout') or 'category').lower(); notes_raw = body.get('annotations') or {}; notes={}
-    for key,val in notes_raw.items():
+    """Create or refresh a named tab in the selected owner spreadsheet.
+
+    r2 always tried addSheet, so the next automatic Thu-Wed refresh failed with
+    "already exists". r3 reuses an existing tab with the same title and replaces
+    only that tab's managed grid. All Google network work stays on Render #2.
+    """
+    rows = body.get('rows') or []
+    layout = str(body.get('layout') or 'category').lower()
+    notes_raw = body.get('annotations') or {}
+    notes = {}
+    for key, val in notes_raw.items():
         try:
-            r,c = key.split(',',1); notes[(int(r),int(c))] = str(val)
-        except Exception: pass
-    token = _google_token(); spreadsheet_id = _sheet_id(body.get('spreadsheet_id')); headers={'Authorization':f'Bearer {token}','Content-Type':'application/json'}
-    info = _google_info(); meta = requests.get(f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}', headers=headers, params={'fields':'spreadsheetId,properties.title'}, timeout=45)
+            r, c = key.split(',', 1); notes[(int(r), int(c))] = str(val)
+        except Exception:
+            pass
+    token = _google_token()
+    spreadsheet_id = _sheet_id(body.get('spreadsheet_id'))
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    info = _google_info()
+    meta = requests.get(
+        f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}',
+        headers=headers,
+        params={'fields': 'spreadsheetId,properties.title,sheets.properties(sheetId,title,gridProperties)'},
+        timeout=45,
+    )
     if meta.status_code >= 300:
-        if meta.status_code in (401,403): raise RuntimeError(f'Google Sheets target access {meta.status_code}; share table with {info.get("client_email")}: {meta.text[:400]}')
+        if meta.status_code in (401, 403):
+            raise RuntimeError(f'Google Sheets target access {meta.status_code}; share table with {info.get("client_email")}: {meta.text[:400]}')
         raise RuntimeError(f'Google Sheets metadata {meta.status_code}: {meta.text[:400]}')
-    max_cols=max((len(r) for r in rows), default=1); row_count=max(100,len(rows)+20); col_count=max(26,max_cols+3); title=_tab_title(body.get('title'))
-    add = requests.post(f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate', headers=headers, json={'requests':[{'addSheet':{'properties':{'title':title,'gridProperties':{'rowCount':row_count,'columnCount':col_count,'frozenRowCount':1 if layout in {'compact','category_compact'} else 2}}}}]}, timeout=60)
-    if add.status_code >= 300: raise RuntimeError(f'Google Sheets add tab {add.status_code}: {add.text[:500]}')
-    try: sheet_id=int(add.json()['replies'][0]['addSheet']['properties']['sheetId'])
-    except Exception as exc: raise RuntimeError(f'Google Sheets missing sheetId: {exc}')
-    cell_rows=[]
-    for r_idx,row in enumerate(rows,start=1):
-        values=[]
-        for c_idx in range(1,max_cols+1):
-            value=row[c_idx-1] if c_idx-1 < len(row) else ''; cell={'userEnteredValue':_cell_value(value)}
-            note=str(notes.get((r_idx,c_idx)) or '').strip()
-            if note: cell['note']=note
-            if r_idx == 1: cell['userEnteredFormat']={'textFormat':{'bold':True}}
-            elif layout == 'category' and c_idx >= 4 and value not in ('',None): cell['userEnteredFormat']={'backgroundColor':_cat_fill(c_idx-4)}
-            elif layout == 'category_compact' and c_idx >= 3 and value not in ('',None): cell['userEnteredFormat']={'backgroundColor':_cat_fill(c_idx-3)}
-            elif layout == 'compact' and c_idx in (2,3) and value not in ('',None): cell['userEnteredFormat']={'backgroundColor':_cat_fill(c_idx-2)}
-            values.append(cell)
-        cell_rows.append({'values':values})
-    reqs=[{'updateCells':{'range':{'sheetId':sheet_id,'startRowIndex':0,'startColumnIndex':0},'rows':cell_rows,'fields':'userEnteredValue,note,userEnteredFormat'}},{'autoResizeDimensions':{'dimensions':{'sheetId':sheet_id,'dimension':'COLUMNS','startIndex':0,'endIndex':max_cols}}}]
-    upd = requests.post(f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate', headers=headers, json={'requests':reqs}, timeout=90)
-    if upd.status_code >= 300: raise RuntimeError(f'Google Sheets update {upd.status_code}: {upd.text[:500]}')
-    # Verify notes when requested, preserving original reliability semantics.
-    expected={(r,c):n.strip() for (r,c),n in notes.items() if n.strip()}
-    if expected:
-        escaped=title.replace("'","''")
-        verify=requests.get(f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}', headers=headers, params={'includeGridData':'true','ranges':f"'{escaped}'!A1:ZZ{max(1,len(rows))}",'fields':'sheets(data(rowData(values(note))))'}, timeout=60)
-        if verify.status_code >= 300: raise RuntimeError(f'Google Sheets note verify {verify.status_code}: {verify.text[:500]}')
-        actual={}
+    payload = meta.json() or {}
+    max_cols = max((len(r) for r in rows), default=1)
+    row_count = max(100, len(rows) + 20)
+    col_count = max(26, max_cols + 3)
+    title = _tab_title(body.get('title'))
+    existing = None
+    for sh in payload.get('sheets') or []:
+        props = (sh or {}).get('properties') or {}
+        if str(props.get('title') or '') == title:
+            existing = props
+            break
+    if existing:
+        sheet_id = int(existing.get('sheetId'))
+        grid = existing.get('gridProperties') or {}
+        clear_rows = max(row_count, int(grid.get('rowCount') or 0), len(rows) + 5)
+        clear_cols = max(col_count, int(grid.get('columnCount') or 0), max_cols + 2)
+        # Empty updateCells over a range clears the listed fields. This prevents
+        # stale values/notes from a longer previous export from surviving.
+        clear_req = {'updateCells': {'range': {
+            'sheetId': sheet_id, 'startRowIndex': 0, 'endRowIndex': clear_rows,
+            'startColumnIndex': 0, 'endColumnIndex': clear_cols,
+        }, 'fields': 'userEnteredValue,note,userEnteredFormat'}}
+    else:
+        add = requests.post(
+            f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate',
+            headers=headers,
+            json={'requests': [{'addSheet': {'properties': {'title': title, 'gridProperties': {
+                'rowCount': row_count, 'columnCount': col_count,
+                'frozenRowCount': 1 if layout in {'compact', 'category_compact'} else 2,
+            }}}}]},
+            timeout=60,
+        )
+        if add.status_code >= 300:
+            raise RuntimeError(f'Google Sheets add tab {add.status_code}: {add.text[:500]}')
         try:
-            row_data=((verify.json().get('sheets') or [{}])[0].get('data') or [{}])[0].get('rowData') or []
-            for r0,row_obj in enumerate(row_data,start=1):
-                for c0,cell in enumerate(row_obj.get('values') or [],start=1):
-                    note=str(cell.get('note') or '').strip()
-                    if note: actual[(r0,c0)] = note
-        except Exception as exc: raise RuntimeError(f'Google Sheets note verify parse: {exc}')
-        missing=[f'{r}:{c}' for (r,c),note in expected.items() if actual.get((r,c)) != note]
-        if missing: raise RuntimeError(f'Google Sheets notes not confirmed: {missing[:12]}')
+            sheet_id = int(add.json()['replies'][0]['addSheet']['properties']['sheetId'])
+        except Exception as exc:
+            raise RuntimeError(f'Google Sheets missing sheetId: {exc}')
+        clear_req = None
+
+    cell_rows = []
+    for r_idx, row in enumerate(rows, start=1):
+        values = []
+        for c_idx in range(1, max_cols + 1):
+            value = row[c_idx - 1] if c_idx - 1 < len(row) else ''
+            cell = {'userEnteredValue': _cell_value(value)}
+            note = str(notes.get((r_idx, c_idx)) or '').strip()
+            if note:
+                cell['note'] = note
+            if r_idx == 1:
+                cell['userEnteredFormat'] = {'textFormat': {'bold': True}}
+            elif layout == 'category' and c_idx >= 4 and value not in ('', None):
+                cell['userEnteredFormat'] = {'backgroundColor': _cat_fill(c_idx - 4)}
+            elif layout == 'category_compact' and c_idx >= 3 and value not in ('', None):
+                cell['userEnteredFormat'] = {'backgroundColor': _cat_fill(c_idx - 3)}
+            elif layout == 'compact' and c_idx in (2, 3) and value not in ('', None):
+                cell['userEnteredFormat'] = {'backgroundColor': _cat_fill(c_idx - 2)}
+            values.append(cell)
+        cell_rows.append({'values': values})
+
+    reqs = []
+    if clear_req:
+        reqs.append(clear_req)
+    reqs.extend([
+        {'updateCells': {'range': {'sheetId': sheet_id, 'startRowIndex': 0, 'startColumnIndex': 0},
+                         'rows': cell_rows, 'fields': 'userEnteredValue,note,userEnteredFormat'}},
+        {'autoResizeDimensions': {'dimensions': {'sheetId': sheet_id, 'dimension': 'COLUMNS',
+                                                 'startIndex': 0, 'endIndex': max_cols}}},
+    ])
+    upd = requests.post(
+        f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate',
+        headers=headers, json={'requests': reqs}, timeout=90,
+    )
+    if upd.status_code >= 300:
+        raise RuntimeError(f'Google Sheets update {upd.status_code}: {upd.text[:500]}')
+
+    expected = {(r, c): n.strip() for (r, c), n in notes.items() if n.strip()}
+    if expected:
+        escaped = title.replace("'", "''")
+        verify = requests.get(
+            f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}', headers=headers,
+            params={'includeGridData': 'true', 'ranges': f"'{escaped}'!A1:ZZ{max(1, len(rows))}",
+                    'fields': 'sheets(data(rowData(values(note))))'}, timeout=60,
+        )
+        if verify.status_code >= 300:
+            raise RuntimeError(f'Google Sheets note verify {verify.status_code}: {verify.text[:500]}')
+        actual = {}
+        try:
+            row_data = ((verify.json().get('sheets') or [{}])[0].get('data') or [{}])[0].get('rowData') or []
+            for r0, row_obj in enumerate(row_data, start=1):
+                for c0, cell in enumerate(row_obj.get('values') or [], start=1):
+                    note = str(cell.get('note') or '').strip()
+                    if note:
+                        actual[(r0, c0)] = note
+        except Exception as exc:
+            raise RuntimeError(f'Google Sheets note verify parse: {exc}')
+        missing = [f'{r}:{c}' for (r, c), note in expected.items() if actual.get((r, c)) != note]
+        if missing:
+            raise RuntimeError(f'Google Sheets notes not confirmed: {missing[:12]}')
     return f'https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={sheet_id}'
 
 
@@ -446,12 +544,15 @@ def health():
 
 @app.route('/internal/job', methods=['POST'])
 def internal_job():
-    global SYNC_PENDING
+    global SYNC_PENDING, SYNC_DIRTY, SYNC_DIRTY_REASON
     if not authorized(): return {'ok':False},404
     body=request.get_json(silent=True) or {}; kind=str(body.get('type') or '').strip()
     if kind != 'sync_state': return {'ok':False,'error':'unsupported job type','supported':['sync_state']},400
     with SYNC_PENDING_LOCK:
-        if SYNC_PENDING: return {'ok':True,'status':'coalesced','queue_size':JOB_Q.qsize()},202
+        if SYNC_PENDING:
+            SYNC_DIRTY = True
+            SYNC_DIRTY_REASON = str(body.get('reason') or 'coalesced_changes')[:180]
+            return {'ok':True,'status':'coalesced_dirty','queue_size':JOB_Q.qsize()},202
         SYNC_PENDING=True
     job={'id':secrets.token_hex(8),'type':kind,'reason':str(body.get('reason') or '')[:180],'created_at':time.time()}
     try: JOB_Q.put_nowait(job)
@@ -486,6 +587,7 @@ def _notify_front_google_result(job, ok, url='', error=''):
         'recipient_chat_id': (job.get('payload') or {}).get('recipient_chat_id'),
         'target_chat_id': (job.get('payload') or {}).get('target_chat_id'),
         'tenant_id': (job.get('payload') or {}).get('tenant_id'),
+        'notify_result': bool((job.get('payload') or {}).get('notify_result', True)),
     }
     for attempt in range(1, 4):
         try:
