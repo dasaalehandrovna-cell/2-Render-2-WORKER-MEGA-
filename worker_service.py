@@ -28,11 +28,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 import requests
+try:
+    import redis as _redis
+except Exception:
+    _redis = None
 from flask import Flask, request, Response
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r4-continuity'
-TRANSPORT_VERSION = 'vys-262-worker-r4-continuity'
+VERSION = 'vys-262-worker-r6-full-state'
+TRANSPORT_VERSION = 'vys-262-worker-r6-full-state'
 
 
 def env_bool(name, default=False):
@@ -65,6 +69,8 @@ STATE = {
     'last_mega_upload_at':0.0, 'last_restore_download_at':0.0, 'mega_layout_ok':False, 'mega_warmup_ok':False,
     'google_jobs':0, 'google_failures':0, 'google_last_ok':0.0, 'google_last_error':'',
     'cache_revision':0.0,
+    'last_state_token':'', 'active_state_token':'', 'dirty_state_token':'', 'deduped_sync_requests':0,
+    'redis_cache_ok':False, 'redis_last_write':0.0, 'redis_last_read':0.0, 'redis_last_error':'',
 }
 JOB_Q = queue.Queue(maxsize=32)
 GOOGLE_Q = queue.Queue(maxsize=16)
@@ -75,6 +81,88 @@ RESTORE_REFRESH_LOCK = threading.RLock(); RESTORE_REFRESH_RUNNING = False
 CACHE_DIR = Path(os.getenv('WORKER_CACHE_DIR','/tmp/vys262_worker') or '/tmp/vys262_worker'); CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_LATEST = CACHE_DIR / 'latest_bot_state.sqlite3.gz'
 _GOOGLE_TOKEN = {'token':'','expires_at':0.0}
+_REDIS_CLIENT = None
+_REDIS_LOCK = threading.RLock()
+_REDIS_SNAPSHOT_KEY = str(os.getenv('WORKER_REDIS_SNAPSHOT_KEY','vys262:bot_state:latest_gz') or 'vys262:bot_state:latest_gz').strip()
+_REDIS_META_KEY = _REDIS_SNAPSHOT_KEY + ':meta'
+
+def _redis_client():
+    global _REDIS_CLIENT
+    if _redis is None:
+        return None
+    url = str(os.getenv('REDIS_URL','') or '').strip()
+    if not url:
+        return None
+    with _REDIS_LOCK:
+        if _REDIS_CLIENT is None:
+            _REDIS_CLIENT = _redis.Redis.from_url(url, socket_connect_timeout=5, socket_timeout=12, health_check_interval=30)
+        return _REDIS_CLIENT
+
+def redis_store_snapshot(local_gz: Path, meta: dict):
+    client = _redis_client()
+    if client is None:
+        return False, 'REDIS_URL not configured'
+    try:
+        payload = local_gz.read_bytes()
+        max_bytes = env_int('WORKER_REDIS_SNAPSHOT_MAX_MB',16,1,128) * 1024 * 1024
+        if len(payload) > max_bytes:
+            return False, f'snapshot too large for Redis: {len(payload)} > {max_bytes}'
+        row = {
+            'revision': float((meta or {}).get('revision') or 0.0),
+            'sha256_gz': str((meta or {}).get('sha256_gz') or hashlib.sha256(payload).hexdigest()),
+            'size': len(payload), 'saved_at': time.time(), 'version': TRANSPORT_VERSION,
+        }
+        pipe = client.pipeline(transaction=True)
+        pipe.set(_REDIS_SNAPSHOT_KEY, payload)
+        pipe.set(_REDIS_META_KEY, json.dumps(row, separators=(',',':')))
+        pipe.execute()
+        with STATE_LOCK:
+            STATE['redis_cache_ok'] = True; STATE['redis_last_write'] = time.time(); STATE['redis_last_error'] = ''
+        return True, 'Redis snapshot cached'
+    except Exception as exc:
+        with STATE_LOCK:
+            STATE['redis_cache_ok'] = False; STATE['redis_last_error'] = f'{type(exc).__name__}: {str(exc)[:220]}'
+        return False, STATE['redis_last_error']
+
+def redis_load_snapshot_to_cache():
+    client = _redis_client()
+    if client is None:
+        return False, 'REDIS_URL not configured'
+    fd, name = tempfile.mkstemp(prefix='vys262_redis_', suffix='.sqlite3.gz'); os.close(fd)
+    tmp = Path(name)
+    try:
+        payload = client.get(_REDIS_SNAPSHOT_KEY)
+        if not payload:
+            return False, 'Redis snapshot missing'
+        tmp.write_bytes(payload)
+        ok, detail, meta = quick_check_gzip(tmp)
+        if not ok:
+            return False, 'Redis snapshot invalid: ' + str(detail)[:240]
+        incoming_revision = float(meta.get('revision') or 0.0)
+        with STATE_LOCK:
+            current_revision = float(STATE.get('cache_revision') or 0.0)
+        cache_exists = CACHE_LATEST.exists()
+        accept = (not cache_exists) or current_revision <= 0.0 or (incoming_revision > 0.0 and incoming_revision >= current_revision)
+        if accept:
+            tmp_cache = CACHE_DIR / f'.redis_{secrets.token_hex(6)}.tmp'
+            shutil.copy2(tmp, tmp_cache); os.replace(tmp_cache, CACHE_LATEST)
+            with STATE_LOCK:
+                STATE['cache_revision'] = max(current_revision, incoming_revision)
+                STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or '')
+                STATE['last_snapshot_size'] = int(meta.get('size') or len(payload))
+        elif cache_exists:
+            with STATE_LOCK:
+                STATE['redis_cache_ok'] = True; STATE['redis_last_read'] = time.time(); STATE['redis_last_error'] = 'older Redis snapshot ignored'
+            return True, f'Redis snapshot older than live cache; kept cache revision={current_revision}'
+        with STATE_LOCK:
+            STATE['redis_cache_ok'] = True; STATE['redis_last_read'] = time.time(); STATE['redis_last_error'] = ''
+        return True, 'Redis latest OK'
+    except Exception as exc:
+        with STATE_LOCK:
+            STATE['redis_cache_ok'] = False; STATE['redis_last_error'] = f'{type(exc).__name__}: {str(exc)[:220]}'
+        return False, STATE['redis_last_error']
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def run_cmd(args, timeout=120):
@@ -154,16 +242,21 @@ def quick_check_gzip(gz_path: Path):
         continuity_revision = 0.0
         try:
             row = con.execute('PRAGMA quick_check').fetchone()
+            user_state_seq = 0
             try:
-                meta_row = con.execute("SELECT v FROM meta WHERE kind=? AND k=?", ('runtime_continuity_v263','latest')).fetchone()
-                if meta_row:
+                for kind in ('runtime_continuity_v263','user_state_shadow_v265'):
+                    meta_row = con.execute("SELECT v FROM meta WHERE kind=? AND k=?", (kind,'latest')).fetchone()
+                    if not meta_row:
+                        continue
                     meta_payload = json.loads(meta_row[0]) if isinstance(meta_row[0], str) else (meta_row[0] or {})
-                    continuity_revision = float((meta_payload or {}).get('saved_at') or 0.0)
+                    continuity_revision = max(continuity_revision, float((meta_payload or {}).get('saved_at') or 0.0))
+                    if kind == 'user_state_shadow_v265':
+                        user_state_seq = int((meta_payload or {}).get('seq') or 0)
             except Exception:
-                continuity_revision = 0.0
+                pass
         finally: con.close()
         if not row or str(row[0]).lower() != 'ok': return False, f'quick_check={row}', {}
-        payload = gz_path.read_bytes(); return True, 'OK', {'sha256_gz':hashlib.sha256(payload).hexdigest(),'size':len(payload),'revision':continuity_revision}
+        payload = gz_path.read_bytes(); return True, 'OK', {'sha256_gz':hashlib.sha256(payload).hexdigest(),'size':len(payload),'revision':continuity_revision,'user_state_seq':user_state_seq}
     except Exception as exc: return False, f'{type(exc).__name__}: {str(exc)[:180]}', {}
     finally: shutil.rmtree(work, ignore_errors=True)
 
@@ -181,6 +274,7 @@ def fetch_front_snapshot():
                 if chunk: fh.write(chunk)
         ok, detail, meta = quick_check_gzip(path)
         if not ok: return None, detail, meta
+        meta['state_token'] = str(r.headers.get('X-Split-State-Token') or '')[:120]
         # Caller owns the copied temp path, so move it out of disposable dir.
         fd, durable_name = tempfile.mkstemp(prefix='vys262_snapshot_', suffix='.sqlite3.gz'); os.close(fd)
         durable = Path(durable_name); shutil.copy2(path, durable)
@@ -230,22 +324,44 @@ def mega_promote_snapshot(local_gz: Path):
 
 def sync_state_job(job):
     snap, detail, meta = fetch_front_snapshot()
-    if not snap: return False, detail
+    if not snap:
+        return False, detail
     try:
-        ok, detail = mega_promote_snapshot(snap)
-        if not ok: return False, detail
         incoming_revision = float(meta.get('revision') or 0.0)
         with STATE_LOCK:
             current_revision = float(STATE.get('cache_revision') or 0.0)
-        if incoming_revision <= 0.0 or incoming_revision >= current_revision:
-            shutil.copy2(snap, CACHE_LATEST)
+        cache_exists = CACHE_LATEST.exists()
+        # Never let a delayed GET overwrite a newer direct-shutdown upload/cache.
+        if cache_exists and current_revision > 0.0 and (incoming_revision <= 0.0 or incoming_revision < current_revision):
+            fetched_token = str(meta.get('state_token') or job.get('state_token') or '')[:120]
             with STATE_LOCK:
-                STATE['cache_revision'] = max(current_revision, incoming_revision)
+                if fetched_token: STATE['last_state_token'] = fetched_token
+                STATE['deduped_sync_requests'] += 1
+            return True, f'stale snapshot ignored revision={incoming_revision} < cache={current_revision}'
+        # R6 durability order: validated front state becomes the restore source FIRST.
+        tmp_cache = CACHE_DIR / f'.sync_{secrets.token_hex(6)}.tmp'
+        shutil.copy2(snap, tmp_cache)
+        os.replace(tmp_cache, CACHE_LATEST)
         with STATE_LOCK:
-            STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or ''); STATE['last_snapshot_size'] = int(meta.get('size') or 0)
-            STATE['last_snapshot_at'] = time.time(); STATE['last_mega_upload_at'] = time.time(); STATE['sync_count'] += 1
-        return True, f"synced {meta.get('size',0)} bytes sha={str(meta.get('sha256_gz') or '')[:12]}"
-    finally: snap.unlink(missing_ok=True)
+            STATE['cache_revision'] = max(current_revision, incoming_revision)
+            STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or '')
+            STATE['last_snapshot_size'] = int(meta.get('size') or 0)
+            STATE['last_snapshot_at'] = time.time()
+            fetched_token = str(meta.get('state_token') or job.get('state_token') or '')[:120]
+            if fetched_token:
+                STATE['last_state_token'] = fetched_token
+        # Fast durable cache is written before slow archival MEGA.
+        redis_ok, redis_detail = redis_store_snapshot(CACHE_LATEST, meta)
+        mega_ok, mega_detail = mega_promote_snapshot(CACHE_LATEST)
+        with STATE_LOCK:
+            if mega_ok:
+                STATE['last_mega_upload_at'] = time.time()
+            else:
+                STATE['sync_failures'] += 1
+            STATE['sync_count'] += 1
+        return True, f"cached {meta.get('size',0)} bytes; redis={redis_ok}; mega={mega_ok}; {redis_detail}; {mega_detail}"
+    finally:
+        snap.unlink(missing_ok=True)
 
 
 def _download_mega_latest():
@@ -274,14 +390,23 @@ def _download_mega_latest():
                 incoming_revision = float(meta.get('revision') or 0.0)
                 with STATE_LOCK:
                     current_revision = float(STATE.get('cache_revision') or 0.0)
-                if incoming_revision <= 0.0 or incoming_revision >= current_revision or not CACHE_LATEST.exists():
-                    shutil.copy2(rows[0], CACHE_LATEST)
+                cache_exists = CACHE_LATEST.exists()
+                accept = (not cache_exists) or current_revision <= 0.0 or (incoming_revision > 0.0 and incoming_revision >= current_revision)
+                if accept:
+                    tmp_cache = CACHE_DIR / f'.mega_{secrets.token_hex(6)}.tmp'
+                    shutil.copy2(rows[0], tmp_cache); os.replace(tmp_cache, CACHE_LATEST)
                     with STATE_LOCK:
                         STATE['cache_revision'] = max(current_revision, incoming_revision)
+                        STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or '')
+                        STATE['last_snapshot_size'] = int(meta.get('size') or 0)
+                    try:
+                        redis_store_snapshot(CACHE_LATEST, meta)
+                    except Exception:
+                        pass
                 with STATE_LOCK:
                     STATE['last_restore_download_at'] = time.time()
-                    STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or '')
-                    STATE['last_snapshot_size'] = int(meta.get('size') or 0)
+                if not accept and cache_exists:
+                    return CACHE_LATEST, f'MEGA snapshot older than restore cache; kept cache rev={current_revision}'
                 return CACHE_LATEST, 'MEGA latest OK' if idx == 0 else f'MEGA legacy restore cache OK: {remote}'
             finally:
                 shutil.rmtree(work, ignore_errors=True)
@@ -319,15 +444,29 @@ def process_job(job):
     finally:
         if kind == 'sync_state':
             followup = None
+            with STATE_LOCK:
+                fetched_token = str(STATE.get('last_state_token') or '')
             with SYNC_PENDING_LOCK:
-                if SYNC_DIRTY:
+                dirty_token = str(STATE.get('dirty_state_token') or '')
+                # A duplicate request that arrived while the first GET was running must
+                # not trigger a second full SQLite download. Only a genuinely newer
+                # front state token deserves one follow-up fetch.
+                if SYNC_DIRTY and dirty_token and dirty_token != fetched_token:
                     reason = str(SYNC_DIRTY_REASON or 'coalesced_changes')[:180]
                     SYNC_DIRTY = False
                     SYNC_DIRTY_REASON = ''
-                    followup = {'id': secrets.token_hex(8), 'type': 'sync_state', 'reason': reason, 'created_at': time.time()}
+                    with STATE_LOCK:
+                        STATE['active_state_token'] = dirty_token
+                        STATE['dirty_state_token'] = ''
+                    followup = {'id': secrets.token_hex(8), 'type': 'sync_state', 'reason': reason, 'state_token': dirty_token, 'created_at': time.time()}
                     # Keep SYNC_PENDING=True while the follow-up is queued/running.
                 else:
+                    SYNC_DIRTY = False
+                    SYNC_DIRTY_REASON = ''
                     SYNC_PENDING = False
+                    with STATE_LOCK:
+                        STATE['active_state_token'] = ''
+                        STATE['dirty_state_token'] = ''
             if followup is not None:
                 try:
                     JOB_Q.put_nowait(followup)
@@ -336,6 +475,8 @@ def process_job(job):
                         SYNC_PENDING = False
                         SYNC_DIRTY = True
                         SYNC_DIRTY_REASON = str(followup.get('reason') or 'queue_full')
+                    with STATE_LOCK:
+                        STATE['dirty_state_token'] = str(followup.get('state_token') or '')[:120]
 
 
 def worker_loop():
@@ -586,13 +727,26 @@ def internal_job():
     if not authorized(): return {'ok':False},404
     body=request.get_json(silent=True) or {}; kind=str(body.get('type') or '').strip()
     if kind != 'sync_state': return {'ok':False,'error':'unsupported job type','supported':['sync_state']},400
+    token = str(body.get('state_token') or '')[:120]
+    with STATE_LOCK:
+        last_token = str(STATE.get('last_state_token') or '')
+        active_token = str(STATE.get('active_state_token') or '')
+        dirty_token = str(STATE.get('dirty_state_token') or '')
     with SYNC_PENDING_LOCK:
+        if not SYNC_PENDING and token and token == last_token:
+            with STATE_LOCK: STATE['deduped_sync_requests'] += 1
+            return {'ok':True,'status':'up_to_date','state_token':token,'queue_size':JOB_Q.qsize()},200
         if SYNC_PENDING:
+            if token and token in {active_token, dirty_token, last_token}:
+                with STATE_LOCK: STATE['deduped_sync_requests'] += 1
+                return {'ok':True,'status':'coalesced_same','state_token':token,'queue_size':JOB_Q.qsize()},202
             SYNC_DIRTY = True
             SYNC_DIRTY_REASON = str(body.get('reason') or 'coalesced_changes')[:180]
-            return {'ok':True,'status':'coalesced_dirty','queue_size':JOB_Q.qsize()},202
+            with STATE_LOCK: STATE['dirty_state_token'] = token
+            return {'ok':True,'status':'coalesced_dirty','state_token':token,'queue_size':JOB_Q.qsize()},202
         SYNC_PENDING=True
-    job={'id':secrets.token_hex(8),'type':kind,'reason':str(body.get('reason') or '')[:180],'created_at':time.time()}
+        with STATE_LOCK: STATE['active_state_token'] = token
+    job={'id':secrets.token_hex(8),'type':kind,'reason':str(body.get('reason') or '')[:180],'state_token':token,'created_at':time.time()}
     try: JOB_Q.put_nowait(job)
     except queue.Full:
         with SYNC_PENDING_LOCK: SYNC_PENDING=False
@@ -758,16 +912,22 @@ def internal_snapshot_upload():
         incoming_revision = float(meta.get('revision') or 0.0)
         with STATE_LOCK:
             current_revision = float(STATE.get('cache_revision') or 0.0)
-        if incoming_revision <= 0.0 or incoming_revision >= current_revision or not CACHE_LATEST.exists():
-            tmp_cache = CACHE_DIR / f'.latest_{secrets.token_hex(6)}.tmp'
-            shutil.copy2(incoming, tmp_cache)
-            os.replace(tmp_cache, CACHE_LATEST)
-            with STATE_LOCK:
-                STATE['cache_revision'] = max(current_revision, incoming_revision)
+        cache_exists = CACHE_LATEST.exists()
+        if cache_exists and current_revision > 0.0 and (incoming_revision <= 0.0 or incoming_revision < current_revision):
+            incoming.unlink(missing_ok=True)
+            return {'ok':True,'cached':False,'status':'stale_ignored','revision':incoming_revision,'cache_revision':current_revision},202
+        tmp_cache = CACHE_DIR / f'.latest_{secrets.token_hex(6)}.tmp'
+        shutil.copy2(incoming, tmp_cache)
+        os.replace(tmp_cache, CACHE_LATEST)
         with STATE_LOCK:
+            STATE['cache_revision'] = max(current_revision, incoming_revision)
             STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or '')
             STATE['last_snapshot_size'] = int(meta.get('size') or len(raw))
             STATE['last_snapshot_at'] = time.time()
+        try:
+            redis_store_snapshot(CACHE_LATEST, meta)
+        except Exception:
+            pass
         job = {
             'id': secrets.token_hex(8), 'type': 'promote_uploaded',
             'reason': str(request.headers.get('X-Snapshot-Reason') or 'front_direct_upload')[:180],
@@ -794,12 +954,33 @@ def internal_snapshot_upload():
 def internal_restore_latest():
     if not authorized(): return {'ok':False},404
     cache_max_age=env_int('WORKER_RESTORE_CACHE_MAX_AGE_SEC',120,0,3600)
-    if CACHE_LATEST.exists():
-        age=max(0.0,time.time()-CACHE_LATEST.stat().st_mtime)
-        if cache_max_age <= 0 or age > cache_max_age:
-            _schedule_restore_refresh()
-        payload=CACHE_LATEST.read_bytes(); resp=Response(payload,status=200,mimetype='application/gzip'); resp.headers['Content-Disposition']='attachment; filename="latest_bot_state.sqlite3.gz"'; resp.headers['X-Worker-Version']=TRANSPORT_VERSION; resp.headers['X-SHA256']=hashlib.sha256(payload).hexdigest(); resp.headers['X-Cache-Age-Sec']=str(int(age)); return resp
-    started=_schedule_restore_refresh(); return {'ok':False,'error':'restore cache not ready','refresh_queued':bool(started)},503
+    if not CACHE_LATEST.exists():
+        redis_ok, redis_detail = redis_load_snapshot_to_cache()
+        if not redis_ok:
+            started=_schedule_restore_refresh()
+            return {'ok':False,'error':'restore cache not ready','redis':redis_detail,'refresh_queued':bool(started)},503
+    # Never serve corrupt cache just because the file exists.
+    ok, detail, meta = quick_check_gzip(CACHE_LATEST)
+    if not ok:
+        CACHE_LATEST.unlink(missing_ok=True)
+        redis_ok, redis_detail = redis_load_snapshot_to_cache()
+        if not redis_ok:
+            started=_schedule_restore_refresh()
+            return {'ok':False,'error':'restore cache invalid','detail':detail,'redis':redis_detail,'refresh_queued':bool(started)},503
+        ok, detail, meta = quick_check_gzip(CACHE_LATEST)
+        if not ok:
+            return {'ok':False,'error':'Redis restore cache invalid after reload'},503
+    age=max(0.0,time.time()-CACHE_LATEST.stat().st_mtime)
+    if cache_max_age <= 0 or age > cache_max_age:
+        _schedule_restore_refresh()
+    payload=CACHE_LATEST.read_bytes()
+    resp=Response(payload,status=200,mimetype='application/gzip')
+    resp.headers['Content-Disposition']='attachment; filename="latest_bot_state.sqlite3.gz"'
+    resp.headers['X-Worker-Version']=TRANSPORT_VERSION
+    resp.headers['X-SHA256']=hashlib.sha256(payload).hexdigest()
+    resp.headers['X-Cache-Age-Sec']=str(int(age))
+    resp.headers['X-State-Revision']=str(float(meta.get('revision') or 0.0))
+    return resp
 
 @app.route('/internal/status', methods=['GET'])
 def internal_status():
@@ -809,6 +990,11 @@ def internal_status():
 threading.Thread(target=worker_loop,name='vys262-worker-jobs',daemon=True).start()
 threading.Thread(target=google_loop,name='vys262-worker-google',daemon=True).start()
 threading.Thread(target=peer_loop,name='vys262-worker-peer',daemon=True).start()
+try:
+    _r6_redis_ok, _r6_redis_detail = redis_load_snapshot_to_cache()
+    print(f'[R6 RESTORE CACHE] redis ok={_r6_redis_ok} {_r6_redis_detail}', flush=True)
+except Exception as _r6_exc:
+    print(f'[R6 RESTORE CACHE] redis error={type(_r6_exc).__name__}: {str(_r6_exc)[:180]}', flush=True)
 threading.Thread(target=_restore_refresh_background,name='vys262-worker-mega-warmup',daemon=True).start()
 
 if __name__ == '__main__':

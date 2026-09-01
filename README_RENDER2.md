@@ -1,24 +1,19 @@
-# Render #2 — HEAVY worker
+# Render #2 — HEAVY worker — R6 FULL STATE
 
-Deploy this folder/ZIP as the second Render service.
+Deploy this ZIP as the heavy worker. Start command: `python worker_service.py`.
 
-- Start: `python worker_service.py` (Dockerfile already uses it).
-- Receives state-sync jobs from Render #1.
-- Fetches a consistent SQLite snapshot, runs `PRAGMA quick_check`, then promotes it to MEGA.
-- Keeps a restore cache for fast boot recovery of Render #1.
-- Runs Google OAuth + Google Sheets API here, never on the Telegram front.
-- Google jobs are asynchronous and callback Render #1 with the final link/error.
+R6 durability order:
+1. Fetch + validate full SQLite from Render #1.
+2. Atomically replace worker restore cache (only if not stale).
+3. Store the exact gzip in shared Redis/Key Value.
+4. Archive/promote it in MEGA in the heavy path.
 
-Google setup:
-1. Put your existing `GOOGLE_SERVICE_ACCOUNT_JSON` only in this Render Environment.
-2. In Telegram open `/google` and choose the destination spreadsheet.
-3. Share that spreadsheet with the service account `client_email` as Editor.
+Restore order:
+1. Worker local cache.
+2. Shared Redis durable snapshot (survives worker deploy/restart).
+3. MEGA archive fallback.
 
-## r3 fixes from 2026-08-31 logs
-- Google refresh reuses an existing tab with the same period title instead of failing on duplicate `addSheet`.
-- Automatic v167/v261 refreshes now execute here using this service account.
-- State-sync coalescing is dirty-aware: if front changes while a snapshot is being uploaded, one follow-up snapshot is guaranteed.
+An older delayed Front GET, Redis value, or MEGA snapshot cannot overwrite a newer cached revision. This prevents rollback to factory/default settings after deployments.
 
-
-## R4 continuity cache
-Render #2 accepts `/internal/snapshot/upload` from the authenticated front, validates SQLite, installs it into restore cache immediately, then promotes it to MEGA asynchronously. Restore cache never regresses to an older continuity revision and can be served while a stale-cache refresh runs.
+Google service-account JSON belongs only on Render #2.
+The `REDIS_URL` must be the same Redis/Key Value used by Render #1.
