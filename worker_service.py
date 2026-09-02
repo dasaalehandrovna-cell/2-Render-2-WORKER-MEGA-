@@ -12,6 +12,8 @@ Responsibilities:
 """
 from __future__ import annotations
 import base64
+import csv
+import mimetypes
 import gzip
 import hashlib
 import json
@@ -32,11 +34,15 @@ try:
     import redis as _redis
 except Exception:
     _redis = None
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_file
+from openpyxl import Workbook
+from openpyxl.comments import Comment
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r6-full-state'
-TRANSPORT_VERSION = 'vys-262-worker-r6-full-state'
+VERSION = 'vys-262-worker-r7-system-polish'
+TRANSPORT_VERSION = 'vys-262-worker-r7-system-polish'
 
 
 def env_bool(name, default=False):
@@ -569,7 +575,10 @@ def _sheet_id(value=None):
     return raw
 
 def _tab_title(title):
-    base = re.sub(r'[\\/?*\[\]:]', ' ', str(title or 'Статьи')); base = re.sub(r'\s+',' ',base).strip(" ' ") or 'Статьи'; suffix=' · '+datetime.now().strftime('%d.%m %H-%M-%S'); return base[:max(1,100-len(suffix))].rstrip()+suffix
+    # R7: deterministic title. Same period/chat updates the same tab instead of creating clutter.
+    base = re.sub(r'[\\/?*\[\]:]', ' ', str(title or 'Статьи'))
+    base = re.sub(r'\s+', ' ', base).strip(" ' ") or 'Статьи'
+    return base[:100].rstrip()
 
 def _cell_value(v):
     if isinstance(v,dict) and v.get('formula'): return {'formulaValue':'='+str(v.get('formula') or '').lstrip('=')}
@@ -986,6 +995,211 @@ def internal_restore_latest():
 def internal_status():
     if not authorized(): return {'ok':False},404
     with STATE_LOCK: return {'ok':True,'version':VERSION,'queue_size':JOB_Q.qsize(),'google_queue_size':GOOGLE_Q.qsize(),'state':dict(STATE)},200
+
+# ---------------------------------------------------------------------------
+# R7 heavy file exports: CSV/XLSX/Drive live here, away from Telegram webhooks.
+FILE_Q = queue.Queue(maxsize=12)
+FILE_JOB_LOCK = threading.RLock()
+FILE_JOB_STATUS = {}
+FILE_DIR = CACHE_DIR / 'exports'
+FILE_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    STATE.update({'file_jobs':0, 'file_failures':0, 'file_last_ok':0.0, 'file_last_error':''})
+except Exception:
+    pass
+
+
+def _file_status_put(job_id, **values):
+    now = time.time()
+    with FILE_JOB_LOCK:
+        for key, row in list(FILE_JOB_STATUS.items()):
+            if now - float((row or {}).get('updated_at') or now) > 7200:
+                old = FILE_JOB_STATUS.pop(key, {}) or {}
+                try:
+                    path = Path(str(old.get('path') or ''))
+                    if path.is_file(): path.unlink(missing_ok=True)
+                except Exception: pass
+        row = dict(FILE_JOB_STATUS.get(job_id) or {})
+        row.update(values); row['updated_at'] = now
+        FILE_JOB_STATUS[job_id] = row
+        return dict(row)
+
+
+def _safe_export_name(value, ext):
+    raw = str(value or f'export.{ext}').replace('\\','_').replace('/','_').strip()
+    raw = re.sub(r'[\x00-\x1f<>:"|?*]+','_',raw)[:180] or f'export.{ext}'
+    if not raw.lower().endswith('.'+ext): raw += '.'+ext
+    return raw
+
+
+def _xlsx_value(value):
+    if isinstance(value, dict):
+        formula = str(value.get('formula') or '').strip()
+        if formula:
+            return '=' + formula.lstrip('=')
+        if 'value' in value:
+            return value.get('value')
+    return value
+
+
+def _render_export_file(body, job_id):
+    ftype = 'xlsx' if str(body.get('file_type') or '').lower() == 'xlsx' else 'csv'
+    filename = _safe_export_name(body.get('filename'), ftype)
+    path = FILE_DIR / f'{job_id}.{ftype}'
+    rows = body.get('rows') or []
+    if ftype == 'csv':
+        with open(path,'w',newline='',encoding='utf-8-sig') as fh:
+            w=csv.writer(fh)
+            for row in rows: w.writerow(list(row or []))
+        return path, filename
+    wb=Workbook(); ws=wb.active; ws.title=str(body.get('sheet_name') or 'Экспорт')[:31] or 'Экспорт'
+    annotations={}
+    for key,val in (body.get('annotations') or {}).items():
+        try:
+            rr,cc=str(key).split(',',1); annotations[(int(rr),int(cc))]=str(val)
+        except Exception: pass
+    layout = body.get('category_layout')
+    style = str(body.get('style') or 'old')
+    palette=['C6EFCB','DDEBF7','FCE4D6','E4DFEC','FFF2CC','D9EAD3','D9EAF7','F4CCCC','D9E1F2','EAD1DC','D9D2E9']
+    max_cols=1
+    for r_idx,row in enumerate(rows,start=1):
+        vals=list(row or []); max_cols=max(max_cols,len(vals))
+        for c_idx,value in enumerate(vals,start=1):
+            cell=ws.cell(r_idx,c_idx,value=_xlsx_value(value))
+            if r_idx == 1:
+                cell.font=Font(bold=True)
+                cell.alignment=Alignment(horizontal='center')
+            note=annotations.get((r_idx,c_idx),'').strip()
+            if note and style in {'new_comments','new_notes','old','new_plain'}:
+                cell.comment=Comment(note,'Telegram Finance Bot')
+            if r_idx > 1 and value not in ('',None):
+                if layout is True and c_idx >= 4:
+                    cell.fill=PatternFill('solid',fgColor=palette[(c_idx-4)%len(palette)])
+                elif str(layout) == 'category_compact' and c_idx >= 3:
+                    cell.fill=PatternFill('solid',fgColor=palette[(c_idx-3)%len(palette)])
+    ws.freeze_panes='A2'
+    for col in range(1,max_cols+1):
+        letter=get_column_letter(col)
+        width=10
+        for cell in ws[letter][:min(ws.max_row,300)]:
+            try: width=max(width,min(48,len(str(cell.value or ''))+2))
+            except Exception: pass
+        ws.column_dimensions[letter].width=width
+    wb.save(path)
+    return path, filename
+
+
+def _drive_upload_file(path: Path, filename: str, folder_id: str=''):
+    token=_google_token(); headers={'Authorization':f'Bearer {token}'}
+    metadata={'name':filename}
+    folder=str(folder_id or '').strip()
+    if folder:
+        folder=_sheet_id(folder) if '/spreadsheets/' in folder else re.sub(r'^.*/folders/','',folder).split('?')[0].split('#')[0].strip('/')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{10,}',folder): raise RuntimeError('Google Drive folder ID invalid')
+        metadata['parents']=[folder]
+    mime=mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+    with open(path,'rb') as fh:
+        r=requests.post('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink', headers=headers,
+            files={'metadata':('metadata',json.dumps(metadata),'application/json; charset=UTF-8'),'file':(filename,fh,mime)}, timeout=120)
+    if r.status_code >= 300: raise RuntimeError(f'Google Drive upload {r.status_code}: {r.text[:500]}')
+    payload=r.json() or {}; fid=str(payload.get('id') or '')
+    return str(payload.get('webViewLink') or (f'https://drive.google.com/file/d/{fid}/view' if fid else ''))
+
+
+def _notify_front_export_result(job, ok, **extra):
+    base,secret=front_base(),peer_secret()
+    if not base or not secret: return False
+    body=dict(job.get('payload') or {})
+    payload={'job_id':str(job.get('id') or ''),'ok':bool(ok),'error':str(extra.get('error') or '')[:900],
+        'url':str(extra.get('url') or ''),'filename':str(extra.get('filename') or body.get('filename') or ''),
+        'file_type':str(body.get('file_type') or ''),'delivery':str(body.get('delivery') or 'chat'),
+        'recipient_chat_id':body.get('recipient_chat_id'),'target_chat_id':body.get('target_chat_id'),
+        'tenant_id':body.get('tenant_id'),'label':str(body.get('label') or ''),'chat_name':str(body.get('chat_name') or ''),'caption':str(body.get('caption') or '')[:1000]}
+    for attempt in range(3):
+        try:
+            r=requests.post(base+'/internal/split/export-result',json=payload,headers={'X-Peer-Secret':secret,'User-Agent':'vys-262-worker-export-r7'},timeout=15)
+            if 200 <= r.status_code < 300: return True
+        except Exception: pass
+        time.sleep(attempt+1)
+    return False
+
+
+def process_file_job(job):
+    jid=str(job.get('id') or ''); body=dict(job.get('payload') or {})
+    _file_status_put(jid,status='running')
+    try:
+        path,filename=_render_export_file(body,jid)
+        delivery=str(body.get('delivery') or 'chat')
+        url=''
+        if delivery == 'drive':
+            url=_drive_upload_file(path,filename,str(body.get('drive_folder_id') or ''))
+        with STATE_LOCK:
+            STATE['file_jobs']=int(STATE.get('file_jobs') or 0)+1; STATE['file_last_ok']=time.time(); STATE['file_last_error']=''
+        _file_status_put(jid,status='done',ok=True,path=str(path),filename=filename,url=url,delivery=delivery)
+        delivered=_notify_front_export_result(job,True,url=url,filename=filename)
+        _file_status_put(jid,callback_delivered=bool(delivered))
+        if delivery == 'drive': path.unlink(missing_ok=True)
+        print(f'[EXPORT JOB] {jid} ok=True delivery={delivery} callback={delivered}',flush=True)
+    except Exception as exc:
+        detail=f'{type(exc).__name__}: {str(exc)[:700]}'
+        with STATE_LOCK:
+            STATE['file_failures']=int(STATE.get('file_failures') or 0)+1; STATE['file_last_error']=detail[:240]
+        _file_status_put(jid,status='done',ok=False,error=detail)
+        _notify_front_export_result(job,False,error=detail)
+        print(f'[EXPORT JOB] {jid} ok=False {detail}',flush=True)
+
+
+def file_loop():
+    while True:
+        job=FILE_Q.get()
+        try: process_file_job(job)
+        except Exception as exc: print(f'[EXPORT LOOP ERROR] {type(exc).__name__}: {str(exc)[:300]}',flush=True)
+        finally: FILE_Q.task_done()
+
+
+@app.route('/internal/google/info',methods=['GET'])
+def internal_google_info_r7():
+    if not authorized(): return {'ok':False},404
+    try:
+        info=_google_info()
+        return {'ok':True,'service_email':str(info.get('client_email') or ''),'configured':True},200
+    except Exception as exc:
+        return {'ok':False,'configured':False,'error':str(exc)[:500]},502
+
+
+@app.route('/internal/export/file',methods=['POST'])
+def internal_export_file_r7():
+    if not authorized(): return {'ok':False},404
+    body=request.get_json(silent=True) or {}
+    try: cid=int(body.get('recipient_chat_id') or 0)
+    except Exception: cid=0
+    if not cid: return {'ok':False,'error':'recipient_chat_id required'},400
+    rows=body.get('rows') or []
+    if not isinstance(rows,list) or len(rows)>100000: return {'ok':False,'error':'invalid/too many rows'},400
+    jid=str(body.get('job_id') or secrets.token_hex(12)).strip()[:80]
+    with FILE_JOB_LOCK: existing=dict(FILE_JOB_STATUS.get(jid) or {})
+    if existing:
+        return {'ok':bool(existing.get('ok',True)),'status':existing.get('status') or 'queued','job_id':jid},200 if existing.get('status')=='done' else 202
+    job={'id':jid,'type':'file_export','created_at':time.time(),'payload':body}
+    _file_status_put(jid,status='queued',ok=None)
+    try: FILE_Q.put_nowait(job)
+    except queue.Full:
+        with FILE_JOB_LOCK: FILE_JOB_STATUS.pop(jid,None)
+        return {'ok':False,'error':'file worker queue full'},503
+    return {'ok':True,'status':'queued','job_id':jid,'queue_size':FILE_Q.qsize()},202
+
+
+@app.route('/internal/export/file/<job_id>',methods=['GET'])
+def internal_export_download_r7(job_id):
+    if not authorized(): return {'ok':False},404
+    jid=str(job_id or '')[:80]
+    with FILE_JOB_LOCK: row=dict(FILE_JOB_STATUS.get(jid) or {})
+    if not row or row.get('status')!='done' or not row.get('ok'): return {'ok':False,'error':'file not ready'},404
+    path=Path(str(row.get('path') or ''))
+    if not path.is_file(): return {'ok':False,'error':'file expired'},410
+    return send_file(path,as_attachment=True,download_name=str(row.get('filename') or path.name),max_age=0)
+
+threading.Thread(target=file_loop,name='vys262-worker-files-r7',daemon=True).start()
 
 threading.Thread(target=worker_loop,name='vys262-worker-jobs',daemon=True).start()
 threading.Thread(target=google_loop,name='vys262-worker-google',daemon=True).start()

@@ -17,3 +17,15 @@ An older delayed Front GET, Redis value, or MEGA snapshot cannot overwrite a new
 
 Google service-account JSON belongs only on Render #2.
 The `REDIS_URL` must be the same Redis/Key Value used by Render #1.
+
+
+## R7 system polish
+- finance derived calculations are coalesced after the local SQLite commit;
+- deep chat audit moves confirmed left/kicked chats to removed;
+- Google setup is a 3-step menu and auto-tests the pasted table;
+- CSV/XLSX serialization and Drive upload execute on Render #2.
+
+### R7.1 finance/chat/google cleanup
+- Owns normal CSV/XLSX serialization and Google Drive upload jobs.
+- Google Sheets tabs use deterministic titles so repeat exports refresh the same tab instead of creating timestamp clutter.
+- Exposes service-account email to the Front for the guided `/google` setup.
