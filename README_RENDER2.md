@@ -29,3 +29,9 @@ The `REDIS_URL` must be the same Redis/Key Value used by Render #1.
 - Owns normal CSV/XLSX serialization and Google Drive upload jobs.
 - Google Sheets tabs use deterministic titles so repeat exports refresh the same tab instead of creating timestamp clutter.
 - Exposes service-account email to the Front for the guided `/google` setup.
+
+R8 paired release: worker logic is unchanged from R7; this archive is version-paired with the R8 Front chat lifecycle fix.
+
+## R9 Google style
+- Restores original vys-262 Google Sheets cell colors, borders, wrapping, bold summary rows and number formatting.
+- Existing R8 worker/restore/export behavior is unchanged.

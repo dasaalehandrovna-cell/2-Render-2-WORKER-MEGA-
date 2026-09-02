@@ -587,8 +587,54 @@ def _cell_value(v):
     return {'stringValue':str(v or '')}
 
 def _cat_fill(idx):
+    # Original vys-262 Google palette/indexing. Columns before the category
+    # block use the same pale green-gray header fill as the monolith.
     palette=[(0.78,0.94,0.81),(0.87,0.92,0.97),(0.99,0.89,0.84),(0.89,0.87,0.93),(1.0,0.95,0.8),(0.85,0.92,0.83),(0.81,0.89,0.95),(0.96,0.8,0.8),(0.82,0.88,0.89),(0.92,0.82,0.86),(0.85,0.82,0.91)]
-    rgb=palette[max(0,idx)%len(palette)]; return {'red':rgb[0],'green':rgb[1],'blue':rgb[2]}
+    idx=int(idx or 0)
+    if idx >= 3:
+        rgb=palette[(idx-3)%len(palette)]
+        return {'red':rgb[0],'green':rgb[1],'blue':rgb[2]}
+    return {'red':0.92,'green':0.95,'blue':0.9}
+
+
+def _v262_google_cell_format(row, r_idx, c_idx, max_cols, layout):
+    """Google cell format from the final vys-262 monolith."""
+    value = row[c_idx - 1] if c_idx - 1 < len(row) else ''
+    row_is_blank = not any(str(v if v is not None else '').strip() for v in row)
+    first = str(row[0] if row else '').strip().casefold()
+    second = str(row[1] if len(row) > 1 else '').strip().casefold()
+    fmt = {
+        'verticalAlignment': 'TOP',
+        'wrapStrategy': 'CLIP' if c_idx == 2 else 'WRAP',
+        'borders': {side: {'style': 'SOLID', 'color': {'red': 0.65, 'green': 0.65, 'blue': 0.65}}
+                    for side in ('top', 'bottom', 'left', 'right')},
+    }
+    if isinstance(value, (int, float)) and not isinstance(value, bool) or (isinstance(value, dict) and value.get('formula')):
+        fmt['numberFormat'] = {'type': 'NUMBER', 'pattern': '#,##0'}
+    if first == 'ars':
+        fmt.update({'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.78, 'green': 0.94, 'blue': 0.81}})
+    elif first == 'usd':
+        fmt.update({'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.72, 'green': 0.86, 'blue': 1.0}})
+    elif first in {'дата', 'date'}:
+        fmt.update({'textFormat': {'bold': True}, 'backgroundColor': _cat_fill(c_idx - 1)})
+    elif row_is_blank and layout in {'category', 'category_compact'}:
+        fmt['backgroundColor'] = {'red': 1.0, 'green': 0.6, 'blue': 0.0}
+    elif first in {'расход', 'сумма по статьям'} or second in {'расход', 'сумма по статьям'}:
+        fmt.update({'textFormat': {'bold': True}, 'backgroundColor': {'red': 1.0, 'green': 0.55, 'blue': 0.55}})
+    elif first in {'приход', 'приход за период'} or second in {'приход', 'приход за период'}:
+        fmt.update({'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.55, 'green': 0.78, 'blue': 1.0}})
+    elif first in {'остаток с прошлого раза', 'остаток на руках', 'на руках:', 'гомонковые', 'остаток в обороте'} or second in {'остаток с прошлого раза', 'остаток на руках', 'на руках:', 'гомонковые', 'остаток в обороте'}:
+        fmt.update({'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.55, 'green': 0.85, 'blue': 0.55}})
+    elif first == 'расход еды на человека в сутки' or second == 'расход еды на человека в сутки':
+        fmt.update({'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.74, 'green': 0.82, 'blue': 1.0}})
+    elif layout == 'compact' and c_idx in {2, 3} and value not in ('', None):
+        fmt['backgroundColor'] = _cat_fill(3 if c_idx == 3 else 2)
+    elif layout == 'category_compact' and c_idx >= 3 and value not in ('', None):
+        fmt['backgroundColor'] = _cat_fill(c_idx)
+    elif layout == 'category' and c_idx >= 4 and value not in ('', None):
+        # Exact final vys-262 category indexing.
+        fmt['backgroundColor'] = _cat_fill(c_idx - 1)
+    return fmt
 
 def create_google_sheet(body):
     """Create or refresh a named tab in the selected owner spreadsheet.
@@ -669,14 +715,9 @@ def create_google_sheet(body):
             note = str(notes.get((r_idx, c_idx)) or '').strip()
             if note:
                 cell['note'] = note
-            if r_idx == 1:
-                cell['userEnteredFormat'] = {'textFormat': {'bold': True}}
-            elif layout == 'category' and c_idx >= 4 and value not in ('', None):
-                cell['userEnteredFormat'] = {'backgroundColor': _cat_fill(c_idx - 4)}
-            elif layout == 'category_compact' and c_idx >= 3 and value not in ('', None):
-                cell['userEnteredFormat'] = {'backgroundColor': _cat_fill(c_idx - 3)}
-            elif layout == 'compact' and c_idx in (2, 3) and value not in ('', None):
-                cell['userEnteredFormat'] = {'backgroundColor': _cat_fill(c_idx - 2)}
+            # R9: use the full original vys-262 formatting, not the reduced
+            # worker-only coloring introduced by the split.
+            cell['userEnteredFormat'] = _v262_google_cell_format(row, r_idx, c_idx, max_cols, layout)
             values.append(cell)
         cell_rows.append({'values': values})
 
