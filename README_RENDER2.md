@@ -57,3 +57,7 @@ Worker не участвует в первичном финансовом commit
 
 ## R13 event journal + delta durability
 Normal state changes arrive through `/internal/delta` as changed SQLite pages. Worker reconstructs the exact database, validates `PRAGMA quick_check` and SHA256, journals the delta to Redis, and keeps a local exact restore gzip. Worker creates a full Redis checkpoint from its own mirror every 6 hours (or safety threshold) by default; MEGA full checkpoint is limited to about once per 24 hours. A hash-only reconciliation with Front runs every 6 hours, and the full Front database is fetched only when hashes really differ. On Worker restart: Redis full checkpoint -> Redis delta replay -> MEGA fallback.
+
+
+## R14 internal configuration
+All runtime tuning values (intervals, limits, ports, feature switches and internal Redis key names) are packaged in `runtime_config.py`. Render Environment should contain only credentials, remote addresses and external Telegram/Google/MEGA identifiers. Stale tuning variables left in Render are ignored/overwritten at service startup.

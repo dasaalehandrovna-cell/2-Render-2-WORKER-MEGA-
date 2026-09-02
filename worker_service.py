@@ -39,10 +39,12 @@ from openpyxl import Workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from runtime_config import install_internal_runtime_config, CONFIG_VERSION as INTERNAL_CONFIG_VERSION
+install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r13-event-journal'
-TRANSPORT_VERSION = 'vys-262-worker-r13-event-journal'
+VERSION = 'vys-262-worker-r14-internal-config'
+TRANSPORT_VERSION = 'vys-262-worker-r14-internal-config'
 
 
 def env_bool(name, default=False):

@@ -12,5 +12,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY worker_service.py .
+COPY worker_service.py runtime_config.py ./
 CMD ["python", "worker_service.py"]
