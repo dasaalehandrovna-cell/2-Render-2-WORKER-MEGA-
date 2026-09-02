@@ -37,12 +37,12 @@ except Exception:
 from flask import Flask, request, Response, send_file
 from openpyxl import Workbook
 from openpyxl.comments import Comment
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r7-system-polish'
-TRANSPORT_VERSION = 'vys-262-worker-r7-system-polish'
+VERSION = 'vys-262-worker-r10-unified-ui'
+TRANSPORT_VERSION = 'vys-262-worker-r10-unified-ui'
 
 
 def env_bool(name, default=False):
@@ -70,6 +70,7 @@ MEGA_LOCK = threading.RLock()
 GOOGLE_LOCK = threading.RLock()
 STATE = {
     'started_at': time.time(), 'peer_last_attempt':0.0, 'peer_last_ok':0.0, 'peer_last_error':'', 'peer_status':None,
+    'front_health':{},
     'job_last_id':'', 'job_last_type':'', 'job_last_reason':'', 'job_last_started':0.0, 'job_last_done':0.0, 'job_last_error':'',
     'sync_count':0, 'sync_failures':0, 'last_snapshot_sha256':'', 'last_snapshot_size':0, 'last_snapshot_at':0.0,
     'last_mega_upload_at':0.0, 'last_restore_download_at':0.0, 'mega_layout_ok':False, 'mega_warmup_ok':False,
@@ -511,20 +512,34 @@ def _schedule_restore_refresh():
 def peer_loop():
     time.sleep(5)
     while True:
+        if not env_bool('PEER_PING_ENABLED', True):
+            time.sleep(env_int('PEER_PING_INTERVAL_SEC',120,30,1800))
+            continue
         base = front_base()
         with STATE_LOCK: STATE['peer_last_attempt'] = time.time()
         if base:
             try:
-                r = requests.get(base + '/peer/health', headers={'User-Agent':'vys-262-worker-peer'}, timeout=12)
+                headers={'User-Agent':'vys-262-worker-peer-r10'}
+                if peer_secret(): headers['X-Peer-Secret']=peer_secret()
+                r = requests.get(base + '/peer/health', headers=headers, timeout=12)
+                payload = {}
+                try: payload = r.json() if r.content else {}
+                except Exception: payload = {}
                 with STATE_LOCK:
                     STATE['peer_status']=int(r.status_code)
-                    if 200 <= r.status_code < 300: STATE['peer_last_ok']=time.time(); STATE['peer_last_error']=''
+                    if 200 <= r.status_code < 300:
+                        STATE['peer_last_ok']=time.time(); STATE['peer_last_error']=''
+                        STATE['front_health']={
+                            'ok':bool(payload.get('ok', True)), 'version':str(payload.get('version') or ''),
+                            'bot_version':str(payload.get('bot_version') or ''), 'ready':bool(payload.get('ready', False)),
+                            'phase':str(payload.get('phase') or ''), 'seen_at':time.time(),
+                        }
                     else: STATE['peer_last_error']=f'HTTP {r.status_code}'
             except Exception as exc:
                 with STATE_LOCK: STATE['peer_status']=None; STATE['peer_last_error']=str(exc)[:220]
         else:
             with STATE_LOCK: STATE['peer_last_error']='FRONT_SERVICE_URL empty'
-        time.sleep(600)
+        time.sleep(env_int('PEER_PING_INTERVAL_SEC',120,30,1800))
 
 
 def _b64url(raw: bytes): return base64.urlsafe_b64encode(raw).rstrip(b'=').decode('ascii')
@@ -1083,6 +1098,43 @@ def _xlsx_value(value):
     return value
 
 
+def _r10_rgb_hex(rgb):
+    if not isinstance(rgb, dict): return None
+    try:
+        vals=[]
+        for key in ('red','green','blue'):
+            raw=float(rgb.get(key,0.0) or 0.0)
+            vals.append(max(0,min(255,round(raw*255))))
+        return ''.join(f'{v:02X}' for v in vals)
+    except Exception:
+        return None
+
+def _r10_apply_v262_xlsx_style(cell, row, r_idx, c_idx, max_cols, layout):
+    """Use one canonical vys-262 palette for file XLSX and Google Sheets."""
+    try:
+        fmt=_v262_google_cell_format(row,r_idx,c_idx,max_cols,layout) or {}
+    except Exception:
+        fmt={}
+    fill=_r10_rgb_hex(fmt.get('backgroundColor'))
+    if fill: cell.fill=PatternFill('solid',fgColor=fill)
+    tf=fmt.get('textFormat') or {}
+    if tf.get('bold'): cell.font=Font(bold=True)
+    wrap = str(fmt.get('wrapStrategy') or '').upper() != 'CLIP'
+    h=str(fmt.get('horizontalAlignment') or '').lower() or None
+    v=str(fmt.get('verticalAlignment') or 'TOP').lower()
+    cell.alignment=Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+    nf=fmt.get('numberFormat') or {}
+    if nf.get('pattern'): cell.number_format=str(nf.get('pattern'))
+    borders=fmt.get('borders') or {}
+    def side(name):
+        spec=borders.get(name) or {}
+        if not spec: return Side(style=None)
+        color=_r10_rgb_hex(spec.get('color')) or 'A6A6A6'
+        style='thin' if str(spec.get('style') or '').upper() != 'NONE' else None
+        return Side(style=style,color=color)
+    if borders:
+        cell.border=Border(left=side('left'),right=side('right'),top=side('top'),bottom=side('bottom'))
+
 def _render_export_file(body, job_id):
     ftype = 'xlsx' if str(body.get('file_type') or '').lower() == 'xlsx' else 'csv'
     filename = _safe_export_name(body.get('filename'), ftype)
@@ -1099,25 +1151,19 @@ def _render_export_file(body, job_id):
         try:
             rr,cc=str(key).split(',',1); annotations[(int(rr),int(cc))]=str(val)
         except Exception: pass
-    layout = body.get('category_layout')
+    raw_layout = body.get('category_layout')
+    layout = 'category' if raw_layout is True else (str(raw_layout or body.get('layout') or 'category').lower())
     style = str(body.get('style') or 'old')
-    palette=['C6EFCB','DDEBF7','FCE4D6','E4DFEC','FFF2CC','D9EAD3','D9EAF7','F4CCCC','D9E1F2','EAD1DC','D9D2E9']
-    max_cols=1
+    max_cols=max((len(list(row or [])) for row in rows), default=1)
     for r_idx,row in enumerate(rows,start=1):
-        vals=list(row or []); max_cols=max(max_cols,len(vals))
-        for c_idx,value in enumerate(vals,start=1):
+        vals=list(row or [])
+        padded=vals + [''] * max(0,max_cols-len(vals))
+        for c_idx,value in enumerate(padded,start=1):
             cell=ws.cell(r_idx,c_idx,value=_xlsx_value(value))
-            if r_idx == 1:
-                cell.font=Font(bold=True)
-                cell.alignment=Alignment(horizontal='center')
+            _r10_apply_v262_xlsx_style(cell,padded,r_idx,c_idx,max_cols,layout)
             note=annotations.get((r_idx,c_idx),'').strip()
             if note and style in {'new_comments','new_notes','old','new_plain'}:
                 cell.comment=Comment(note,'Telegram Finance Bot')
-            if r_idx > 1 and value not in ('',None):
-                if layout is True and c_idx >= 4:
-                    cell.fill=PatternFill('solid',fgColor=palette[(c_idx-4)%len(palette)])
-                elif str(layout) == 'category_compact' and c_idx >= 3:
-                    cell.fill=PatternFill('solid',fgColor=palette[(c_idx-3)%len(palette)])
     ws.freeze_panes='A2'
     for col in range(1,max_cols+1):
         letter=get_column_letter(col)

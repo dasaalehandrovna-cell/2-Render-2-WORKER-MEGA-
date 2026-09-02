@@ -35,3 +35,11 @@ R8 paired release: worker logic is unchanged from R7; this archive is version-pa
 ## R9 Google style
 - Restores original vys-262 Google Sheets cell colors, borders, wrapping, bold summary rows and number formatting.
 - Existing R8 worker/restore/export behavior is unchanged.
+
+## R10 unified UI / contours / Excel
+- Service progress is human-readable; internal W/Ф232/Ф233 ids are hidden from ordinary users.
+- All XLSX/Google Sheet outputs use the colored vys-262 financial palette.
+- /ok is blocked in contour 1/2; disabled business-mode callbacks return to the mode menu.
+- Owner UI has Google Excel and Render #2 health controls; peer health is bidirectional.
+- Contour toggles force immediate keyboard redraw after state changes.
+
