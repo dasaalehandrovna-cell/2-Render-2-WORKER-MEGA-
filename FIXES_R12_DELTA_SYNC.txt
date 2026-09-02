@@ -1,0 +1,8 @@
+R12 DELTA SYNC WORKER
+
+- POST /internal/delta applies changed SQLite pages to exact Worker cache.
+- PRAGMA quick_check and SHA256 must pass before promotion.
+- Redis delta journal is durable before local /tmp promotion.
+- Redis base snapshot + delta journal are replayed after Worker restart/deploy.
+- Full checkpoint is generated locally on Worker (default: 900 sec or 100 deltas), then Redis delta journal is compacted and MEGA latest is promoted.
+- /internal/snapshot/upload remains the full checkpoint/rebase path for shutdown or mismatch.

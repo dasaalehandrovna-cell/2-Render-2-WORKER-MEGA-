@@ -1,3 +1,11 @@
+# Render #2 HEAVY — R13 Event Journal
+
+R13 adds a pre-commit remote Telegram event witness and monotonic operation states `RECEIVED → COMMITTED → MIRRORED`. Normal changes use compact SQLite page deltas. A full database moves from Front only after a rare hash mismatch or explicit deploy/shutdown checkpoint. Worker creates its own periodic checkpoints from the mirrored SQLite.
+
+Recommended cadence: hash reconciliation every 6h, Worker Redis checkpoint every 6h/threshold, MEGA full checkpoint once per 24h.
+
+---
+
 # Render #2 — HEAVY worker — R6 FULL STATE
 
 Deploy this ZIP as the heavy worker. Start command: `python worker_service.py`.
@@ -43,3 +51,9 @@ R8 paired release: worker logic is unchanged from R7; this archive is version-pa
 - Owner UI has Google Excel and Render #2 health controls; peer health is bidirectional.
 - Contour toggles force immediate keyboard redraw after state changes.
 
+
+## R11 fast finance handoff
+Worker не участвует в первичном финансовом commit. Он получает coalesced уведомление после локального commit/завершения update, скачивает консистентный полный SQLite, валидирует PRAGMA quick_check, сначала обновляет restore cache/Redis и затем архивирует в MEGA.
+
+## R13 event journal + delta durability
+Normal state changes arrive through `/internal/delta` as changed SQLite pages. Worker reconstructs the exact database, validates `PRAGMA quick_check` and SHA256, journals the delta to Redis, and keeps a local exact restore gzip. Worker creates a full Redis checkpoint from its own mirror every 6 hours (or safety threshold) by default; MEGA full checkpoint is limited to about once per 24 hours. A hash-only reconciliation with Front runs every 6 hours, and the full Front database is fetched only when hashes really differ. On Worker restart: Redis full checkpoint -> Redis delta replay -> MEGA fallback.

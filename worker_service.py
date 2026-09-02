@@ -4,9 +4,9 @@
 
 Responsibilities:
 - mutual peer health ping with Render #1;
-- receive coalesced state sync jobs from front;
-- fetch a consistent SQLite gzip snapshot and validate PRAGMA quick_check;
-- promote/archive the latest durable SQLite snapshot in MEGA;
+- receive compact SQLite page deltas from front and validate reconstructed state;
+- keep a Redis delta journal plus local exact restore cache;
+- generate periodic full Redis/MEGA checkpoints locally;
 - serve cached latest snapshot to Render #1 for fast deploy restore;
 - execute Google Sheets creation (OAuth + Sheets API) away from Telegram frontend.
 """
@@ -41,8 +41,8 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r10-unified-ui'
-TRANSPORT_VERSION = 'vys-262-worker-r10-unified-ui'
+VERSION = 'vys-262-worker-r13-event-journal'
+TRANSPORT_VERSION = 'vys-262-worker-r13-event-journal'
 
 
 def env_bool(name, default=False):
@@ -78,6 +78,11 @@ STATE = {
     'cache_revision':0.0,
     'last_state_token':'', 'active_state_token':'', 'dirty_state_token':'', 'deduped_sync_requests':0,
     'redis_cache_ok':False, 'redis_last_write':0.0, 'redis_last_read':0.0, 'redis_last_error':'',
+    'delta_count':0, 'delta_since_checkpoint':0, 'delta_bytes':0, 'delta_last_at':0.0, 'delta_last_pages':0, 'delta_last_error':'',
+    'delta_replayed':0, 'full_checkpoint_at':0.0, 'full_checkpoint_count':0, 'last_state_sha256':'',
+    'delta_bytes_since_checkpoint':0,
+    'event_received':0, 'event_committed':0, 'event_mirrored':0, 'event_pending':0, 'event_last_at':0.0, 'event_last_error':'',
+    'reconcile_last_at':0.0, 'reconcile_last_ok':0.0, 'reconcile_last_error':'', 'reconcile_full_resyncs':0,
 }
 JOB_Q = queue.Queue(maxsize=32)
 GOOGLE_Q = queue.Queue(maxsize=16)
@@ -87,11 +92,139 @@ SYNC_PENDING_LOCK = threading.RLock(); SYNC_PENDING = False; SYNC_DIRTY = False;
 RESTORE_REFRESH_LOCK = threading.RLock(); RESTORE_REFRESH_RUNNING = False
 CACHE_DIR = Path(os.getenv('WORKER_CACHE_DIR','/tmp/vys262_worker') or '/tmp/vys262_worker'); CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_LATEST = CACHE_DIR / 'latest_bot_state.sqlite3.gz'
+CACHE_DB = CACHE_DIR / 'latest_bot_state.sqlite3'
 _GOOGLE_TOKEN = {'token':'','expires_at':0.0}
 _REDIS_CLIENT = None
 _REDIS_LOCK = threading.RLock()
 _REDIS_SNAPSHOT_KEY = str(os.getenv('WORKER_REDIS_SNAPSHOT_KEY','vys262:bot_state:latest_gz') or 'vys262:bot_state:latest_gz').strip()
 _REDIS_META_KEY = _REDIS_SNAPSHOT_KEY + ':meta'
+_REDIS_DELTA_KEY = str(os.getenv('WORKER_REDIS_DELTA_KEY', _REDIS_SNAPSHOT_KEY + ':deltas_v1') or (_REDIS_SNAPSHOT_KEY + ':deltas_v1')).strip()
+_REDIS_DELTA_META_KEY = _REDIS_DELTA_KEY + ':meta'
+_REDIS_EVENT_PREFIX = str(os.getenv('WORKER_REDIS_EVENT_PREFIX','vys262:tg_events:v1') or 'vys262:tg_events:v1').strip()
+EVENT_DB = CACHE_DIR / 'event_journal.sqlite3'
+EVENT_LOCK = threading.RLock()
+
+def _event_db_init_v268():
+    with EVENT_LOCK:
+        conn=sqlite3.connect(EVENT_DB,timeout=10)
+        try:
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute("CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY, update_id TEXT, chat_id TEXT, update_type TEXT, payload_json TEXT, payload_sha256 TEXT, state TEXT, received_at REAL, committed_at REAL, mirrored_at REAL, state_token TEXT, last_error TEXT, updated_at REAL)")
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_events_state_time ON events(state,updated_at)')
+            conn.commit()
+        finally: conn.close()
+
+def _event_local_upsert_v268(row:dict):
+    if not isinstance(row,dict): return False
+    eid=str(row.get('event_id') or row.get('update_id') or '')
+    if not eid: return False
+    _event_db_init_v268()
+    with EVENT_LOCK:
+        conn=sqlite3.connect(EVENT_DB,timeout=10)
+        try:
+            old=conn.execute('SELECT payload_json,payload_sha256,state,received_at,committed_at,mirrored_at,state_token,last_error FROM events WHERE event_id=?',(eid,)).fetchone()
+            payload=row.get('payload')
+            payload_json=json.dumps(payload,ensure_ascii=False,separators=(',',':'),default=str) if isinstance(payload,dict) else (old[0] if old else '{}')
+            incoming_state=str(row.get('state') or (old[2] if old else 'received'))
+            old_state=str(old[2] if old else '')
+            _rank={'received':1,'failed_retry':1,'committed':2,'mirrored':3,'checkpointed':4,'done':4}
+            state=old_state if _rank.get(old_state,0)>_rank.get(incoming_state,0) else incoming_state
+            received=float(row.get('received_at') or (old[3] if old else time.time()) or time.time())
+            committed=float(row.get('committed_at') or (old[4] if old else 0.0) or 0.0)
+            mirrored=float(row.get('mirrored_at') or (old[5] if old else 0.0) or 0.0)
+            token=str(row.get('state_token') or (old[6] if old else '') or '')[:120]
+            err=str(row.get('last_error') or (old[7] if old else '') or '')[:300]
+            conn.execute("INSERT INTO events(event_id,update_id,chat_id,update_type,payload_json,payload_sha256,state,received_at,committed_at,mirrored_at,state_token,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET update_id=excluded.update_id,chat_id=excluded.chat_id,update_type=excluded.update_type,payload_json=CASE WHEN excluded.payload_json!='{}' THEN excluded.payload_json ELSE events.payload_json END,payload_sha256=CASE WHEN excluded.payload_sha256!='' THEN excluded.payload_sha256 ELSE events.payload_sha256 END,state=excluded.state,received_at=events.received_at,committed_at=CASE WHEN excluded.committed_at>0 THEN excluded.committed_at ELSE events.committed_at END,mirrored_at=CASE WHEN excluded.mirrored_at>0 THEN excluded.mirrored_at ELSE events.mirrored_at END,state_token=CASE WHEN excluded.state_token!='' THEN excluded.state_token ELSE events.state_token END,last_error=excluded.last_error,updated_at=excluded.updated_at",
+                (eid,str(row.get('update_id') or eid),str(row.get('chat_id') if row.get('chat_id') is not None else ''),str(row.get('update_type') or 'other')[:40],payload_json,str(row.get('payload_sha256') or (old[1] if old else '') or ''),state,received,committed,mirrored,token,err,time.time()))
+            conn.commit(); return True
+        finally: conn.close()
+
+def _event_redis_store_v268(row:dict):
+    client=_redis_client()
+    if client is None: return False,'REDIS_URL not configured'
+    eid=str(row.get('event_id') or row.get('update_id') or '')
+    if not eid: return False,'event id empty'
+    try:
+        key=f'{_REDIS_EVENT_PREFIX}:event:{eid}'; pending=f'{_REDIS_EVENT_PREFIX}:pending'
+        current={}
+        raw=client.get(key)
+        if raw:
+            try: current=json.loads(raw.decode('utf-8') if isinstance(raw,(bytes,bytearray)) else raw)
+            except Exception: current={}
+        merged=dict(current or {}); merged.update(row)
+        _rank={'received':1,'failed_retry':1,'committed':2,'mirrored':3,'checkpointed':4,'done':4}
+        old_state=str((current or {}).get('state') or ''); new_state=str((row or {}).get('state') or '')
+        if _rank.get(old_state,0)>_rank.get(new_state,0): merged['state']=old_state
+        merged['updated_at']=time.time()
+        ttl=env_int('WORKER_EVENT_RETENTION_SEC',604800,86400,2592000)
+        pipe=client.pipeline(transaction=True)
+        pipe.set(key,json.dumps(merged,ensure_ascii=False,separators=(',',':'),default=str),ex=ttl)
+        if str(merged.get('state') or '') in {'mirrored','checkpointed','done'}: pipe.zrem(pending,eid)
+        else: pipe.zadd(pending,{eid:float(merged.get('received_at') or time.time())})
+        pipe.execute(); return True,'Redis event stored'
+    except Exception as exc: return False,f'{type(exc).__name__}: {str(exc)[:220]}'
+
+def _event_hydrate_pending_from_redis_v268(limit=250):
+    client=_redis_client()
+    if client is None: return 0
+    loaded=0
+    try:
+        ids=client.zrange(f'{_REDIS_EVENT_PREFIX}:pending',0,max(0,min(999,int(limit)-1))) or []
+        for raw_id in ids:
+            eid=raw_id.decode() if isinstance(raw_id,(bytes,bytearray)) else str(raw_id)
+            raw=client.get(f'{_REDIS_EVENT_PREFIX}:event:{eid}')
+            if not raw: continue
+            try: row=json.loads(raw.decode('utf-8') if isinstance(raw,(bytes,bytearray)) else raw)
+            except Exception: continue
+            if _event_local_upsert_v268(row): loaded+=1
+        return loaded
+    except Exception: return loaded
+
+def _event_mark_mirrored_v268(event_ids,state_token=''):
+    ids=[str(x) for x in (event_ids or []) if str(x)]
+    if not ids: return 0
+    n=0
+    for eid in ids:
+        row={'event_id':eid,'update_id':eid,'state':'mirrored','mirrored_at':time.time(),'state_token':str(state_token or '')[:120],'last_error':''}
+        if _event_local_upsert_v268(row): n+=1
+        _event_redis_store_v268(row)
+    with STATE_LOCK:
+        STATE['event_mirrored']=int(STATE.get('event_mirrored') or 0)+n; STATE['event_last_at']=time.time()
+        try:
+            conn=sqlite3.connect(EVENT_DB); STATE['event_pending']=int(conn.execute("SELECT COUNT(*) FROM events WHERE state IN ('received','failed_retry','committed')").fetchone()[0]); conn.close()
+        except Exception: pass
+    return n
+
+def _event_pending_rows_v268(limit=100):
+    _event_hydrate_pending_from_redis_v268(limit*2)
+    _event_db_init_v268()
+    with EVENT_LOCK:
+        conn=sqlite3.connect(EVENT_DB,timeout=10)
+        try:
+            rows=conn.execute("SELECT event_id,update_id,chat_id,update_type,payload_json,payload_sha256,state,received_at,committed_at,state_token,last_error FROM events WHERE state IN ('received','failed_retry','committed') ORDER BY received_at ASC LIMIT ?",(max(1,min(250,int(limit))),)).fetchall()
+        finally: conn.close()
+    out=[]
+    for r in rows:
+        try: payload=json.loads(r[4] or '{}')
+        except Exception: payload={}
+        chat=None
+        try: chat=int(r[2]) if str(r[2]).strip() else None
+        except Exception: chat=r[2]
+        out.append({'event_id':r[0],'update_id':r[1],'chat_id':chat,'update_type':r[3],'payload':payload,'payload_sha256':r[5],'state':r[6],'received_at':r[7],'committed_at':r[8],'state_token':r[9],'last_error':r[10]})
+    with STATE_LOCK: STATE['event_pending']=len(out)
+    return out
+
+def _event_reconcile_loop_v268():
+    while True:
+        time.sleep(20)
+        try:
+            _event_hydrate_pending_from_redis_v268(500)
+            # prune old mirrored local diagnostics; Redis keys expire independently.
+            cutoff=time.time()-env_int('WORKER_EVENT_RETENTION_SEC',604800,86400,2592000)
+            with EVENT_LOCK:
+                conn=sqlite3.connect(EVENT_DB,timeout=10); conn.execute("DELETE FROM events WHERE state='mirrored' AND updated_at<?",(cutoff,)); conn.commit(); conn.close()
+        except Exception as exc:
+            with STATE_LOCK: STATE['event_last_error']=f'{type(exc).__name__}: {str(exc)[:180]}'
 
 def _redis_client():
     global _REDIS_CLIENT
@@ -105,7 +238,7 @@ def _redis_client():
             _REDIS_CLIENT = _redis.Redis.from_url(url, socket_connect_timeout=5, socket_timeout=12, health_check_interval=30)
         return _REDIS_CLIENT
 
-def redis_store_snapshot(local_gz: Path, meta: dict):
+def redis_store_snapshot(local_gz: Path, meta: dict, clear_deltas: bool=False):
     client = _redis_client()
     if client is None:
         return False, 'REDIS_URL not configured'
@@ -122,6 +255,9 @@ def redis_store_snapshot(local_gz: Path, meta: dict):
         pipe = client.pipeline(transaction=True)
         pipe.set(_REDIS_SNAPSHOT_KEY, payload)
         pipe.set(_REDIS_META_KEY, json.dumps(row, separators=(',',':')))
+        if clear_deltas:
+            pipe.delete(_REDIS_DELTA_KEY)
+            pipe.delete(_REDIS_DELTA_META_KEY)
         pipe.execute()
         with STATE_LOCK:
             STATE['redis_cache_ok'] = True; STATE['redis_last_write'] = time.time(); STATE['redis_last_error'] = ''
@@ -268,6 +404,258 @@ def quick_check_gzip(gz_path: Path):
     finally: shutil.rmtree(work, ignore_errors=True)
 
 
+
+DELTA_APPLY_LOCK = threading.RLock()
+
+def _sha256_file_v267(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _sqlite_page_size_v267(path: Path) -> int:
+    with open(path, 'rb') as fh:
+        head = fh.read(100)
+    if len(head) < 18 or head[:16] != b'SQLite format 3\x00':
+        raise RuntimeError('not a SQLite database')
+    size = int.from_bytes(head[16:18], 'big')
+    if size == 1:
+        size = 65536
+    if size < 512 or size > 65536 or (size & (size - 1)):
+        raise RuntimeError(f'invalid SQLite page size {size}')
+    return size
+
+def _quick_check_db_v267(path: Path):
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            row = con.execute('PRAGMA quick_check').fetchone()
+            revision = 0.0
+            user_state_seq = 0
+            try:
+                for kind in ('runtime_continuity_v263','user_state_shadow_v265'):
+                    meta_row = con.execute("SELECT v FROM meta WHERE kind=? AND k=?", (kind,'latest')).fetchone()
+                    if not meta_row:
+                        continue
+                    payload = json.loads(meta_row[0]) if isinstance(meta_row[0], str) else (meta_row[0] or {})
+                    revision = max(revision, float((payload or {}).get('saved_at') or 0.0))
+                    if kind == 'user_state_shadow_v265':
+                        user_state_seq = int((payload or {}).get('seq') or 0)
+            except Exception:
+                pass
+        finally:
+            con.close()
+        if not row or str(row[0]).lower() != 'ok':
+            return False, f'quick_check={row}', {}
+        return True, 'OK', {'revision':revision,'user_state_seq':user_state_seq,'sha256_db':_sha256_file_v267(path),'size_db':path.stat().st_size}
+    except Exception as exc:
+        return False, f'{type(exc).__name__}: {str(exc)[:220]}', {}
+
+def _gzip_cache_db_v267():
+    if not CACHE_DB.exists():
+        return False, 'CACHE_DB missing', {}
+    fd, name = tempfile.mkstemp(prefix='vys262_cache_', suffix='.sqlite3.gz'); os.close(fd)
+    tmp = Path(name)
+    try:
+        with open(CACHE_DB,'rb') as src, gzip.open(tmp,'wb',compresslevel=9) as dst:
+            shutil.copyfileobj(src,dst,1024*1024)
+        ok, detail, meta = quick_check_gzip(tmp)
+        if not ok:
+            return False, detail, {}
+        target = CACHE_DIR / f'.latest_gz_{secrets.token_hex(6)}.tmp'
+        shutil.copy2(tmp,target); os.replace(target,CACHE_LATEST)
+        return True, 'OK', meta
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def _ensure_cache_db_v267():
+    if CACHE_DB.exists():
+        ok, detail, meta = _quick_check_db_v267(CACHE_DB)
+        if ok:
+            with STATE_LOCK:
+                STATE['last_state_sha256'] = str(meta.get('sha256_db') or '')
+            return True, 'cache DB OK', meta
+        CACHE_DB.unlink(missing_ok=True)
+    if not CACHE_LATEST.exists():
+        return False, 'CACHE_LATEST missing', {}
+    fd, name = tempfile.mkstemp(prefix='vys262_cache_db_', suffix='.sqlite3'); os.close(fd)
+    tmp = Path(name)
+    try:
+        with gzip.open(CACHE_LATEST,'rb') as src, open(tmp,'wb') as dst:
+            shutil.copyfileobj(src,dst,1024*1024)
+        ok, detail, meta = _quick_check_db_v267(tmp)
+        if not ok:
+            return False, 'decompressed cache invalid: '+detail, {}
+        target = CACHE_DIR / f'.latest_db_{secrets.token_hex(6)}.tmp'
+        shutil.copy2(tmp,target); os.replace(target,CACHE_DB)
+        with STATE_LOCK:
+            STATE['last_state_sha256'] = str(meta.get('sha256_db') or '')
+        return True, 'cache DB hydrated', meta
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def _redis_append_delta_v267(wire: bytes, payload: dict):
+    client = _redis_client()
+    if client is None:
+        return False, 'REDIS_URL not configured'
+    try:
+        max_items = env_int('WORKER_REDIS_DELTA_MAX_ITEMS',2000,10,20000)
+        row = {'new_sha256':str(payload.get('new_sha256') or ''), 'state_token':str(payload.get('state_token') or ''), 'saved_at':time.time(), 'count':int(STATE.get('delta_since_checkpoint') or 0)}
+        pipe=client.pipeline(transaction=True)
+        pipe.rpush(_REDIS_DELTA_KEY, wire)
+        pipe.ltrim(_REDIS_DELTA_KEY, -max_items, -1)
+        pipe.set(_REDIS_DELTA_META_KEY, json.dumps(row,separators=(',',':')))
+        pipe.execute()
+        with STATE_LOCK:
+            STATE['redis_cache_ok']=True; STATE['redis_last_write']=time.time(); STATE['redis_last_error']=''
+        return True, 'Redis delta appended'
+    except Exception as exc:
+        detail=f'{type(exc).__name__}: {str(exc)[:220]}'
+        with STATE_LOCK:
+            STATE['redis_cache_ok']=False; STATE['redis_last_error']=detail
+        return False,detail
+
+def _apply_delta_payload_v267(payload: dict, *, journal_wire: bytes|None=None, replay=False):
+    if not isinstance(payload,dict) or int(payload.get('schema') or 0) != 1:
+        return False, 'invalid delta schema', 'invalid'
+    ok, detail, meta = _ensure_cache_db_v267()
+    if not ok:
+        return False, detail, 'need_full'
+    base_sha=str(payload.get('base_sha256') or '').lower()
+    new_sha=str(payload.get('new_sha256') or '').lower()
+    current_sha=str(meta.get('sha256_db') or _sha256_file_v267(CACHE_DB)).lower()
+    if new_sha and current_sha == new_sha:
+        _event_mark_mirrored_v268(payload.get('event_ids') or [], payload.get('state_token') or '')
+        return True, 'already applied', 'up_to_date'
+    if not base_sha or current_sha != base_sha:
+        return False, f'base mismatch worker={current_sha[:16]} front={base_sha[:16]}', 'need_full'
+    page_size=int(payload.get('page_size') or 0)
+    db_size=int(payload.get('db_size') or 0)
+    pages=payload.get('pages') or []
+    if page_size != _sqlite_page_size_v267(CACHE_DB) or db_size < 100 or db_size > env_int('WORKER_DELTA_MAX_DB_MB',128,1,1024)*1024*1024:
+        return False, 'delta database geometry invalid', 'need_full'
+    if not isinstance(pages,list) or len(pages) > env_int('WORKER_DELTA_MAX_PAGES',4096,8,65536):
+        return False, 'too many delta pages', 'invalid'
+    tmp=CACHE_DIR / f'.delta_{secrets.token_hex(8)}.sqlite3'
+    shutil.copy2(CACHE_DB,tmp)
+    try:
+        with open(tmp,'r+b') as fh:
+            for row in pages:
+                if not isinstance(row,list) or len(row)!=2:
+                    return False,'invalid delta page row','invalid'
+                idx=int(row[0]); data=base64.b64decode(str(row[1] or ''),validate=True)
+                if idx < 0 or len(data) > page_size:
+                    return False,'invalid delta page geometry','invalid'
+                fh.seek(idx*page_size); fh.write(data)
+            fh.truncate(db_size)
+            fh.flush(); os.fsync(fh.fileno())
+        ok2, detail2, meta2=_quick_check_db_v267(tmp)
+        if not ok2:
+            return False,'patched DB invalid: '+detail2,'need_full'
+        actual=str(meta2.get('sha256_db') or '').lower()
+        if new_sha and actual != new_sha:
+            return False,f'patched sha mismatch expected={new_sha[:16]} actual={actual[:16]}','need_full'
+        # Durability first: after the patch is fully validated, append the tiny delta to
+        # Redis BEFORE replacing the local /tmp cache. If the Worker is killed in the
+        # next millisecond, startup can replay this journal onto the last checkpoint.
+        if (not replay) and journal_wire is not None and _redis_client() is not None:
+            redis_ok,redis_detail=_redis_append_delta_v267(journal_wire,payload)
+            if not redis_ok:
+                return False,'Redis delta append failed: '+str(redis_detail)[:180],'redis_unavailable'
+        os.replace(tmp,CACHE_DB)
+        gz_ok,gz_detail,gz_meta=_gzip_cache_db_v267()
+        if not gz_ok:
+            return False,'cache gzip failed: '+gz_detail,'need_full'
+        with STATE_LOCK:
+            STATE['cache_revision']=max(float(STATE.get('cache_revision') or 0.0),float(meta2.get('revision') or 0.0))
+            STATE['last_snapshot_sha256']=str(gz_meta.get('sha256_gz') or '')
+            STATE['last_snapshot_size']=int(gz_meta.get('size') or 0)
+            STATE['last_snapshot_at']=time.time()
+            STATE['last_state_sha256']=actual
+            STATE['last_state_token']=str(payload.get('state_token') or '')[:120]
+            STATE['delta_last_at']=time.time(); STATE['delta_last_pages']=len(pages); STATE['delta_last_error']=''
+            if replay:
+                STATE['delta_replayed']=int(STATE.get('delta_replayed') or 0)+1
+            else:
+                STATE['delta_count']=int(STATE.get('delta_count') or 0)+1
+                STATE['delta_since_checkpoint']=int(STATE.get('delta_since_checkpoint') or 0)+1
+                STATE['delta_bytes']=int(STATE.get('delta_bytes') or 0)+int(len(journal_wire or b''))
+                STATE['delta_bytes_since_checkpoint']=int(STATE.get('delta_bytes_since_checkpoint') or 0)+int(len(journal_wire or b''))
+        _event_mark_mirrored_v268(payload.get('event_ids') or [], payload.get('state_token') or '')
+        return True,f'applied pages={len(pages)} bytes={len(journal_wire or b"")}', 'applied'
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def redis_replay_deltas_v267():
+    client=_redis_client()
+    if client is None:
+        return False,'REDIS_URL not configured'
+    try:
+        rows=client.lrange(_REDIS_DELTA_KEY,0,-1) or []
+        if not rows:
+            _ensure_cache_db_v267()
+            return True,'no Redis deltas'
+        applied=0
+        for wire in rows:
+            try:
+                raw=gzip.decompress(wire)
+                payload=json.loads(raw.decode('utf-8'))
+            except Exception as exc:
+                return False,f'delta decode failed at {applied}: {exc}'
+            ok,detail,status=_apply_delta_payload_v267(payload,journal_wire=None,replay=True)
+            if not ok and status!='up_to_date':
+                return False,f'delta replay failed at {applied}: {detail}'
+            applied+=1
+        with STATE_LOCK:
+            STATE['delta_since_checkpoint']=max(int(STATE.get('delta_since_checkpoint') or 0), applied)
+        return True,f'replayed {applied} Redis deltas'
+    except Exception as exc:
+        return False,f'{type(exc).__name__}: {str(exc)[:220]}'
+
+def _full_checkpoint_v267(reason='periodic'):
+    with DELTA_APPLY_LOCK:
+        ok,detail,meta=_ensure_cache_db_v267()
+        if not ok:
+            return False,detail
+        gz_ok,gz_detail,gz_meta=_gzip_cache_db_v267()
+        if not gz_ok:
+            return False,gz_detail
+        redis_ok,redis_detail=redis_store_snapshot(CACHE_LATEST,gz_meta,clear_deltas=True)
+        with STATE_LOCK: last_mega=float(STATE.get('last_mega_upload_at') or 0.0)
+        mega_every=env_int('WORKER_MEGA_CHECKPOINT_SEC',86400,3600,604800)
+        mega_due=(last_mega<=0.0 or time.time()-last_mega>=mega_every or str(reason).startswith(('manual','shutdown','reconcile')))
+        if mega_due:
+            mega_ok,mega_detail=mega_promote_snapshot(CACHE_LATEST)
+        else:
+            mega_ok,mega_detail=True,f'deferred until {mega_every}s interval'
+        with STATE_LOCK:
+            if mega_due and mega_ok: STATE['last_mega_upload_at']=time.time()
+            STATE['full_checkpoint_at']=time.time(); STATE['full_checkpoint_count']=int(STATE.get('full_checkpoint_count') or 0)+1
+            if redis_ok:
+                STATE['delta_since_checkpoint']=0; STATE['delta_bytes_since_checkpoint']=0
+        return bool(redis_ok),f'{reason}: redis={redis_ok} {redis_detail}; mega={mega_ok} {mega_detail}'
+
+def _checkpoint_loop_v267():
+    while True:
+        time.sleep(30)
+        try:
+            with STATE_LOCK:
+                count=int(STATE.get('delta_since_checkpoint') or 0)
+                last=float(STATE.get('full_checkpoint_at') or STATE.get('started_at') or time.time())
+            if count <= 0:
+                continue
+            seconds=env_int('WORKER_FULL_CHECKPOINT_SEC',21600,300,86400)
+            max_deltas=env_int('WORKER_FULL_CHECKPOINT_MAX_DELTAS',1000,10,20000)
+            with STATE_LOCK: delta_bytes_since=int(STATE.get('delta_bytes_since_checkpoint') or 0)
+            max_delta_bytes=env_int('WORKER_FULL_CHECKPOINT_MAX_DELTA_MB',16,1,128)*1024*1024
+            if count >= max_deltas or delta_bytes_since >= max_delta_bytes or time.time()-last >= seconds:
+                ok,detail=_full_checkpoint_v267('threshold')
+                print(f'[R12 CHECKPOINT] ok={ok} {detail}',flush=True)
+        except Exception as exc:
+            print(f'[R12 CHECKPOINT ERROR] {type(exc).__name__}: {str(exc)[:240]}',flush=True)
+
+
 def fetch_front_snapshot():
     base, secret = front_base(), peer_secret()
     if not base or not secret: return None, 'front URL/secret not configured', {}
@@ -357,8 +745,18 @@ def sync_state_job(job):
             fetched_token = str(meta.get('state_token') or job.get('state_token') or '')[:120]
             if fetched_token:
                 STATE['last_state_token'] = fetched_token
+        # Full resync establishes a fresh delta base and clears the Redis delta journal.
+        try:
+            CACHE_DB.unlink(missing_ok=True)
+            _ensure_cache_db_v267()
+            with STATE_LOCK:
+                STATE['last_state_sha256'] = _sha256_file_v267(CACHE_DB) if CACHE_DB.exists() else ''
+                STATE['delta_since_checkpoint'] = 0
+                STATE['delta_bytes_since_checkpoint'] = 0
+        except Exception:
+            pass
         # Fast durable cache is written before slow archival MEGA.
-        redis_ok, redis_detail = redis_store_snapshot(CACHE_LATEST, meta)
+        redis_ok, redis_detail = redis_store_snapshot(CACHE_LATEST, meta, clear_deltas=True)
         mega_ok, mega_detail = mega_promote_snapshot(CACHE_LATEST)
         with STATE_LOCK:
             if mega_ok:
@@ -407,6 +805,8 @@ def _download_mega_latest():
                         STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or '')
                         STATE['last_snapshot_size'] = int(meta.get('size') or 0)
                     try:
+                        CACHE_DB.unlink(missing_ok=True)
+                        _ensure_cache_db_v267()
                         redis_store_snapshot(CACHE_LATEST, meta)
                     except Exception:
                         pass
@@ -509,6 +909,33 @@ def _schedule_restore_refresh():
     threading.Thread(target=_restore_refresh_background, name='vys262-worker-restore-refresh', daemon=True).start(); return True
 
 
+def _reconcile_hash_loop_v268():
+    """Every ~6h compare hashes; transfer a full database only on real divergence."""
+    while True:
+        interval=env_int('WORKER_RECONCILE_SEC',21600,900,86400)
+        time.sleep(interval)
+        base,secret=front_base(),peer_secret()
+        if not base or not secret: continue
+        with STATE_LOCK: STATE['reconcile_last_at']=time.time()
+        try:
+            r=requests.get(base+'/internal/split/hash',headers={'X-Peer-Secret':secret,'User-Agent':'vys-262-worker-reconcile-r13'},timeout=30)
+            if r.status_code!=200: raise RuntimeError(f'hash HTTP {r.status_code}: {r.text[:160]}')
+            body=r.json() if r.content else {}; front_sha=str(body.get('sha256') or '')
+            with STATE_LOCK: worker_sha=str(STATE.get('last_state_sha256') or '')
+            if front_sha and worker_sha and front_sha==worker_sha:
+                with STATE_LOCK: STATE['reconcile_last_ok']=time.time(); STATE['reconcile_last_error']=''
+                print(f'[R13 RECONCILE] hash OK {front_sha[:16]}',flush=True); continue
+            # Rare recovery: only now fetch the ~1 MB full compressed SQLite.
+            ok,detail=sync_state_job({'state_token':str(body.get('state_token') or ''),'reason':'reconcile_hash_mismatch'})
+            with STATE_LOCK:
+                if ok:
+                    STATE['reconcile_last_ok']=time.time(); STATE['reconcile_last_error']=''; STATE['reconcile_full_resyncs']=int(STATE.get('reconcile_full_resyncs') or 0)+1
+                else: STATE['reconcile_last_error']=str(detail)[:220]
+            print(f'[R13 RECONCILE] full={ok} {detail}',flush=True)
+        except Exception as exc:
+            with STATE_LOCK: STATE['reconcile_last_error']=f'{type(exc).__name__}: {str(exc)[:220]}'
+            print(f'[R13 RECONCILE ERROR] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
+
 def peer_loop():
     time.sleep(5)
     while True:
@@ -519,7 +946,7 @@ def peer_loop():
         with STATE_LOCK: STATE['peer_last_attempt'] = time.time()
         if base:
             try:
-                headers={'User-Agent':'vys-262-worker-peer-r10'}
+                headers={'User-Agent':'vys-262-worker-peer-r11'}
                 if peer_secret(): headers['X-Peer-Secret']=peer_secret()
                 r = requests.get(base + '/peer/health', headers=headers, timeout=12)
                 payload = {}
@@ -786,6 +1213,82 @@ def health():
     with STATE_LOCK: state=dict(STATE)
     return {'ok':True,'role':'worker','version':VERSION,'front_configured':bool(front_base()),'mega_configured':bool(os.getenv('MEGA_SESSION') or (os.getenv('MEGA_EMAIL') and os.getenv('MEGA_PASSWORD'))),'google_configured':bool(os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')),'queue_size':JOB_Q.qsize(),'google_queue_size':GOOGLE_Q.qsize(),'state':state},200
 
+@app.route('/internal/event/receipt', methods=['POST'])
+def internal_event_receipt_v268():
+    if not authorized(): return {'ok':False},404
+    wire=request.get_data(cache=False,as_text=False) or b''
+    if not wire or len(wire)>env_int('WORKER_EVENT_MAX_WIRE_KB',512,16,4096)*1024: return {'ok':False,'error':'event wire invalid'},413
+    try:
+        raw=gzip.decompress(wire) if str(request.headers.get('Content-Encoding') or '').lower()=='gzip' else wire
+        row=json.loads(raw.decode('utf-8'))
+    except Exception as exc: return {'ok':False,'error':f'event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
+    if not isinstance(row,dict) or int(row.get('schema') or 0)!=1 or not str(row.get('event_id') or ''): return {'ok':False,'error':'event schema invalid'},400
+    eid=str(row.get('event_id'))
+    row['state']='received'; row['received_at']=float(row.get('received_at') or time.time()); row['updated_at']=time.time()
+    _event_local_upsert_v268(row)
+    rok,rdetail=_event_redis_store_v268(row)
+    if not rok:
+        with STATE_LOCK: STATE['event_last_error']=str(rdetail)[:220]
+        return {'ok':False,'error':'Redis witness failed: '+str(rdetail)[:180]},503
+    with STATE_LOCK:
+        STATE['event_received']=int(STATE.get('event_received') or 0)+1; STATE['event_last_at']=time.time(); STATE['event_last_error']=''
+    return {'ok':True,'event_id':eid,'state':'received','durable':'redis'},200
+
+@app.route('/internal/event/commit', methods=['POST'])
+def internal_event_commit_v268():
+    if not authorized(): return {'ok':False},404
+    row=request.get_json(silent=True) or {}; eid=str(row.get('event_id') or row.get('update_id') or '')
+    if not eid: return {'ok':False,'error':'event id empty'},400
+    state='committed' if str(row.get('state') or '')=='committed' else 'failed_retry'
+    row.update({'event_id':eid,'update_id':str(row.get('update_id') or eid),'state':state,'updated_at':time.time()})
+    if state=='committed' and not float(row.get('committed_at') or 0.0): row['committed_at']=time.time()
+    _event_local_upsert_v268(row); rok,rdetail=_event_redis_store_v268(row)
+    if not rok: return {'ok':False,'error':'Redis event update failed: '+str(rdetail)[:180]},503
+    with STATE_LOCK:
+        if state=='committed': STATE['event_committed']=int(STATE.get('event_committed') or 0)+1
+        STATE['event_last_at']=time.time(); STATE['event_last_error']=''
+    return {'ok':True,'event_id':eid,'state':state},200
+
+@app.route('/internal/events/pending', methods=['GET'])
+def internal_events_pending_v268():
+    if not authorized(): return {'ok':False},404
+    try: limit=max(1,min(250,int(request.args.get('limit','100') or '100')))
+    except Exception: limit=100
+    rows=_event_pending_rows_v268(limit)
+    return {'ok':True,'events':rows,'count':len(rows)},200
+
+@app.route('/internal/delta', methods=['POST'])
+def internal_delta_v267():
+    """Apply a compact page delta to the Worker's exact SQLite cache.
+
+    Normal Front updates use this endpoint. A 409 means the Front and Worker bases
+    diverged and the Front should perform one full /internal/snapshot/upload rebase.
+    """
+    if not authorized():
+        return {'ok':False},404
+    max_wire=env_int('WORKER_DELTA_MAX_WIRE_KB',2048,32,16384)*1024
+    wire=request.get_data(cache=False,as_text=False) or b''
+    if not wire:
+        return {'ok':False,'error':'empty delta'},400
+    if len(wire)>max_wire:
+        return {'ok':False,'error':f'delta too large: {len(wire)} > {max_wire}'},413
+    try:
+        raw=gzip.decompress(wire) if str(request.headers.get('Content-Encoding') or '').lower()=='gzip' else wire
+        if len(raw)>env_int('WORKER_DELTA_MAX_JSON_MB',16,1,64)*1024*1024:
+            return {'ok':False,'error':'delta JSON too large'},413
+        payload=json.loads(raw.decode('utf-8'))
+    except Exception as exc:
+        return {'ok':False,'error':f'delta decode: {type(exc).__name__}: {str(exc)[:240]}'},400
+    with DELTA_APPLY_LOCK:
+        ok,detail,status=_apply_delta_payload_v267(payload,journal_wire=wire,replay=False)
+    if ok:
+        with STATE_LOCK:
+            return {'ok':True,'status':status,'detail':detail,'state_token':STATE.get('last_state_token'),'state_sha256':STATE.get('last_state_sha256'),'delta_since_checkpoint':STATE.get('delta_since_checkpoint')},200
+    with STATE_LOCK:
+        STATE['delta_last_error']=str(detail)[:240]
+    code=409 if status=='need_full' else 400
+    return {'ok':False,'status':status,'error':detail,'worker_sha256':str(STATE.get('last_state_sha256') or '')},code
+
 @app.route('/internal/job', methods=['POST'])
 def internal_job():
     global SYNC_PENDING, SYNC_DIRTY, SYNC_DIRTY_REASON
@@ -966,6 +1469,7 @@ def internal_snapshot_upload():
         return {'ok':False,'error':'empty snapshot'},400
     if len(raw) > max_bytes:
         return {'ok':False,'error':f'snapshot too large: {len(raw)} > {max_bytes}'},413
+    DELTA_APPLY_LOCK.acquire()
     fd, name = tempfile.mkstemp(prefix='vys262_uploaded_', suffix='.sqlite3.gz'); os.close(fd)
     incoming = Path(name)
     try:
@@ -989,8 +1493,14 @@ def internal_snapshot_upload():
             STATE['last_snapshot_sha256'] = str(meta.get('sha256_gz') or '')
             STATE['last_snapshot_size'] = int(meta.get('size') or len(raw))
             STATE['last_snapshot_at'] = time.time()
+            STATE['last_state_token'] = str(request.headers.get('X-Split-State-Token') or STATE.get('last_state_token') or '')[:120]
         try:
-            redis_store_snapshot(CACHE_LATEST, meta)
+            CACHE_DB.unlink(missing_ok=True)
+            _ensure_cache_db_v267()
+            with STATE_LOCK:
+                STATE['last_state_sha256'] = _sha256_file_v267(CACHE_DB) if CACHE_DB.exists() else ''
+                STATE['delta_since_checkpoint'] = 0
+            redis_store_snapshot(CACHE_LATEST, meta, clear_deltas=True)
         except Exception:
             pass
         job = {
@@ -1013,6 +1523,9 @@ def internal_snapshot_upload():
     except Exception as exc:
         incoming.unlink(missing_ok=True)
         return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:400]}'},500
+    finally:
+        try: DELTA_APPLY_LOCK.release()
+        except Exception: pass
 
 
 @app.route('/internal/restore/latest', methods=['GET'])
@@ -1294,9 +1807,15 @@ threading.Thread(target=peer_loop,name='vys262-worker-peer',daemon=True).start()
 try:
     _r6_redis_ok, _r6_redis_detail = redis_load_snapshot_to_cache()
     print(f'[R6 RESTORE CACHE] redis ok={_r6_redis_ok} {_r6_redis_detail}', flush=True)
+    if _r6_redis_ok:
+        _r12_replay_ok, _r12_replay_detail = redis_replay_deltas_v267()
+        print(f'[R12 DELTA REPLAY] ok={_r12_replay_ok} {_r12_replay_detail}', flush=True)
 except Exception as _r6_exc:
     print(f'[R6 RESTORE CACHE] redis error={type(_r6_exc).__name__}: {str(_r6_exc)[:180]}', flush=True)
 threading.Thread(target=_restore_refresh_background,name='vys262-worker-mega-warmup',daemon=True).start()
+threading.Thread(target=_checkpoint_loop_v267,name='vys262-worker-checkpoint-r13',daemon=True).start()
+threading.Thread(target=_event_reconcile_loop_v268,name='vys262-worker-events-r13',daemon=True).start()
+threading.Thread(target=_reconcile_hash_loop_v268,name='vys262-worker-reconcile-r13',daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0',port=env_int('PORT',10000,1,65535),threaded=True)
