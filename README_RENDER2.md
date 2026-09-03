@@ -61,3 +61,7 @@ Normal state changes arrive through `/internal/delta` as changed SQLite pages. W
 
 ## R14 internal configuration
 All runtime tuning values (intervals, limits, ports, feature switches and internal Redis key names) are packaged in `runtime_config.py`. Render Environment should contain only credentials, remote addresses and external Telegram/Google/MEGA identifiers. Stale tuning variables left in Render are ignored/overwritten at service startup.
+
+## R15 FAST HOTPATH
+- RAW event receipt acknowledges after Worker-local SQLite fsync; Redis event persistence is handled by a dedicated retrying queue/reconcile loop so Front is not held by Redis latency.
+- Worker remains owner of Redis/MEGA/Google/heavy checkpoints. No new numeric Render ENV is required; R14 runtime_config.py remains authoritative.

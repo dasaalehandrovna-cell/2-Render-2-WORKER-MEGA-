@@ -43,7 +43,7 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r14-internal-config'
+VERSION = 'vys-262-worker-r15-fast-hotpath'
 TRANSPORT_VERSION = 'vys-262-worker-r14-internal-config'
 
 
@@ -105,12 +105,14 @@ _REDIS_DELTA_META_KEY = _REDIS_DELTA_KEY + ':meta'
 _REDIS_EVENT_PREFIX = str(os.getenv('WORKER_REDIS_EVENT_PREFIX','vys262:tg_events:v1') or 'vys262:tg_events:v1').strip()
 EVENT_DB = CACHE_DIR / 'event_journal.sqlite3'
 EVENT_LOCK = threading.RLock()
+EVENT_REDIS_Q = queue.Queue(maxsize=env_int('WORKER_EVENT_REDIS_QUEUE_MAX',2048,64,20000))
 
 def _event_db_init_v268():
     with EVENT_LOCK:
         conn=sqlite3.connect(EVENT_DB,timeout=10)
         try:
             conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=FULL')
             conn.execute("CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY, update_id TEXT, chat_id TEXT, update_type TEXT, payload_json TEXT, payload_sha256 TEXT, state TEXT, received_at REAL, committed_at REAL, mirrored_at REAL, state_token TEXT, last_error TEXT, updated_at REAL)")
             conn.execute('CREATE INDEX IF NOT EXISTS idx_events_state_time ON events(state,updated_at)')
             conn.commit()
@@ -166,6 +168,38 @@ def _event_redis_store_v268(row:dict):
         pipe.execute(); return True,'Redis event stored'
     except Exception as exc: return False,f'{type(exc).__name__}: {str(exc)[:220]}'
 
+
+
+def _event_redis_enqueue_v270(row:dict) -> bool:
+    """R15: acknowledge the remote witness after Worker-local fsync; Redis flush is detached.
+
+    This keeps Render #1 fast while retaining a second-service copy immediately.  The
+    reconcile loop retries every unmirrored local event into Redis until it succeeds.
+    """
+    try:
+        EVENT_REDIS_Q.put_nowait(dict(row or {}))
+        return True
+    except queue.Full:
+        return False
+
+def _event_redis_flush_loop_v270():
+    while True:
+        row = EVENT_REDIS_Q.get()
+        try:
+            ok, detail = _event_redis_store_v268(row)
+            if not ok:
+                with STATE_LOCK:
+                    STATE['event_last_error'] = ('async redis: ' + str(detail))[:220]
+                # Small retry without blocking the HTTP receipt path.
+                time.sleep(env_int('WORKER_EVENT_REDIS_RETRY_MS',250,10,5000)/1000.0)
+                try: EVENT_REDIS_Q.put_nowait(row)
+                except queue.Full: pass
+        except Exception as exc:
+            with STATE_LOCK:
+                STATE['event_last_error'] = f'async redis {type(exc).__name__}: {str(exc)[:180]}'
+        finally:
+            EVENT_REDIS_Q.task_done()
+
 def _event_hydrate_pending_from_redis_v268(limit=250):
     client=_redis_client()
     if client is None: return 0
@@ -218,9 +252,20 @@ def _event_pending_rows_v268(limit=100):
 
 def _event_reconcile_loop_v268():
     while True:
-        time.sleep(20)
+        time.sleep(env_int('WORKER_EVENT_REDIS_RECONCILE_SEC',5,1,300))
         try:
             _event_hydrate_pending_from_redis_v268(500)
+            # R15: any Worker-local event not yet guaranteed in Redis is retried here.
+            _event_db_init_v268()
+            with EVENT_LOCK:
+                conn=sqlite3.connect(EVENT_DB,timeout=10)
+                rows=conn.execute("SELECT event_id,update_id,chat_id,update_type,payload_json,payload_sha256,state,received_at,committed_at,state_token,last_error FROM events WHERE state IN ('received','failed_retry','committed') ORDER BY updated_at ASC LIMIT 200").fetchall()
+                conn.close()
+            for r in rows:
+                try: payload=json.loads(r[4] or '{}')
+                except Exception: payload={}
+                row={'event_id':r[0],'update_id':r[1],'chat_id':r[2],'update_type':r[3],'payload':payload,'payload_sha256':r[5],'state':r[6],'received_at':r[7],'committed_at':r[8],'state_token':r[9],'last_error':r[10]}
+                _event_redis_store_v268(row)
             # prune old mirrored local diagnostics; Redis keys expire independently.
             cutoff=time.time()-env_int('WORKER_EVENT_RETENTION_SEC',604800,86400,2592000)
             with EVENT_LOCK:
@@ -1227,14 +1272,17 @@ def internal_event_receipt_v268():
     if not isinstance(row,dict) or int(row.get('schema') or 0)!=1 or not str(row.get('event_id') or ''): return {'ok':False,'error':'event schema invalid'},400
     eid=str(row.get('event_id'))
     row['state']='received'; row['received_at']=float(row.get('received_at') or time.time()); row['updated_at']=time.time()
-    _event_local_upsert_v268(row)
-    rok,rdetail=_event_redis_store_v268(row)
-    if not rok:
-        with STATE_LOCK: STATE['event_last_error']=str(rdetail)[:220]
-        return {'ok':False,'error':'Redis witness failed: '+str(rdetail)[:180]},503
+    if not _event_local_upsert_v268(row):
+        return {'ok':False,'error':'worker local event journal failed'},503
+    queued=_event_redis_enqueue_v270(row)
+    if not queued:
+        rok,rdetail=_event_redis_store_v268(row)
+        if not rok:
+            with STATE_LOCK: STATE['event_last_error']=str(rdetail)[:220]
+            return {'ok':False,'error':'event witness queue+Redis failed: '+str(rdetail)[:180]},503
     with STATE_LOCK:
         STATE['event_received']=int(STATE.get('event_received') or 0)+1; STATE['event_last_at']=time.time(); STATE['event_last_error']=''
-    return {'ok':True,'event_id':eid,'state':'received','durable':'redis'},200
+    return {'ok':True,'event_id':eid,'state':'received','durable':'worker_local+redis_async'},200
 
 @app.route('/internal/event/commit', methods=['POST'])
 def internal_event_commit_v268():
@@ -1802,6 +1850,8 @@ def internal_export_download_r7(job_id):
     return send_file(path,as_attachment=True,download_name=str(row.get('filename') or path.name),max_age=0)
 
 threading.Thread(target=file_loop,name='vys262-worker-files-r7',daemon=True).start()
+
+threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
 
 threading.Thread(target=worker_loop,name='vys262-worker-jobs',daemon=True).start()
 threading.Thread(target=google_loop,name='vys262-worker-google',daemon=True).start()
