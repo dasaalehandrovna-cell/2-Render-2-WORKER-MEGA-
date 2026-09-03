@@ -1673,7 +1673,7 @@ def _r10_rgb_hex(rgb):
         return None
 
 def _r10_apply_v262_xlsx_style(cell, row, r_idx, c_idx, max_cols, layout):
-    """Use one canonical vys-262 palette for file XLSX and Google Sheets."""
+    """R16 canonical palette for every XLSX file and Google Sheets path."""
     try:
         fmt=_v262_google_cell_format(row,r_idx,c_idx,max_cols,layout) or {}
     except Exception:
@@ -1699,7 +1699,7 @@ def _r10_apply_v262_xlsx_style(cell, row, r_idx, c_idx, max_cols, layout):
         cell.border=Border(left=side('left'),right=side('right'),top=side('top'),bottom=side('bottom'))
 
 def _render_export_file(body, job_id):
-    ftype = 'xlsx' if str(body.get('file_type') or '').lower() == 'xlsx' else 'csv'
+    ftype = 'xlsx' if str(body.get('file_type') or '').lower() in {'xlsx','xlsxstat','excel'} else 'csv'
     filename = _safe_export_name(body.get('filename'), ftype)
     path = FILE_DIR / f'{job_id}.{ftype}'
     rows = body.get('rows') or []

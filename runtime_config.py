@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r15-fast-hotpath"
+CONFIG_VERSION = "vys-262-r16-fast-finance-color-xlsx"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {

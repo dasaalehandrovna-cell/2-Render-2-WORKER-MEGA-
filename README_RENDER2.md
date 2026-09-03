@@ -65,3 +65,7 @@ All runtime tuning values (intervals, limits, ports, feature switches and intern
 ## R15 FAST HOTPATH
 - RAW event receipt acknowledges after Worker-local SQLite fsync; Redis event persistence is handled by a dedicated retrying queue/reconcile loop so Front is not held by Redis latency.
 - Worker remains owner of Redis/MEGA/Google/heavy checkpoints. No new numeric Render ENV is required; R14 runtime_config.py remains authoritative.
+
+
+## R16 FAST FINANCE + ALL COLOR XLSX
+See FIXES_R16_FAST_FINANCE_ALL_COLOR_XLSX.txt.
