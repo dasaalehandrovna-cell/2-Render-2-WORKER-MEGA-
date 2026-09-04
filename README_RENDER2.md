@@ -101,3 +101,9 @@ Render #2 remains the heavy execution/durable service. R21 changes the Front bou
 See `FIXES_R22_ZERO_BLOCKING_BUTTON_RENDER.txt`.
 
 Render #2 remains the HEAVY/durable service. R22 changes only the Front critical path and keeps the existing R20 durable capsule key/format compatible.
+
+
+## Пер-R23 — HEAVY SECOND STAGE
+See `FIXES_R23_FAST_RAM_FIRST_REMOTE_GUARD.txt`.
+
+Render #2 remains the durable/heavy worker. R23 intentionally moves even more work out of the Front callback hot path; Redis/shared durability, Google, MEGA, snapshots, exports and other slow work stay on HEAVY/background stages. R20 durable capsule key/format remains compatible.

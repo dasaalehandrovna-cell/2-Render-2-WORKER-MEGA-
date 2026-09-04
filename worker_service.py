@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R22.
+"""vys-262 Render #2 heavy worker · Пер-R23.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
