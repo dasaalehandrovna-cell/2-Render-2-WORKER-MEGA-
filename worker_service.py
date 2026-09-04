@@ -1,6 +1,6 @@
-# v263
+# v262
 #!/usr/bin/env python3
-"""vys-263 Render #2 heavy worker.
+"""vys-262 Render #2 heavy worker.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -43,54 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-263-worker-r17-local-lab-hybrid-guard'
-TRANSPORT_VERSION = 'vys-263-worker-r17-isolation-control'
-
-WORKER_IO_LOCK_V263 = threading.RLock()
-def _worker_io_norm_v263(value):
-    raw=str(value or '').strip().lower().replace('-','_').replace(' ','_')
-    if raw in {'local','lab','local_lab','locallab'}: return 'local_lab'
-    if raw in {'safe','safe_isolation','isolation'}: return 'safe_isolation'
-    return 'normal'
-WORKER_IO_PROFILE_V263 = _worker_io_norm_v263(os.getenv('EXTERNAL_IO_BOOT_MODE','normal'))
-WORKER_IO_SEGMENTS_V263 = {'mega_critical':True,'mega_backup':True,'google':True,'currency':True,'self_http':True,'peer_http':True,'other_http':True}
-WORKER_IO_BLOCKED_V263 = {k:0 for k in WORKER_IO_SEGMENTS_V263}
-WORKER_IO_LAST_BLOCK_V263 = {}
-
-def worker_io_allowed_v263(category, source=''):
-    global WORKER_IO_LAST_BLOCK_V263
-    cat=str(category or 'other_http').strip().lower()
-    aliases={'mega':'mega_backup','redis':'peer_http','worker_http':'peer_http','usd':'currency','http':'other_http'}
-    cat=aliases.get(cat,cat)
-    if cat not in WORKER_IO_SEGMENTS_V263: cat='other_http'
-    with WORKER_IO_LOCK_V263:
-        ok=WORKER_IO_PROFILE_V263=='normal' and bool(WORKER_IO_SEGMENTS_V263.get(cat,True))
-        if not ok:
-            WORKER_IO_BLOCKED_V263[cat]=int(WORKER_IO_BLOCKED_V263.get(cat,0) or 0)+1
-            WORKER_IO_LAST_BLOCK_V263={'category':cat,'source':str(source or '')[:160],'time':time.time(),'profile':WORKER_IO_PROFILE_V263}
-        return ok
-
-def _worker_http_category_v263(url):
-    try:
-        from urllib.parse import urlsplit
-        host=(urlsplit(str(url or '')).hostname or '').lower()
-    except Exception: host=''
-    if 'googleapis.com' in host or host.endswith('google.com'): return 'google'
-    try:
-        peer=(front_base().split('://',1)[-1].split('/',1)[0].split(':',1)[0] or '').lower()
-    except Exception: peer=''
-    if peer and host==peer: return 'peer_http'
-    render_host=str(os.getenv('RENDER_EXTERNAL_HOSTNAME','') or '').lower()
-    if render_host and host==render_host: return 'self_http'
-    return 'other_http'
-
-_WORKER_REQUEST_ORIG_V263 = requests.sessions.Session.request
-def _worker_request_guard_v263(self, method, url, *args, **kwargs):
-    cat=_worker_http_category_v263(url)
-    if not worker_io_allowed_v263(cat, f'{method}:{url}'):
-        raise RuntimeError(f'external_io_blocked_v263:{cat}')
-    return _WORKER_REQUEST_ORIG_V263(self, method, url, *args, **kwargs)
-requests.sessions.Session.request=_worker_request_guard_v263
+VERSION = 'vys-262-worker-r17-full-restore'
+TRANSPORT_VERSION = 'vys-262-worker-r17-internal-config'
 
 
 def env_bool(name, default=False):
@@ -108,7 +62,7 @@ def front_base():
     raw = str(os.getenv('FRONT_SERVICE_URL', os.getenv('PEER_SERVICE_URL','')) or '').strip().rstrip('/')
     if raw and not raw.startswith(('http://','https://')): raw = 'https://' + raw
     return raw
-def mega_root(): return '/' + str(os.getenv('MEGA_BACKUP_DIR','TelegramBotBackups') or 'TelegramBotBackups').strip('/')
+def mega_root(): return '/' + str(os.getenv('MEGA_BACKUP_DIR','TelegramBotBackups2-2') or 'TelegramBotBackups2-2').strip('/')
 def remote_db_dir(): return mega_root().rstrip('/') + '/database'
 def remote_latest(): return remote_db_dir().rstrip('/') + '/latest_bot_state.sqlite3.gz'
 def remote_history_dir(): return remote_db_dir().rstrip('/') + '/history'
@@ -320,8 +274,6 @@ def _event_reconcile_loop_v268():
             with STATE_LOCK: STATE['event_last_error']=f'{type(exc).__name__}: {str(exc)[:180]}'
 
 def _redis_client():
-    if not worker_io_allowed_v263('peer_http', 'worker:redis_client'):
-        return None
     global _REDIS_CLIENT
     if _redis is None:
         return None
@@ -404,16 +356,10 @@ def redis_load_snapshot_to_cache():
 
 
 def run_cmd(args, timeout=120):
-    # v263 last subprocess guard for all MEGAcmd invocations.
-    first = str((args or [''])[0] or '').casefold()
-    if first.startswith('mega-') and not worker_io_allowed_v263('mega_backup', 'worker:subprocess:' + first):
-        raise RuntimeError('external_io_blocked_v263:mega_backup:' + first)
     return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
 
 
 def mega_login():
-    if not worker_io_allowed_v263('mega_backup', 'worker:mega_login'):
-        return False, 'external_io_blocked_v263:mega_backup'
     login_timeout = env_int('MEGA_LOGIN_TIMEOUT',120,30,300)
     try:
         who = run_cmd(['mega-whoami'], timeout=min(20,login_timeout))
@@ -461,7 +407,7 @@ def prepare_mega_layout():
 
 
 def mega_legacy_roots():
-    raw = str(os.getenv('MEGA_LEGACY_BACKUP_DIRS','/TelegramBotBackups2-2,/TelegramBotBackups-2T') or '')
+    raw = str(os.getenv('MEGA_LEGACY_BACKUP_DIRS','/TelegramBotBackups-2T,/TelegramBotBackups') or '')
     out = []
     current = mega_root()
     for item in raw.split(','):
@@ -1096,8 +1042,6 @@ def _google_sign(message: bytes, private_key: str):
                 except Exception: pass
 
 def _google_token():
-    if not worker_io_allowed_v263('google', 'worker:google_token'):
-        raise RuntimeError('external_io_blocked_v263:google')
     with GOOGLE_LOCK:
         now = time.time()
         if _GOOGLE_TOKEN['token'] and now < float(_GOOGLE_TOKEN['expires_at']) - 120: return _GOOGLE_TOKEN['token']
@@ -1310,24 +1254,6 @@ def create_google_sheet(body):
 
 @app.route('/', methods=['GET','HEAD'])
 @app.route('/healthz', methods=['GET','HEAD'])
-
-@app.route('/internal/isolation/control', methods=['POST'])
-def internal_isolation_control_v263():
-    global WORKER_IO_PROFILE_V263, WORKER_IO_SEGMENTS_V263
-    if not authorized(): return ({'ok':False},404)
-    body=request.get_json(silent=True) or {}
-    profile=_worker_io_norm_v263(body.get('profile'))
-    seg=body.get('segments') or {}
-    with WORKER_IO_LOCK_V263:
-        WORKER_IO_PROFILE_V263=profile
-        if isinstance(seg,dict):
-            for key in WORKER_IO_SEGMENTS_V263:
-                if key in seg: WORKER_IO_SEGMENTS_V263[key]=bool(seg.get(key))
-        try:
-            (CACHE_DIR/'external_io_v263.json').write_text(json.dumps({'profile':WORKER_IO_PROFILE_V263,'segments':WORKER_IO_SEGMENTS_V263,'updated_at':time.time()},separators=(',',':')),encoding='utf-8')
-        except Exception: pass
-    return ({'ok':True,'profile':WORKER_IO_PROFILE_V263,'segments':WORKER_IO_SEGMENTS_V263},200)
-
 @app.route('/peer/health', methods=['GET','HEAD'])
 def health():
     if request.method == 'HEAD': return '',200
@@ -1520,13 +1446,6 @@ def google_loop():
         finally:
             GOOGLE_Q.task_done()
 
-
-
-@app.route('/internal/isolation/status', methods=['GET'])
-def internal_isolation_status_v263():
-    if not authorized(): return ({'ok':False},404)
-    with WORKER_IO_LOCK_V263:
-        return ({'ok':True,'profile':WORKER_IO_PROFILE_V263,'segments':dict(WORKER_IO_SEGMENTS_V263),'blocked':dict(WORKER_IO_BLOCKED_V263),'last_blocked':dict(WORKER_IO_LAST_BLOCK_V263)},200)
 
 @app.route('/internal/google/sheet', methods=['POST'])
 def internal_google_sheet():
@@ -1930,126 +1849,6 @@ def internal_export_download_r7(job_id):
     if not path.is_file(): return {'ok':False,'error':'file expired'},410
     return send_file(path,as_attachment=True,download_name=str(row.get('filename') or path.name),max_age=0)
 
-
-
-# v263 hybrid storage control/evidence -----------------------------------------
-WORKER_STORAGE_CONTROL_CACHE_V263 = CACHE_DIR / 'storage_control_v263.json'
-
-def _worker_storage_checksum_v263(control:dict) -> str:
-    row={k:v for k,v in dict(control or {}).items() if k!='checksum'}
-    return hashlib.sha256(json.dumps(row,ensure_ascii=False,sort_keys=True,separators=(',',':'),default=str).encode('utf-8')).hexdigest()
-
-def _worker_storage_control_valid_v263(control) -> bool:
-    if not isinstance(control,dict): return False
-    try:
-        return int(control.get('schema_version') or 0)==1 and str(control.get('mode') or '') in {'auto','telegram_first','mega_first','newest_verified','render_only'} and bool(control.get('checksum')) and secrets.compare_digest(str(control.get('checksum')), _worker_storage_checksum_v263(control))
-    except Exception: return False
-
-def _worker_storage_control_remote_v263() -> str:
-    return mega_root().rstrip('/') + '/control/storage_control.json'
-
-def _worker_storage_control_cache_write_v263(control:dict) -> bool:
-    try:
-        tmp=WORKER_STORAGE_CONTROL_CACHE_V263.with_suffix('.tmp')
-        tmp.write_text(json.dumps(control,ensure_ascii=False,sort_keys=True,separators=(',',':'))+'\n',encoding='utf-8')
-        os.replace(tmp,WORKER_STORAGE_CONTROL_CACHE_V263); return True
-    except Exception: return False
-
-def _worker_storage_control_cache_read_v263() -> dict:
-    try:
-        row=json.loads(WORKER_STORAGE_CONTROL_CACHE_V263.read_text(encoding='utf-8'))
-        return dict(row) if _worker_storage_control_valid_v263(row) else {}
-    except Exception: return {}
-
-def worker_storage_control_read_v263(force_mega:bool=True) -> dict:
-    cached=_worker_storage_control_cache_read_v263()
-    if not force_mega or not worker_io_allowed_v263('mega_critical','worker:storage_control_read'):
-        return cached
-    work=Path(tempfile.mkdtemp(prefix='vys263_storage_control_get_'))
-    try:
-        ok,detail=mega_login()
-        if not ok: return cached
-        remote=_worker_storage_control_remote_v263()
-        p=run_cmd(['mega-get',remote,str(work)],timeout=60)
-        if p.returncode!=0: return cached
-        rows=list(work.rglob('storage_control.json'))
-        if not rows: return cached
-        row=json.loads(rows[0].read_text(encoding='utf-8'))
-        if not _worker_storage_control_valid_v263(row): return cached
-        _worker_storage_control_cache_write_v263(row)
-        return dict(row)
-    except Exception: return cached
-    finally: shutil.rmtree(work,ignore_errors=True)
-
-def worker_storage_control_write_v263(control:dict) -> tuple[bool,bool,str]:
-    if not _worker_storage_control_valid_v263(control): return False,False,'invalid control'
-    accepted=_worker_storage_control_cache_write_v263(control)
-    if not accepted: return False,False,'local control cache write failed'
-    if not worker_io_allowed_v263('mega_critical','worker:storage_control_write'):
-        return True,False,'MEGA blocked; control cached pending mirror'
-    work=Path(tempfile.mkdtemp(prefix='vys263_storage_control_put_'))
-    try:
-        ok,detail=mega_login()
-        if not ok: return True,False,detail
-        root=mega_root().rstrip('/'); control_dir=root+'/control'
-        ensure_mega_dir(root); ensure_mega_dir(control_dir)
-        stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
-        name=f'storage_control_candidate_{stamp}.json'; local=work/name
-        local.write_text(json.dumps(control,ensure_ascii=False,sort_keys=True,separators=(',',':'))+'\n',encoding='utf-8')
-        put=run_cmd(['mega-put',str(local),control_dir],timeout=90)
-        if put.returncode!=0: return True,False,'mega-put control failed'
-        candidate=control_dir+'/'+name; final=_worker_storage_control_remote_v263()
-        # Preserve old final until candidate is uploaded. Rename old into a rollback slot.
-        rollback=control_dir+f'/storage_control_previous_{stamp}.json'
-        if mega_exists(final):
-            try: run_cmd(['mega-mv',final,rollback],timeout=60)
-            except Exception: rollback=''
-        mv=run_cmd(['mega-mv',candidate,final],timeout=60)
-        if mv.returncode!=0:
-            if rollback and mega_exists(rollback):
-                try: run_cmd(['mega-mv',rollback,final],timeout=60)
-                except Exception: pass
-            return True,False,'mega-mv control failed; rollback attempted'
-        verify=worker_storage_control_read_v263(True)
-        mirrored=bool(_worker_storage_control_valid_v263(verify) and str(verify.get('checksum'))==str(control.get('checksum')))
-        return True,mirrored,'MEGA control mirrored' if mirrored else 'MEGA control verify pending'
-    except Exception as exc: return True,False,f'{type(exc).__name__}: {str(exc)[:220]}'
-    finally: shutil.rmtree(work,ignore_errors=True)
-
-def worker_storage_evidence_v263() -> dict:
-    ok,detail,meta=_ensure_cache_db_v267()
-    out={'backend':'mega','available':bool(ok),'detail':detail,'generation':int(STATE.get('full_checkpoint_count') or 0),'user_state_seq':int((meta or {}).get('user_state_seq') or 0),'db_sha256':str((meta or {}).get('sha256_db') or ''),'lineage':'','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds')}
-    if ok and CACHE_DB.exists():
-        try:
-            con=sqlite3.connect(str(CACHE_DB))
-            try:
-                row=con.execute("SELECT v FROM meta WHERE kind='storage_lineage_v239' AND k='current'").fetchone()
-                payload=json.loads(row[0]) if row and row[0] else {}
-                out['lineage']=str((payload or {}).get('lineage') or '') if isinstance(payload,dict) else str(payload or '')
-                row=con.execute("SELECT v FROM meta WHERE kind='data_constitution_snapshot' AND k='main'").fetchone()
-                manifest=json.loads(row[0]) if row and row[0] else {}
-                if isinstance(manifest,dict):
-                    out['generation']=max(int(out.get('generation') or 0),int(manifest.get('generation') or manifest.get('ledger_highwater_seq') or 0))
-            finally: con.close()
-        except Exception: pass
-    return out
-
-@app.route('/internal/storage/control',methods=['GET','POST'])
-def internal_storage_control_v263():
-    if not authorized(): return {'ok':False},404
-    if request.method=='GET':
-        row=worker_storage_control_read_v263(True)
-        return {'ok':bool(row),'control':row,'version':VERSION},200
-    body=request.get_json(silent=True) or {}; control=body.get('control') or {}
-    accepted,mirrored,detail=worker_storage_control_write_v263(control)
-    return {'ok':bool(accepted),'accepted':bool(accepted),'mega_mirrored':bool(mirrored),'pending':bool(accepted and not mirrored),'detail':detail,'control':control if accepted else {}},200 if accepted else 400
-
-@app.route('/internal/storage/evidence',methods=['GET'])
-def internal_storage_evidence_v263():
-    if not authorized(): return {'ok':False},404
-    return {'ok':True,'evidence':worker_storage_evidence_v263(),'control':worker_storage_control_read_v263(False)},200
-# end v263 hybrid storage ------------------------------------------------------
-
 threading.Thread(target=file_loop,name='vys262-worker-files-r7',daemon=True).start()
 
 threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
@@ -2072,4 +1871,4 @@ threading.Thread(target=_reconcile_hash_loop_v268,name='vys262-worker-reconcile-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0',port=env_int('PORT',10000,1,65535),threaded=True)
-# v263
+# v262
