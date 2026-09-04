@@ -1,4 +1,4 @@
-"""vys-262 R19 internal runtime configuration.
+"""vys-262 R20 internal runtime configuration.
 
 All non-secret operational tunables that used to be Render environment variables
 live here.  Render ENV is intentionally reserved for credentials, remote
@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r19-fast-callback-authoritative-restore"
+CONFIG_VERSION = "vys-262-r20-v262-durable-capsule-fast-ui"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {
@@ -23,7 +23,7 @@ FRONT_INTERNAL_ENV: Dict[str, str] = {
     "RENDER_TELEGRAM_ONLY": "1",
     "MALLOC_ARENA_MAX": "2",
 
-    # R19 FAST lanes: user callbacks must never wait behind cleanup/sync work.
+    # R20 FAST lanes: user callbacks must never wait behind cleanup/sync work.
     "UI_WORKERS": "6",
         "FAST_UI_WORKERS": "4",
         "FAST_UI_MAX_PENDING": "600",
@@ -42,6 +42,10 @@ FRONT_INTERNAL_ENV: Dict[str, str] = {
     "WORKER_REDIS_SNAPSHOT_KEY": "vys262:bot_state:latest_gz",
     "WORKER_REDIS_SNAPSHOT_MAX_MB": "16",
     "WORKER_REDIS_EVENT_PREFIX": "vys262:tg_events:v1",
+    "WORKER_REDIS_CAPSULE_KEY": "vys262:durable_capsule:r20",
+        "WORKER_CAPSULE_MEGA_ENABLED": "1",
+        "WORKER_CAPSULE_MEGA_KEEP": "10",
+    "WORKER_REDIS_CAPSULE_MAX_MB": "8",
     "WORKER_EVENT_RETENTION_SEC": "604800",
 
     # Peer / event-journal transport
@@ -95,6 +99,10 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
     "WORKER_REDIS_DELTA_KEY": "vys262:bot_state:latest_gz:deltas_v1",
     "WORKER_REDIS_DELTA_MAX_ITEMS": "2000",
     "WORKER_REDIS_EVENT_PREFIX": "vys262:tg_events:v1",
+    "WORKER_REDIS_CAPSULE_KEY": "vys262:durable_capsule:r20",
+        "WORKER_CAPSULE_MEGA_ENABLED": "1",
+        "WORKER_CAPSULE_MEGA_KEEP": "10",
+    "WORKER_REDIS_CAPSULE_MAX_MB": "8",
     "WORKER_EVENT_RETENTION_SEC": "604800",
     "WORKER_EVENT_MAX_WIRE_KB": "512",
     "WORKER_EVENT_REDIS_QUEUE_MAX": "2048",

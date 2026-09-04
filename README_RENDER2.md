@@ -86,3 +86,8 @@ HEAVY now accepts immediate full-rebase requests when the delta base mismatches,
 See `FIXES_R19_FAST_CALLBACK_AUTHORITATIVE_RESTORE.txt`.
 
 R19 removes the second legacy boot restore on FAST, gives lightweight navigation callbacks their own dedicated FAST UI lane, moves post-update cleanup off the UI lane, fixes the repeated full-state rebase loop by promoting the exact served full snapshot as the next delta baseline, and pauses automatic Google sync cleanly when no target table is configured.
+
+## R20 DURABLE CONFIG + TRUE FAST LANE
+See `FIXES_R20_DURABLE_CONFIG_FAST_LANE.txt`.
+
+HEAVY owns the R20 durable config/user-state capsule: local cache + Redis + asynchronous versioned MEGA archive. A deep capsule request can heal Redis/local cache from MEGA during FAST preboot.

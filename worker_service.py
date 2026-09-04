@@ -43,8 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r19-fast-callback-authoritative-restore'
-TRANSPORT_VERSION = 'vys-262-worker-r19-internal-config'
+VERSION = 'vys-262-worker-r20-v262-durable-capsule-fast-ui'
+TRANSPORT_VERSION = 'vys-262-worker-r20-internal-config'
 
 
 def env_bool(name, default=False):
@@ -103,6 +103,11 @@ _REDIS_META_KEY = _REDIS_SNAPSHOT_KEY + ':meta'
 _REDIS_DELTA_KEY = str(os.getenv('WORKER_REDIS_DELTA_KEY', _REDIS_SNAPSHOT_KEY + ':deltas_v1') or (_REDIS_SNAPSHOT_KEY + ':deltas_v1')).strip()
 _REDIS_DELTA_META_KEY = _REDIS_DELTA_KEY + ':meta'
 _REDIS_EVENT_PREFIX = str(os.getenv('WORKER_REDIS_EVENT_PREFIX','vys262:tg_events:v1') or 'vys262:tg_events:v1').strip()
+_REDIS_CAPSULE_KEY = str(os.getenv('WORKER_REDIS_CAPSULE_KEY','vys262:durable_capsule:r20') or 'vys262:durable_capsule:r20').strip()
+CAPSULE_LOCAL = CACHE_DIR / 'durable_capsule_r20.json.gz'
+CAPSULE_LOCK = threading.RLock()
+CAPSULE_MEGA_Q = queue.Queue(maxsize=1)
+CAPSULE_MEGA_STATE = {'last_ok':0.0,'last_error':'','uploads':0,'restores':0}
 EVENT_DB = CACHE_DIR / 'event_journal.sqlite3'
 EVENT_LOCK = threading.RLock()
 EVENT_REDIS_Q = queue.Queue(maxsize=env_int('WORKER_EVENT_REDIS_QUEUE_MAX',2048,64,20000))
@@ -1592,6 +1597,233 @@ def internal_snapshot_upload():
         except Exception: pass
 
 
+
+def _capsule_mega_dir_r20():
+    return mega_root().rstrip('/') + '/config_r20'
+
+def _capsule_mega_filename_r20(obj):
+    seq,gen,_=_capsule_tuple_r20(obj) if '_capsule_tuple_r20' in globals() else (0,0,0.0)
+    stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+    return f'capsule_g{int(gen):010d}_s{int(seq):010d}_{stamp}.json.gz'
+
+def _capsule_mega_rows_r20(limit=30):
+    path=_capsule_mega_dir_r20()
+    try:
+        res=run_cmd(['mega-find',path,'--pattern=capsule_*.json.gz','--type=f'],timeout=60)
+        if res.returncode!=0: return []
+        rows=[x.strip() for x in (res.stdout or '').splitlines() if x.strip().endswith('.json.gz')]
+        return sorted(set(rows),reverse=True)[:max(1,int(limit))]
+    except Exception:
+        return []
+
+def _capsule_mega_upload_latest_r20():
+    if not env_bool('WORKER_CAPSULE_MEGA_ENABLED',True): return True,'MEGA capsule disabled'
+    try:
+        with CAPSULE_LOCK:
+            if not CAPSULE_LOCAL.is_file(): return False,'local capsule missing'
+            packed=CAPSULE_LOCAL.read_bytes()
+        obj,err=_capsule_decode_r20(packed)
+        if not obj: return False,err or 'invalid local capsule'
+        with MEGA_LOCK:
+            ok,detail=prepare_mega_layout()
+            if not ok: return False,detail
+            cdir=_capsule_mega_dir_r20()
+            if not ensure_mega_dir(cdir): return False,'cannot create capsule MEGA dir'
+            work=Path(tempfile.mkdtemp(prefix='vys262_capsule_mega_'))
+            try:
+                local=work/_capsule_mega_filename_r20(obj); local.write_bytes(packed)
+                put=run_cmd(['mega-put',str(local),cdir],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+                if put.returncode!=0: return False,'mega-put capsule failed: '+(put.stderr or put.stdout or '')[:180]
+                keep=env_int('WORKER_CAPSULE_MEGA_KEEP',10,3,50)
+                rows=_capsule_mega_rows_r20(keep+30)
+                for old in rows[keep:]:
+                    try: run_cmd(['mega-rm',old],timeout=45)
+                    except Exception: pass
+            finally:
+                shutil.rmtree(work,ignore_errors=True)
+        CAPSULE_MEGA_STATE['last_ok']=time.time(); CAPSULE_MEGA_STATE['last_error']=''; CAPSULE_MEGA_STATE['uploads']=int(CAPSULE_MEGA_STATE.get('uploads') or 0)+1
+        return True,f'MEGA capsule stored gen={_capsule_tuple_r20(obj)[1]} seq={_capsule_tuple_r20(obj)[0]}'
+    except Exception as exc:
+        detail=f'{type(exc).__name__}: {str(exc)[:200]}'; CAPSULE_MEGA_STATE['last_error']=detail; return False,detail
+
+def _capsule_mega_load_r20():
+    if not env_bool('WORKER_CAPSULE_MEGA_ENABLED',True): return {},'MEGA capsule disabled'
+    try:
+        with MEGA_LOCK:
+            ok,detail=prepare_mega_layout()
+            if not ok: return {},detail
+            cdir=_capsule_mega_dir_r20()
+            if not ensure_mega_dir(cdir): return {},'capsule MEGA dir unavailable'
+            rows=_capsule_mega_rows_r20(20)
+            if not rows: return {},'no MEGA capsule'
+            # Filenames are zero-padded by generation then user seq, so reverse sort
+            # gives the strongest recent configuration first. Validate more than one
+            # file so a partial/corrupt upload cannot break recovery.
+            work=Path(tempfile.mkdtemp(prefix='vys262_capsule_get_'))
+            try:
+                candidates=[]
+                for remote in rows[:5]:
+                    dl=work/secrets.token_hex(3); dl.mkdir(parents=True,exist_ok=True)
+                    get=run_cmd(['mega-get',remote,str(dl)],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+                    if get.returncode!=0: continue
+                    files=list(dl.rglob('*.json.gz'))+list(dl.rglob('*.gz'))
+                    for f in files:
+                        obj,err=_capsule_decode_r20(f.read_bytes())
+                        if obj: candidates.append(obj)
+                obj=_capsule_merge_r20(*candidates) if '_capsule_merge_r20' in globals() else (candidates[0] if candidates else {})
+                if obj:
+                    CAPSULE_MEGA_STATE['last_ok']=time.time(); CAPSULE_MEGA_STATE['last_error']=''; CAPSULE_MEGA_STATE['restores']=int(CAPSULE_MEGA_STATE.get('restores') or 0)+1
+                    return obj,f'MEGA capsule OK gen={_capsule_tuple_r20(obj)[1]} seq={_capsule_tuple_r20(obj)[0]}'
+                return {},'MEGA capsule files invalid'
+            finally:
+                shutil.rmtree(work,ignore_errors=True)
+    except Exception as exc:
+        detail=f'{type(exc).__name__}: {str(exc)[:200]}'; CAPSULE_MEGA_STATE['last_error']=detail; return {},detail
+
+def _capsule_mega_enqueue_r20():
+    if not env_bool('WORKER_CAPSULE_MEGA_ENABLED',True): return False
+    try:
+        CAPSULE_MEGA_Q.put_nowait(1); return True
+    except queue.Full:
+        # A queued job reads CAPSULE_LOCAL only when it runs, therefore it naturally
+        # uploads the newest coalesced generation even if several changes arrived.
+        return True
+
+def _capsule_mega_loop_r20():
+    while True:
+        CAPSULE_MEGA_Q.get()
+        try:
+            time.sleep(0.25)
+            # Collapse any duplicate wakeups; the file itself is the latest generation.
+            try:
+                while True: CAPSULE_MEGA_Q.get_nowait(); CAPSULE_MEGA_Q.task_done()
+            except queue.Empty: pass
+            ok,detail=_capsule_mega_upload_latest_r20()
+            if not ok: print('[R20 CAPSULE MEGA] '+detail,flush=True)
+        except Exception as exc:
+            CAPSULE_MEGA_STATE['last_error']=f'{type(exc).__name__}: {str(exc)[:180]}'
+        finally:
+            CAPSULE_MEGA_Q.task_done()
+
+def _capsule_decode_r20(raw: bytes):
+    try:
+        if raw[:2] == b'\x1f\x8b': raw = gzip.decompress(raw)
+        obj=json.loads(raw.decode('utf-8'))
+        if not isinstance(obj,dict) or str(obj.get('kind') or '')!='vys262_durable_capsule_r20':
+            return {}, 'invalid capsule kind'
+        return obj, ''
+    except Exception as exc:
+        return {}, f'{type(exc).__name__}: {str(exc)[:180]}'
+
+def _capsule_tuple_r20(obj):
+    return (int((obj or {}).get('user_state_seq') or ((obj or {}).get('user_state') or {}).get('seq') or 0),
+            int((obj or {}).get('config_generation') or ((obj or {}).get('config_checkpoint') or {}).get('generation') or 0),
+            float((obj or {}).get('saved_at') or 0.0))
+
+def _capsule_merge_r20(*rows):
+    rows=[x for x in rows if isinstance(x,dict) and x]
+    if not rows: return {}
+    merged=dict(max(rows,key=lambda x: float(x.get('saved_at') or 0.0)))
+    best_us=max(rows,key=lambda x:int((x.get('user_state') or {}).get('seq') or x.get('user_state_seq') or 0))
+    best_cp=max(rows,key=lambda x:int((x.get('config_checkpoint') or {}).get('generation') or x.get('config_generation') or 0))
+    merged['user_state']=best_us.get('user_state') or {}; merged['user_state_seq']=int((merged['user_state'] or {}).get('seq') or best_us.get('user_state_seq') or 0)
+    merged['config_checkpoint']=best_cp.get('config_checkpoint') or {}; merged['config_generation']=int((merged['config_checkpoint'] or {}).get('generation') or best_cp.get('config_generation') or 0)
+    try:
+        best_rev=max(rows,key=lambda x:float(((x.get('state_revision') or {}).get('saved_at') or 0.0))); merged['state_revision']=best_rev.get('state_revision') or {}
+    except Exception: pass
+    merged['saved_at']=max(float(x.get('saved_at') or 0.0) for x in rows)
+    merged['kind']='vys262_durable_capsule_r20'; merged['schema']=1
+    return merged
+
+def _capsule_load_latest_r20(deep_mega=False):
+    rows=[]; detail=[]
+    client=_redis_client()
+    if client is not None:
+        try:
+            raw=client.get(_REDIS_CAPSULE_KEY)
+            if raw:
+                obj,err=_capsule_decode_r20(bytes(raw))
+                if obj: rows.append(obj); detail.append('redis')
+                elif err: detail.append('redis:'+err)
+        except Exception as exc: detail.append('redis:'+str(exc)[:100])
+    try:
+        if CAPSULE_LOCAL.is_file():
+            obj,err=_capsule_decode_r20(CAPSULE_LOCAL.read_bytes())
+            if obj: rows.append(obj); detail.append('local')
+            elif err: detail.append('local:'+err)
+    except Exception as exc: detail.append('local:'+str(exc)[:100])
+    if deep_mega or not rows:
+        obj,why=_capsule_mega_load_r20()
+        if obj: rows.append(obj); detail.append('mega')
+        elif why: detail.append('mega:'+why[:100])
+    return _capsule_merge_r20(*rows), ','.join(detail)
+
+def _capsule_store_r20(obj:dict, packed:bytes):
+    with CAPSULE_LOCK:
+        old,_=_capsule_load_latest_r20()
+        merged=dict(obj or {})
+        if isinstance(old,dict) and old:
+            old_seq,old_gen,_old_at=_capsule_tuple_r20(old)
+            new_seq,new_gen,_new_at=_capsule_tuple_r20(merged)
+            if old_seq > new_seq:
+                merged['user_state']=old.get('user_state') or {}; merged['user_state_seq']=old_seq
+            if old_gen > new_gen:
+                merged['config_checkpoint']=old.get('config_checkpoint') or {}; merged['config_generation']=old_gen
+            try:
+                if float(((old.get('state_revision') or {}).get('saved_at') or 0.0)) > float(((merged.get('state_revision') or {}).get('saved_at') or 0.0)):
+                    merged['state_revision']=old.get('state_revision') or {}
+            except Exception: pass
+            merged['saved_at']=max(float(old.get('saved_at') or 0.0),float(merged.get('saved_at') or 0.0))
+        packed=gzip.compress(json.dumps(merged,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
+        new_t=_capsule_tuple_r20(merged)
+        tmp=CAPSULE_LOCAL.with_suffix('.tmp'); tmp.write_bytes(packed); os.replace(tmp,CAPSULE_LOCAL)
+        client=_redis_client()
+        if client is not None:
+            meta={'user_state_seq':new_t[0],'config_generation':new_t[1],'saved_at':new_t[2],'size':len(packed),'source':'worker-r20'}
+            pipe=client.pipeline(transaction=True); pipe.set(_REDIS_CAPSULE_KEY,packed); pipe.set(_REDIS_CAPSULE_KEY+':meta',json.dumps(meta,separators=(',',':'))); pipe.execute()
+        with STATE_LOCK:
+            STATE['capsule_seq']=new_t[0]; STATE['capsule_generation']=new_t[1]; STATE['capsule_saved_at']=new_t[2]; STATE['capsule_last_error']=''
+        _capsule_mega_enqueue_r20()
+        return True, f'stored seq={new_t[0]} gen={new_t[1]}'
+
+@app.route('/internal/capsule',methods=['POST'])
+def internal_capsule_r20():
+    if not authorized(): return {'ok':False},404
+    max_bytes=env_int('WORKER_REDIS_CAPSULE_MAX_MB',8,1,32)*1024*1024
+    raw=request.get_data(cache=False)
+    if not raw or len(raw)>max_bytes: return {'ok':False,'error':'invalid capsule size'},413
+    obj,err=_capsule_decode_r20(raw)
+    if not obj: return {'ok':False,'error':err},400
+    # Canonical storage remains gzip independent of HTTP server decompression behavior.
+    packed=gzip.compress(json.dumps(obj,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
+    try:
+        ok,detail=_capsule_store_r20(obj,packed)
+        return {'ok':ok,'detail':detail,'user_state_seq':_capsule_tuple_r20(obj)[0],'config_generation':_capsule_tuple_r20(obj)[1]},200 if ok else 503
+    except Exception as exc:
+        with STATE_LOCK: STATE['capsule_last_error']=f'{type(exc).__name__}: {str(exc)[:180]}'
+        return {'ok':False,'error':STATE['capsule_last_error']},500
+
+@app.route('/internal/capsule/latest',methods=['GET'])
+def internal_capsule_latest_r20():
+    if not authorized(): return {'ok':False},404
+    deep=str(request.args.get('deep') or '').strip().lower() in {'1','true','yes','on'}
+    obj,detail=_capsule_load_latest_r20(deep_mega=deep)
+    if not obj: return {'ok':False,'error':'capsule not available','detail':detail},404
+    # A deep boot restore also heals local/Redis from MEGA without waiting for the next change.
+    if deep:
+        try:
+            packed0=gzip.compress(json.dumps(obj,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
+            with CAPSULE_LOCK:
+                tmp=CAPSULE_LOCAL.with_suffix('.tmp'); tmp.write_bytes(packed0); os.replace(tmp,CAPSULE_LOCAL)
+            client=_redis_client()
+            if client is not None:
+                pipe=client.pipeline(transaction=True); pipe.set(_REDIS_CAPSULE_KEY,packed0); pipe.set(_REDIS_CAPSULE_KEY+':meta',json.dumps({'user_state_seq':_capsule_tuple_r20(obj)[0],'config_generation':_capsule_tuple_r20(obj)[1],'saved_at':_capsule_tuple_r20(obj)[2],'size':len(packed0),'source':'worker-r20-deep'},separators=(',',':'))); pipe.execute()
+        except Exception: pass
+    packed=gzip.compress(json.dumps(obj,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
+    resp=Response(packed,status=200,mimetype='application/gzip')
+    resp.headers['X-Capsule-User-Seq']=str(_capsule_tuple_r20(obj)[0]); resp.headers['X-Capsule-Config-Generation']=str(_capsule_tuple_r20(obj)[1])
+    return resp
+
 @app.route('/internal/restore/latest', methods=['GET'])
 def internal_restore_latest():
     if not authorized(): return {'ok':False},404
@@ -1864,6 +2096,7 @@ def internal_export_download_r7(job_id):
     return send_file(path,as_attachment=True,download_name=str(row.get('filename') or path.name),max_age=0)
 
 threading.Thread(target=file_loop,name='vys262-worker-files-r7',daemon=True).start()
+threading.Thread(target=_capsule_mega_loop_r20,name='vys262-worker-capsule-mega-r20',daemon=True).start()
 
 threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
 
