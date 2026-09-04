@@ -69,9 +69,3 @@ All runtime tuning values (intervals, limits, ports, feature switches and intern
 
 ## R16 FAST FINANCE + ALL COLOR XLSX
 See FIXES_R16_FAST_FINANCE_ALL_COLOR_XLSX.txt.
-
-## R17 FAST TERMINAL CHAT + FULL RESTORE
-See FIXES_R17_FAST_TERMINAL_CHAT_FULL_RESTORE.txt.
-
-Render #2 remains the heavy durability/restore side. It receives/coalesces state from FAST; no new user-button dependency on HEAVY was introduced in R17.
-

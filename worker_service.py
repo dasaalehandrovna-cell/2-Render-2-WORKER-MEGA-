@@ -43,8 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r17-full-restore'
-TRANSPORT_VERSION = 'vys-262-worker-r17-internal-config'
+VERSION = 'vys-262-worker-r15-fast-hotpath'
+TRANSPORT_VERSION = 'vys-262-worker-r14-internal-config'
 
 
 def env_bool(name, default=False):
