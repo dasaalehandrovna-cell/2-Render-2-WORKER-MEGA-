@@ -91,3 +91,8 @@ R19 removes the second legacy boot restore on FAST, gives lightweight navigation
 See `FIXES_R20_DURABLE_CONFIG_FAST_LANE.txt`.
 
 HEAVY owns the R20 durable config/user-state capsule: local cache + Redis + asynchronous versioned MEGA archive. A deep capsule request can heal Redis/local cache from MEGA during FAST preboot.
+
+## Пер-R21 — HEAVY SECOND STAGE
+See `FIXES_R21_EVERY_BUTTON_FAST_HEAVY_STAGE.txt`.
+
+Render #2 remains the heavy execution/durable service. R21 changes the Front boundary: every button is accepted by FAST first, while split-capable heavy work is dispatched here as a second stage. R20 durable capsule format/key stays compatible across the upgrade.
