@@ -1,0 +1,6 @@
+R17 / v263 WORKER ISOLATION GUARD
+
+- Worker understands EXTERNAL_IO_BOOT_MODE.
+- Runtime isolation control endpoint is owner-peer-secret protected.
+- Worker outbound requests, Redis client, MEGA login and Google token paths obey the external I/O gate.
+- Existing R16 Redis/MEGA checkpoint, event journal and Google worker behavior is unchanged in NORMAL.

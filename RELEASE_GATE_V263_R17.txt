@@ -1,0 +1,19 @@
+R17 / v263 RELEASE GATE — HEAVY Render #2
+
+Base: R16 / v262
+Target: R17 / v263
+
+Validated:
+- compileall: PASS
+- LOCAL LAB worker hard-gate semantic smoke: PASS
+- outbound HTTP guard: PASS
+- MEGAcmd subprocess guard: PASS
+- canonical MEGA root: /TelegramBotBackups
+- legacy MEGA roots: recovery fallback only
+
+Changed/new files against supplied HEAVY R16 archive:
+- FIXES_R17_LOCAL_LAB_HYBRID_GUARD.txt
+- README_RENDER2.md
+- RENDER2_VARIABLES.env.example
+- runtime_config.py
+- worker_service.py

@@ -1,6 +1,6 @@
-# v262
+# v263
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker.
+"""vys-263 Render #2 heavy worker.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -26,8 +26,6 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
-import zipfile
-import xml.etree.ElementTree as ET
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,8 +43,54 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r16-excel-parity'
-TRANSPORT_VERSION = 'vys-262-worker-r14-internal-config'
+VERSION = 'vys-263-worker-r17-local-lab-hybrid-guard'
+TRANSPORT_VERSION = 'vys-263-worker-r17-isolation-control'
+
+WORKER_IO_LOCK_V263 = threading.RLock()
+def _worker_io_norm_v263(value):
+    raw=str(value or '').strip().lower().replace('-','_').replace(' ','_')
+    if raw in {'local','lab','local_lab','locallab'}: return 'local_lab'
+    if raw in {'safe','safe_isolation','isolation'}: return 'safe_isolation'
+    return 'normal'
+WORKER_IO_PROFILE_V263 = _worker_io_norm_v263(os.getenv('EXTERNAL_IO_BOOT_MODE','normal'))
+WORKER_IO_SEGMENTS_V263 = {'mega_critical':True,'mega_backup':True,'google':True,'currency':True,'self_http':True,'peer_http':True,'other_http':True}
+WORKER_IO_BLOCKED_V263 = {k:0 for k in WORKER_IO_SEGMENTS_V263}
+WORKER_IO_LAST_BLOCK_V263 = {}
+
+def worker_io_allowed_v263(category, source=''):
+    global WORKER_IO_LAST_BLOCK_V263
+    cat=str(category or 'other_http').strip().lower()
+    aliases={'mega':'mega_backup','redis':'peer_http','worker_http':'peer_http','usd':'currency','http':'other_http'}
+    cat=aliases.get(cat,cat)
+    if cat not in WORKER_IO_SEGMENTS_V263: cat='other_http'
+    with WORKER_IO_LOCK_V263:
+        ok=WORKER_IO_PROFILE_V263=='normal' and bool(WORKER_IO_SEGMENTS_V263.get(cat,True))
+        if not ok:
+            WORKER_IO_BLOCKED_V263[cat]=int(WORKER_IO_BLOCKED_V263.get(cat,0) or 0)+1
+            WORKER_IO_LAST_BLOCK_V263={'category':cat,'source':str(source or '')[:160],'time':time.time(),'profile':WORKER_IO_PROFILE_V263}
+        return ok
+
+def _worker_http_category_v263(url):
+    try:
+        from urllib.parse import urlsplit
+        host=(urlsplit(str(url or '')).hostname or '').lower()
+    except Exception: host=''
+    if 'googleapis.com' in host or host.endswith('google.com'): return 'google'
+    try:
+        peer=(front_base().split('://',1)[-1].split('/',1)[0].split(':',1)[0] or '').lower()
+    except Exception: peer=''
+    if peer and host==peer: return 'peer_http'
+    render_host=str(os.getenv('RENDER_EXTERNAL_HOSTNAME','') or '').lower()
+    if render_host and host==render_host: return 'self_http'
+    return 'other_http'
+
+_WORKER_REQUEST_ORIG_V263 = requests.sessions.Session.request
+def _worker_request_guard_v263(self, method, url, *args, **kwargs):
+    cat=_worker_http_category_v263(url)
+    if not worker_io_allowed_v263(cat, f'{method}:{url}'):
+        raise RuntimeError(f'external_io_blocked_v263:{cat}')
+    return _WORKER_REQUEST_ORIG_V263(self, method, url, *args, **kwargs)
+requests.sessions.Session.request=_worker_request_guard_v263
 
 
 def env_bool(name, default=False):
@@ -64,7 +108,7 @@ def front_base():
     raw = str(os.getenv('FRONT_SERVICE_URL', os.getenv('PEER_SERVICE_URL','')) or '').strip().rstrip('/')
     if raw and not raw.startswith(('http://','https://')): raw = 'https://' + raw
     return raw
-def mega_root(): return '/' + str(os.getenv('MEGA_BACKUP_DIR','TelegramBotBackups2-2') or 'TelegramBotBackups2-2').strip('/')
+def mega_root(): return '/' + str(os.getenv('MEGA_BACKUP_DIR','TelegramBotBackups') or 'TelegramBotBackups').strip('/')
 def remote_db_dir(): return mega_root().rstrip('/') + '/database'
 def remote_latest(): return remote_db_dir().rstrip('/') + '/latest_bot_state.sqlite3.gz'
 def remote_history_dir(): return remote_db_dir().rstrip('/') + '/history'
@@ -276,6 +320,8 @@ def _event_reconcile_loop_v268():
             with STATE_LOCK: STATE['event_last_error']=f'{type(exc).__name__}: {str(exc)[:180]}'
 
 def _redis_client():
+    if not worker_io_allowed_v263('peer_http', 'worker:redis_client'):
+        return None
     global _REDIS_CLIENT
     if _redis is None:
         return None
@@ -358,10 +404,16 @@ def redis_load_snapshot_to_cache():
 
 
 def run_cmd(args, timeout=120):
+    # v263 last subprocess guard for all MEGAcmd invocations.
+    first = str((args or [''])[0] or '').casefold()
+    if first.startswith('mega-') and not worker_io_allowed_v263('mega_backup', 'worker:subprocess:' + first):
+        raise RuntimeError('external_io_blocked_v263:mega_backup:' + first)
     return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
 
 
 def mega_login():
+    if not worker_io_allowed_v263('mega_backup', 'worker:mega_login'):
+        return False, 'external_io_blocked_v263:mega_backup'
     login_timeout = env_int('MEGA_LOGIN_TIMEOUT',120,30,300)
     try:
         who = run_cmd(['mega-whoami'], timeout=min(20,login_timeout))
@@ -409,7 +461,7 @@ def prepare_mega_layout():
 
 
 def mega_legacy_roots():
-    raw = str(os.getenv('MEGA_LEGACY_BACKUP_DIRS','/TelegramBotBackups-2T,/TelegramBotBackups') or '')
+    raw = str(os.getenv('MEGA_LEGACY_BACKUP_DIRS','/TelegramBotBackups2-2,/TelegramBotBackups-2T') or '')
     out = []
     current = mega_root()
     for item in raw.split(','):
@@ -1044,6 +1096,8 @@ def _google_sign(message: bytes, private_key: str):
                 except Exception: pass
 
 def _google_token():
+    if not worker_io_allowed_v263('google', 'worker:google_token'):
+        raise RuntimeError('external_io_blocked_v263:google')
     with GOOGLE_LOCK:
         now = time.time()
         if _GOOGLE_TOKEN['token'] and now < float(_GOOGLE_TOKEN['expires_at']) - 120: return _GOOGLE_TOKEN['token']
@@ -1256,6 +1310,24 @@ def create_google_sheet(body):
 
 @app.route('/', methods=['GET','HEAD'])
 @app.route('/healthz', methods=['GET','HEAD'])
+
+@app.route('/internal/isolation/control', methods=['POST'])
+def internal_isolation_control_v263():
+    global WORKER_IO_PROFILE_V263, WORKER_IO_SEGMENTS_V263
+    if not authorized(): return ({'ok':False},404)
+    body=request.get_json(silent=True) or {}
+    profile=_worker_io_norm_v263(body.get('profile'))
+    seg=body.get('segments') or {}
+    with WORKER_IO_LOCK_V263:
+        WORKER_IO_PROFILE_V263=profile
+        if isinstance(seg,dict):
+            for key in WORKER_IO_SEGMENTS_V263:
+                if key in seg: WORKER_IO_SEGMENTS_V263[key]=bool(seg.get(key))
+        try:
+            (CACHE_DIR/'external_io_v263.json').write_text(json.dumps({'profile':WORKER_IO_PROFILE_V263,'segments':WORKER_IO_SEGMENTS_V263,'updated_at':time.time()},separators=(',',':')),encoding='utf-8')
+        except Exception: pass
+    return ({'ok':True,'profile':WORKER_IO_PROFILE_V263,'segments':WORKER_IO_SEGMENTS_V263},200)
+
 @app.route('/peer/health', methods=['GET','HEAD'])
 def health():
     if request.method == 'HEAD': return '',200
@@ -1448,6 +1520,13 @@ def google_loop():
         finally:
             GOOGLE_Q.task_done()
 
+
+
+@app.route('/internal/isolation/status', methods=['GET'])
+def internal_isolation_status_v263():
+    if not authorized(): return ({'ok':False},404)
+    with WORKER_IO_LOCK_V263:
+        return ({'ok':True,'profile':WORKER_IO_PROFILE_V263,'segments':dict(WORKER_IO_SEGMENTS_V263),'blocked':dict(WORKER_IO_BLOCKED_V263),'last_blocked':dict(WORKER_IO_LAST_BLOCK_V263)},200)
 
 @app.route('/internal/google/sheet', methods=['POST'])
 def internal_google_sheet():
@@ -1653,414 +1732,93 @@ def _safe_export_name(value, ext):
     return raw
 
 
-def _r16_xlsx_col_name(n: int) -> str:
-    out=''; n=int(n)
-    while n > 0:
-        n,rem=divmod(n-1,26); out=chr(65+rem)+out
-    return out or 'A'
+def _xlsx_value(value):
+    if isinstance(value, dict):
+        formula = str(value.get('formula') or '').strip()
+        if formula:
+            return '=' + formula.lstrip('=')
+        if 'value' in value:
+            return value.get('value')
+    return value
 
 
-def _r16_xlsx_xml_escape(value) -> str:
-    text='' if value is None else str(value)
-    return text.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;').replace("'",'&apos;')
-
-
-def _r16_xlsx_nonempty(value) -> bool:
-    if value is None: return False
-    if isinstance(value,str): return bool(value.strip())
-    return True
-
-
-_R16_XLSX_CATEGORIES=['Продукты','Хоз общ','Авто и (бус)','прочие','орг. техника','Еда доп и ШБ','Связь','переводы','Проживание','Хоз за ашр','аптечка']
-_R16_XLSX_CATEGORY_COLORS=['FFC6EFCE','FFDDEBF7','FFFCE4D6','FFE4DFEC','FFFFF2CC','FFD9EAD3','FFCFE2F3','FFF4CCCC','FFD0E0E3','FFEAD1DC','FFD9D2E9']
-
-
-def _r16_xlsx_category_index(note: str) -> int:
-    text=str(note or '').casefold()
-    checks=[
-        ('Еда доп и ШБ',('шб','шамп','мыло','зуб','паста','гигиен')),
-        ('Продукты',('продукт','еда','хлеб','мол','фрукт','овощ','банан','лук','масло','йогурт','кофе','чай','курица','мясо')),
-        ('Хоз общ',('хоз','салф','порош','клей','краск','саморез','инструмент','батарей','розет','шнур','пульт','ключ')),
-        ('Авто и (бус)',('авто','бенз','соляр','заправ','машин','шина','масло авто','пикап','бус')),
-        ('орг. техника',('орг','двд','dvd','переходник','блок питание','провод','кабель','монитор','паяль','заряд','науш','мыш','принтер')),
-        ('Связь',('тел','связ','пополнение','сим','интернет')),
-        ('переводы',('перевод','вестерн','western','банковский','mercado','меркадо')),
-        ('Проживание',('прож','аренд','квар','отель','дом')),
-        ('Хоз за ашр',('ашр','ашрам')),
-        ('аптечка',('аптеч','аптек','лекар','ибуп','витамин','стоматолог')),
-    ]
-    name='прочие'
-    for cat,words in checks:
-        if any(w in text for w in words):
-            name=cat; break
-    try: return _R16_XLSX_CATEGORIES.index(name)
-    except Exception: return 3
-
-
-def _r16_xlsx_infer_layout(rows, raw_layout=None, category_layout=None) -> str:
-    value=str(raw_layout or '').strip().lower()
-    if value in {'simple','compact','category','category_compact'}:
-        return value
-    if category_layout is True:
-        return 'category'
-    cat_raw=str(category_layout or '').strip().lower()
-    if cat_raw in {'category','category_compact','compact','simple'}:
-        return cat_raw
-    first_header=[]
-    for row in rows or []:
-        vals=list(row or [])
-        if vals and str(vals[0] or '').strip().casefold() in {'дата','date'}:
-            first_header=[str(v or '').strip().casefold() for v in vals]
-            break
-    if len(first_header) >= 4 and first_header[1] in {'описание','description'}:
-        return 'simple'
-    if len(first_header) == 3 and any('расход' in v for v in first_header):
-        return 'compact'
-    return 'simple'
-
-
-def _r16_xlsx_style_plan(rows, layout: str, annotations: dict[tuple[int,int],str]):
-    """Return FAST-compatible styles/annotations for every current R16 layout.
-
-    Current production simple tables use Date/Description/signed Amount.  Compact
-    and category exports keep their ARS layout but intentionally append a full
-    signed-Amount USD section, so those mixed sections are handled explicitly.
-    """
-    max_cols=max((len(list(r or [])) for r in rows), default=1)
-    styles=[]; notes=dict(annotations or {}); header_row=1
-
-    def _num(value):
-        if isinstance(value,dict) and value.get('formula'):
-            value=value.get('value')
-        if isinstance(value,bool) or value is None or value=='':
-            return None
-        try: return float(value)
-        except Exception: return None
-
-    def _currency_title(row):
-        first=str(row[0] if row else '').strip().upper()
-        second=str(row[1] if len(row)>1 else '').strip()
-        return first if first in {'ARS','USD'} and not second else ''
-
-    summary_labels={'остаток с прошлого раза','сумма по статьям','расход','приход','приход за период','расход за период','остаток на руках','на руках:','гомонковые','остаток в обороте','продукты','расход еды на человека в сутки','расчёт'}
-    def _operation_note(value):
-        note=str(value or '').strip()
-        return '' if (not note or note.casefold() in summary_labels) else note
-
-    if layout == 'simple':
-        signed_amount_layout=max_cols <= 3
-        found=False; derived={}
-        for r_idx,row in enumerate(rows,start=1):
-            row=list(row or []); first=str(row[0] if row else '').strip().casefold(); second=str(row[1] if len(row)>1 else '').strip().casefold()
-            if _currency_title(row):
-                styles.append([1]+[4]*max(0,max_cols-1)); continue
-            is_header=first in {'дата','date'} and second in {'описание','description','amount'}
-            if is_header:
-                if not found: header_row=r_idx
-                found=True; styles.append([2]*max_cols); continue
-            st=[4]*max_cols if any(_r16_xlsx_nonempty(v) for v in row) else [0]*max_cols
-            if not found:
-                styles.append(st); continue
-            note=str(row[1] if len(row)>1 else '').strip(); key=note.casefold(); op_note=_operation_note(note)
-            if key in {'остаток с прошлого раза','остаток на руках'}:
-                styles.append([6]*max_cols); continue
-            if key in {'приход за период','расход за период'}:
-                styles.append([5]*max_cols); continue
-            if signed_amount_layout:
-                amount=row[2] if len(row)>2 else ''; numeric=_num(amount)
-                if numeric is not None and len(st)>2:
-                    if numeric < 0:
-                        st[2]=19+_r16_xlsx_category_index(note)
-                        if note: derived[(r_idx,3)]=note
-                    elif _r16_xlsx_nonempty(amount):
-                        st[2]=7
-                        if op_note: derived[(r_idx,3)]=op_note
-            else:
-                income=row[2] if len(row)>2 else ''; expense=row[3] if len(row)>3 else ''
-                if _r16_xlsx_nonempty(income) and len(st)>2:
-                    st[2]=7
-                    if op_note: derived[(r_idx,3)]=op_note
-                if _r16_xlsx_nonempty(expense) and len(st)>3:
-                    st[3]=19+_r16_xlsx_category_index(note)
-                    if note: derived[(r_idx,4)]=note
-            styles.append(st)
-        if not notes: notes=derived
-        elif derived:
-            for k,v in derived.items(): notes.setdefault(k,v)
-        widths=([13,38,16] if signed_amount_layout else [13,38,15,15])+[14]*max(0,max_cols-(3 if signed_amount_layout else 4))
-        return styles,notes,header_row,widths
-
-    if layout == 'compact':
-        found=False; usd_full=False; derived={}
-        for r_idx,row in enumerate(rows,start=1):
-            row=list(row or []); first=str(row[0] if row else '').strip().casefold(); second=str(row[1] if len(row)>1 else '').strip().casefold(); currency=_currency_title(row)
-            if currency:
-                if currency=='USD':
-                    usd_full=True
-                    styles.append(([1,4,4]+[0]*max(0,max_cols-3))[:max_cols]); continue
-                styles.append([1]+[4]*max(0,max_cols-1)); continue
-            is_header=first in {'дата','date'}
-            if is_header:
-                if not found: header_row=r_idx
-                found=True; styles.append([2]*max_cols); continue
-            if not any(_r16_xlsx_nonempty(v) for v in row): styles.append([0]*max_cols); continue
-            if usd_full:
-                if second in {'остаток с прошлого раза','остаток на руках'}: styles.append([6]*min(3,max_cols)+[0]*max(0,max_cols-3)); continue
-                if second in {'приход за период','расход за период'}: styles.append([5]*min(3,max_cols)+[0]*max(0,max_cols-3)); continue
-                st=[4]*min(3,max_cols)+[0]*max(0,max_cols-3); note=str(row[1] if len(row)>1 else '').strip(); amount=row[2] if len(row)>2 else ''; numeric=_num(amount)
-                if numeric is not None and len(st)>2:
-                    if numeric < 0:
-                        st[2]=19+_r16_xlsx_category_index(note)
-                    elif _r16_xlsx_nonempty(amount): st[2]=7
-                styles.append(st); continue
-            if first in {'остаток с прошлого раза','остаток на руках'}: styles.append([6]*max_cols); continue
-            if first in {'приход за период','расход за период'}: styles.append([5]*max_cols); continue
-            st=[4]*max_cols
-            if len(row)>1 and _r16_xlsx_nonempty(row[1]): st[1]=7
-            if len(row)>2 and _r16_xlsx_nonempty(row[2]): st[2]=19+_r16_xlsx_category_index(notes.get((r_idx,3),'') or derived.get((r_idx,3),''))
-            styles.append(st)
-        for k,v in derived.items(): notes.setdefault(k,v)
-        return styles,notes,header_row,[22,16,16]+[14]*max(0,max_cols-3)
-
-    if layout == 'category_compact':
-        found=False; usd_full=False; derived={}
-        for r_idx,row in enumerate(rows,start=1):
-            row=list(row or []); first=str(row[0] if row else '').strip().casefold(); second=str(row[1] if len(row)>1 else '').strip().casefold(); currency=_currency_title(row)
-            if currency:
-                if currency=='USD':
-                    usd_full=True
-                    styles.append(([1,4,4]+[0]*max(0,max_cols-3))[:max_cols]); continue
-                styles.append([1]+[4]*max(0,max_cols-1)); continue
-            is_header=first in {'дата','date'}
-            if is_header:
-                if not found: header_row=r_idx
-                found=True
-                if usd_full: styles.append([2]*min(3,max_cols)+[0]*max(0,max_cols-3))
-                else: styles.append([2]*min(2,max_cols)+[8+(c-2)%len(_R16_XLSX_CATEGORIES) for c in range(2,max_cols)])
-                continue
-            if not any(_r16_xlsx_nonempty(v) for v in row): styles.append(([0] if usd_full else [3])*max_cols); continue
-            if usd_full:
-                if second in {'остаток с прошлого раза','остаток на руках'}: styles.append([6]*min(3,max_cols)+[0]*max(0,max_cols-3)); continue
-                if second in {'приход за период','расход за период'}: styles.append([5]*min(3,max_cols)+[0]*max(0,max_cols-3)); continue
-                st=[4]*min(3,max_cols)+[0]*max(0,max_cols-3); note=str(row[1] if len(row)>1 else '').strip(); amount=row[2] if len(row)>2 else ''; numeric=_num(amount)
-                if numeric is not None and len(st)>2:
-                    if numeric < 0:
-                        st[2]=19+_r16_xlsx_category_index(note)
-                    elif _r16_xlsx_nonempty(amount): st[2]=7
-                styles.append(st); continue
-            if first in {'сумма по статьям','расход','приход','остаток с прошлого раза','остаток на руках','на руках:'}:
-                styles.append(([5] if first in {'сумма по статьям','расход'} else [6])*max_cols); continue
-            st=[4]*max_cols
-            if len(row)>1 and _r16_xlsx_nonempty(row[1]): st[1]=7
-            for c in range(2,max_cols):
-                if c < len(row) and _r16_xlsx_nonempty(row[c]): st[c]=19+(c-2)%len(_R16_XLSX_CATEGORIES)
-            styles.append(st)
-        for k,v in derived.items(): notes.setdefault(k,v)
-        return styles,notes,header_row,[22,15]+[18]*max(0,max_cols-2)
-
-    # category: ARS wide category grid + optional full signed-Amount USD section.
-    found=False; derived={}; usd_full=False
-    for r_idx,row in enumerate(rows,start=1):
-        row=list(row or []); first=str(row[0] if row else '').strip().casefold(); second=str(row[1] if len(row)>1 else '').strip().casefold(); currency=_currency_title(row)
-        if currency:
-            if currency=='USD':
-                usd_full=True
-                styles.append(([1,4,4]+[0]*max(0,max_cols-3))[:max_cols]); continue
-            styles.append([1]+[4]*max(0,max_cols-1)); continue
-        is_header=first in {'дата','date'} and second in {'описание','description','приход/выдача'}
-        if is_header:
-            if not found: header_row=r_idx
-            found=True
-            if usd_full: styles.append([2]*min(3,max_cols)+[0]*max(0,max_cols-3))
-            else: styles.append([2]*min(3,max_cols)+[8+(c-3)%len(_R16_XLSX_CATEGORIES) for c in range(3,max_cols)])
-            continue
-        if not any(_r16_xlsx_nonempty(v) for v in row): styles.append([0]*max_cols); continue
-        if usd_full:
-            if second in {'остаток с прошлого раза','остаток на руках'}: styles.append([6]*min(3,max_cols)+[0]*max(0,max_cols-3)); continue
-            if second in {'приход за период','расход за период'}: styles.append([5]*min(3,max_cols)+[0]*max(0,max_cols-3)); continue
-            st=[4]*min(3,max_cols)+[0]*max(0,max_cols-3); note=str(row[1] if len(row)>1 else '').strip(); op_note=_operation_note(note); amount=row[2] if len(row)>2 else ''; numeric=_num(amount)
-            if numeric is not None and len(st)>2:
-                if numeric < 0:
-                    st[2]=19+_r16_xlsx_category_index(note)
-                    if note: derived[(r_idx,3)]=note
-                elif _r16_xlsx_nonempty(amount):
-                    st[2]=7
-                    if op_note: derived[(r_idx,3)]=op_note
-            styles.append(st); continue
-        if second in {'сумма по статьям','расход'}: styles.append([5]*max_cols); continue
-        if second in {'приход','остаток с прошлого раза','остаток на руках','на руках:'}: styles.append([6]*max_cols); continue
-        st=[4]*max_cols; note=str(row[1] if len(row)>1 else '').strip(); op_note=_operation_note(note)
-        if found:
-            if len(row)>2 and _r16_xlsx_nonempty(row[2]):
-                st[2]=7
-                if op_note: derived[(r_idx,3)]=op_note
-            for c in range(3,max_cols):
-                if c < len(row) and _r16_xlsx_nonempty(row[c]):
-                    st[c]=19+(c-3)%len(_R16_XLSX_CATEGORIES)
-                    if note: derived[(r_idx,c+1)]=note
-        styles.append(st)
-    if not notes: notes=derived
-    else:
-        for k,v in derived.items(): notes.setdefault(k,v)
-    return styles,notes,header_row,(([13,38,16] if usd_full else [13,36,15])+[18]*max(0,max_cols-3))
-
-def _r16_xlsx_cell_xml(row_idx: int, col_idx: int, value, style: int=0) -> str:
-    ref=f'{_r16_xlsx_col_name(col_idx)}{row_idx}'; s_attr=f' s="{int(style)}"' if int(style or 0) else ''
-    if isinstance(value,dict) and value.get('formula'):
-        formula=_r16_xlsx_xml_escape(str(value.get('formula') or '').lstrip('=')); cached=value.get('value',0)
-        try:
-            cached=float(cached); cached=int(cached) if cached.is_integer() else cached
-        except Exception: cached=0
-        return f'<c r="{ref}"{s_attr}><f>{formula}</f><v>{cached}</v></c>'
-    if isinstance(value,(int,float)) and not isinstance(value,bool):
-        return f'<c r="{ref}"{s_attr}><v>{float(value):.2f}</v></c>'
-    return f'<c r="{ref}" t="inlineStr"{s_attr}><is><t>{_r16_xlsx_xml_escape(value)}</t></is></c>'
-
-
-def _r16_write_xlsx(path: Path, rows, styles, sheet_name='Экспорт', comments=None, freeze_rows=1, widths=None, annotation_mode=None):
-    comments=dict(comments or {}); mode=str(annotation_mode or '').strip().lower() or None
-    if mode not in {None,'notes','comments'}: mode=None
-    if not comments: mode=None
-    max_cols=max((len(list(r or [])) for r in rows), default=1); widths=list(widths or [18]*max_cols)
-    if len(widths)<max_cols: widths.extend([18]*(max_cols-len(widths)))
-    freeze_rows=max(0,int(freeze_rows or 0)); cols_xml=''.join(f'<col min="{i}" max="{i}" width="{min(float(widths[i-1]),48):g}" customWidth="1"/>' for i in range(1,max_cols+1))
-    legacy_drawing='<legacyDrawing r:id="rId2"/>' if mode=='notes' else ''
-    sheet_title=_r16_xlsx_xml_escape(str(sheet_name or 'Экспорт')[:31])
-    workbook_xml=f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="{sheet_title}" sheetId="1" r:id="rId1"/></sheets><calcPr calcId="191029" fullCalcOnLoad="1" forceFullCalc="1"/></workbook>'
-    rels_xml='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
-    person_rel='\n<Relationship Id="rId3" Type="http://schemas.microsoft.com/office/2017/10/relationships/person" Target="persons/person.xml"/>' if mode=='comments' else ''
-    workbook_rels_xml=f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>{person_rel}</Relationships>'
-    extra_fills=''.join(f'<fill><patternFill patternType="solid"><fgColor rgb="{rgb}"/></patternFill></fill>' for rgb in _R16_XLSX_CATEGORY_COLORS)
-    header_xfs=''.join(f'<xf numFmtId="0" fontId="1" fillId="{7+i}" borderId="1" xfId="0" applyFill="1" applyFont="1"/>' for i in range(len(_R16_XLSX_CATEGORY_COLORS)))
-    data_xfs=''.join(f'<xf numFmtId="0" fontId="0" fillId="{7+i}" borderId="1" xfId="0" applyFill="1"/>' for i in range(len(_R16_XLSX_CATEGORY_COLORS)))
-    styles_xml=f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="3"><font><sz val="10"/><name val="Calibri"/></font><font><b/><sz val="10"/><name val="Calibri"/></font><font><b/><sz val="14"/><name val="Calibri"/></font></fonts><fills count="18"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF00E000"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFC000"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFF9999"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFE2F0D9"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9EAD3"/></patternFill></fill>{extra_fills}</fills><borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"/><right style="thin"/><top style="thin"/><bottom style="thin"/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="30"><xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0"/><xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFill="1" applyFont="1"/><xf numFmtId="0" fontId="1" fillId="3" borderId="1" xfId="0" applyFill="1" applyFont="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0"/><xf numFmtId="0" fontId="1" fillId="4" borderId="1" xfId="0" applyFill="1" applyFont="1"/><xf numFmtId="0" fontId="1" fillId="5" borderId="1" xfId="0" applyFill="1" applyFont="1"/><xf numFmtId="0" fontId="1" fillId="6" borderId="1" xfId="0" applyFill="1" applyFont="1"/>{header_xfs}{data_xfs}</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>'''
-    content_extra=''; sheet_rels=None; notes_xml=None; vml_xml=None; threaded_xml=None; persons_xml=None
-    if mode=='notes':
-        content_extra='<Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/><Override PartName="/xl/comments1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/>'
-        nodes=[]; shapes=[]
-        for idx,((rr,cc),text) in enumerate(sorted(comments.items()),start=1):
-            ref=f'{_r16_xlsx_col_name(int(cc))}{int(rr)}'; safe=_r16_xlsx_xml_escape(text)
-            nodes.append(f'<comment ref="{ref}" authorId="0"><text><t xml:space="preserve">{safe}</t></text></comment>')
-            shapes.append(f'<v:shape id="_x0000_s{1024+idx}" type="#_x0000_t202" style="position:absolute;margin-left:59.25pt;margin-top:1.5pt;width:144pt;height:79.5pt;z-index:{idx};visibility:hidden" fillcolor="#ffffe1" o:insetmode="auto"><v:fill color2="#ffffe1"/><v:shadow on="t" color="black" obscured="t"/><v:path o:connecttype="none"/><v:textbox style="mso-direction-alt:auto"><div style="text-align:left"/></v:textbox><x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>{max(0,int(cc)-1)}, 15, {max(0,int(rr)-1)}, 2, {int(cc)+2}, 15, {int(rr)+4}, 4</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>{max(0,int(rr)-1)}</x:Row><x:Column>{max(0,int(cc)-1)}</x:Column></x:ClientData></v:shape>')
-        notes_xml=f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>Telegram Finance Bot</author></authors><commentList>{"".join(nodes)}</commentList></comments>'
-        vml_xml=f'<?xml version="1.0" encoding="UTF-8"?>\n<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel"><o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="1"/></o:shapelayout><v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>{"".join(shapes)}</xml>'
-        sheet_rels='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" Target="../drawings/vmlDrawing1.vml"/></Relationships>'
-    elif mode=='comments':
-        content_extra='<Override PartName="/xl/threadedComments/threadedComment1.xml" ContentType="application/vnd.ms-excel.threadedcomments+xml"/><Override PartName="/xl/persons/person.xml" ContentType="application/vnd.ms-excel.person+xml"/>'
-        person_id='{7C441D5B-9D3A-4B84-95C4-5BCE02D746A1}'; now=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'); nodes=[]
-        for idx,((rr,cc),text) in enumerate(sorted(comments.items()),start=1):
-            ref=f'{_r16_xlsx_col_name(int(cc))}{int(rr)}'; cid='{00000000-0000-0000-0000-'+f'{idx:012X}'+'}'
-            nodes.append(f'<threadedComment ref="{ref}" dT="{now}" personId="{person_id}" id="{cid}"><text>{_r16_xlsx_xml_escape(text)}</text></threadedComment>')
-        threaded_xml=f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">{"".join(nodes)}</ThreadedComments>'
-        persons_xml=f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<personList xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"><person displayName="Telegram Finance Bot" id="{person_id}" userId="Telegram Finance Bot" providerId="None"/></personList>'
-        sheet_rels='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="../threadedComments/threadedComment1.xml"/></Relationships>'
-    content_types=f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>{content_extra}<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'
-    fd,tmp=tempfile.mkstemp(prefix='r16_xlsx_',suffix='.xml',dir=str(FILE_DIR)); os.close(fd)
+def _r10_rgb_hex(rgb):
+    if not isinstance(rgb, dict): return None
     try:
-        with open(tmp,'w',encoding='utf-8',newline='') as fh:
-            fh.write('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">')
-            pane=f'<pane ySplit="{freeze_rows}" topLeftCell="A{freeze_rows+1}" activePane="bottomLeft" state="frozen"/>' if freeze_rows else ''
-            fh.write(f'<sheetViews><sheetView workbookViewId="0">{pane}</sheetView></sheetViews><cols>{cols_xml}</cols><sheetData>')
-            for r_idx,row in enumerate(rows,start=1):
-                strow=styles[r_idx-1] if r_idx-1 < len(styles) else []; height=' ht="22" customHeight="1"' if r_idx <= max(1,freeze_rows) else ''
-                fh.write(f'<row r="{r_idx}"{height}>'); vals=list(row or [])
-                for c_idx in range(1,max_cols+1):
-                    value=vals[c_idx-1] if c_idx-1 < len(vals) else ''; st=strow[c_idx-1] if c_idx-1 < len(strow) else 0
-                    fh.write(_r16_xlsx_cell_xml(r_idx,c_idx,value,st))
-                fh.write('</row>')
-            fh.write(f'</sheetData>{legacy_drawing}</worksheet>')
-        with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as z:
-            z.writestr('[Content_Types].xml',content_types); z.writestr('_rels/.rels',rels_xml); z.writestr('xl/workbook.xml',workbook_xml); z.writestr('xl/_rels/workbook.xml.rels',workbook_rels_xml); z.write(tmp,'xl/worksheets/sheet1.xml'); z.writestr('xl/styles.xml',styles_xml)
-            if sheet_rels: z.writestr('xl/worksheets/_rels/sheet1.xml.rels',sheet_rels)
-            if mode=='notes': z.writestr('xl/comments1.xml',notes_xml); z.writestr('xl/drawings/vmlDrawing1.vml',vml_xml)
-            elif mode=='comments': z.writestr('xl/threadedComments/threadedComment1.xml',threaded_xml); z.writestr('xl/persons/person.xml',persons_xml)
-    finally:
-        try: os.remove(tmp)
-        except Exception: pass
+        vals=[]
+        for key in ('red','green','blue'):
+            raw=float(rgb.get(key,0.0) or 0.0)
+            vals.append(max(0,min(255,round(raw*255))))
+        return ''.join(f'{v:02X}' for v in vals)
+    except Exception:
+        return None
 
-
-def _r16_patch_xlsx_package(path: Path) -> None:
-    """Match FAST post-processing: integer format, borders, wrap and wide description."""
-    if not path or not Path(path).exists():
-        return
-    tmp=str(path)+'.r16.tmp'; ns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-    ET.register_namespace('',ns)
-    with zipfile.ZipFile(path,'r') as zin, zipfile.ZipFile(tmp,'w',zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            raw=zin.read(item.filename)
-            if item.filename == 'xl/styles.xml':
-                try:
-                    root=ET.fromstring(raw); numfmts=root.find(f'{{{ns}}}numFmts')
-                    if numfmts is None:
-                        numfmts=ET.Element(f'{{{ns}}}numFmts',{'count':'1'}); root.insert(0,numfmts)
-                    existing=None
-                    for nf in list(numfmts):
-                        if nf.attrib.get('formatCode') in {'#,##0','#,###'}:
-                            existing=nf; break
-                    if existing is None:
-                        used={int(x.attrib.get('numFmtId','0') or 0) for x in list(numfmts)}
-                        fmt_id=next((n for n in range(164,300) if n not in used),164)
-                        ET.SubElement(numfmts,f'{{{ns}}}numFmt',{'numFmtId':str(fmt_id),'formatCode':'#,##0'})
-                    else:
-                        fmt_id=int(existing.attrib.get('numFmtId','164') or 164)
-                    numfmts.set('count',str(len(list(numfmts))))
-                    borders=root.find(f'{{{ns}}}borders'); thin_id=0
-                    if borders is not None:
-                        thin_id=len(list(borders)); border=ET.SubElement(borders,f'{{{ns}}}border')
-                        for side in ('left','right','top','bottom'):
-                            ET.SubElement(border,f'{{{ns}}}{side}',{'style':'thin'})
-                        ET.SubElement(border,f'{{{ns}}}diagonal'); borders.set('count',str(len(list(borders))))
-                    cell_xfs=root.find(f'{{{ns}}}cellXfs')
-                    if cell_xfs is not None:
-                        for xf in list(cell_xfs):
-                            xf.set('numFmtId',str(fmt_id)); xf.set('applyNumberFormat','1')
-                            if borders is not None:
-                                xf.set('borderId',str(thin_id)); xf.set('applyBorder','1')
-                            align=xf.find(f'{{{ns}}}alignment')
-                            if align is None:
-                                align=ET.SubElement(xf,f'{{{ns}}}alignment')
-                            align.set('wrapText','1'); align.set('vertical','top'); xf.set('applyAlignment','1')
-                    raw=ET.tostring(root,encoding='utf-8',xml_declaration=True)
-                except Exception:
-                    pass
-            elif item.filename == 'xl/worksheets/sheet1.xml':
-                try:
-                    root=ET.fromstring(raw); cols=root.find(f'{{{ns}}}cols')
-                    if cols is not None:
-                        for col in list(cols):
-                            lo=int(col.attrib.get('min','0') or 0); hi=int(col.attrib.get('max','0') or 0)
-                            if lo <= 2 <= hi:
-                                col.set('width','42'); col.set('customWidth','1')
-                    raw=ET.tostring(root,encoding='utf-8',xml_declaration=True)
-                except Exception:
-                    pass
-            zout.writestr(item,raw)
-    os.replace(tmp,path)
-
+def _r10_apply_v262_xlsx_style(cell, row, r_idx, c_idx, max_cols, layout):
+    """R16 canonical palette for every XLSX file and Google Sheets path."""
+    try:
+        fmt=_v262_google_cell_format(row,r_idx,c_idx,max_cols,layout) or {}
+    except Exception:
+        fmt={}
+    fill=_r10_rgb_hex(fmt.get('backgroundColor'))
+    if fill: cell.fill=PatternFill('solid',fgColor=fill)
+    tf=fmt.get('textFormat') or {}
+    if tf.get('bold'): cell.font=Font(bold=True)
+    wrap = str(fmt.get('wrapStrategy') or '').upper() != 'CLIP'
+    h=str(fmt.get('horizontalAlignment') or '').lower() or None
+    v=str(fmt.get('verticalAlignment') or 'TOP').lower()
+    cell.alignment=Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+    nf=fmt.get('numberFormat') or {}
+    if nf.get('pattern'): cell.number_format=str(nf.get('pattern'))
+    borders=fmt.get('borders') or {}
+    def side(name):
+        spec=borders.get(name) or {}
+        if not spec: return Side(style=None)
+        color=_r10_rgb_hex(spec.get('color')) or 'A6A6A6'
+        style='thin' if str(spec.get('style') or '').upper() != 'NONE' else None
+        return Side(style=style,color=color)
+    if borders:
+        cell.border=Border(left=side('left'),right=side('right'),top=side('top'),bottom=side('bottom'))
 
 def _render_export_file(body, job_id):
-    ftype='xlsx' if str(body.get('file_type') or '').lower() in {'xlsx','xlsxstat','excel'} else 'csv'
-    filename=_safe_export_name(body.get('filename'),ftype); path=FILE_DIR/f'{job_id}.{ftype}'; rows=body.get('rows') or []
-    if ftype=='csv':
+    ftype = 'xlsx' if str(body.get('file_type') or '').lower() in {'xlsx','xlsxstat','excel'} else 'csv'
+    filename = _safe_export_name(body.get('filename'), ftype)
+    path = FILE_DIR / f'{job_id}.{ftype}'
+    rows = body.get('rows') or []
+    if ftype == 'csv':
         with open(path,'w',newline='',encoding='utf-8-sig') as fh:
             w=csv.writer(fh)
             for row in rows: w.writerow(list(row or []))
-        return path,filename
+        return path, filename
+    wb=Workbook(); ws=wb.active; ws.title=str(body.get('sheet_name') or 'Экспорт')[:31] or 'Экспорт'
     annotations={}
     for key,val in (body.get('annotations') or {}).items():
-        try: rr,cc=str(key).split(',',1); annotations[(int(rr),int(cc))]=str(val)
+        try:
+            rr,cc=str(key).split(',',1); annotations[(int(rr),int(cc))]=str(val)
         except Exception: pass
-    layout=_r16_xlsx_infer_layout(rows,body.get('layout'),body.get('category_layout'))
-    style=str(body.get('style') or 'old').strip().lower(); mode=str(body.get('annotation_mode') or '').strip().lower()
-    if not mode:
-        mode='comments' if style=='new_comments' else ('notes' if style in {'new_notes','google_notes'} else '')
-    if style in {'old','new_plain'}: mode=''
-    styles,derived,freeze_rows,widths=_r16_xlsx_style_plan(rows,layout,annotations)
-    if mode not in {'notes','comments'}: derived={}
-    _r16_write_xlsx(path,rows,styles,sheet_name=str(body.get('sheet_name') or 'Экспорт')[:31] or 'Экспорт',comments=derived,freeze_rows=freeze_rows,widths=widths,annotation_mode=mode)
-    _r16_patch_xlsx_package(path)
-    return path,filename
+    raw_layout = body.get('category_layout')
+    layout = 'category' if raw_layout is True else (str(raw_layout or body.get('layout') or 'category').lower())
+    style = str(body.get('style') or 'old')
+    max_cols=max((len(list(row or [])) for row in rows), default=1)
+    for r_idx,row in enumerate(rows,start=1):
+        vals=list(row or [])
+        padded=vals + [''] * max(0,max_cols-len(vals))
+        for c_idx,value in enumerate(padded,start=1):
+            cell=ws.cell(r_idx,c_idx,value=_xlsx_value(value))
+            _r10_apply_v262_xlsx_style(cell,padded,r_idx,c_idx,max_cols,layout)
+            note=annotations.get((r_idx,c_idx),'').strip()
+            if note and style in {'new_comments','new_notes','old','new_plain'}:
+                cell.comment=Comment(note,'Telegram Finance Bot')
+    ws.freeze_panes='A2'
+    for col in range(1,max_cols+1):
+        letter=get_column_letter(col)
+        width=10
+        for cell in ws[letter][:min(ws.max_row,300)]:
+            try: width=max(width,min(48,len(str(cell.value or ''))+2))
+            except Exception: pass
+        ws.column_dimensions[letter].width=width
+    wb.save(path)
+    return path, filename
+
 
 def _drive_upload_file(path: Path, filename: str, folder_id: str=''):
     token=_google_token(); headers={'Authorization':f'Bearer {token}'}
@@ -2172,6 +1930,126 @@ def internal_export_download_r7(job_id):
     if not path.is_file(): return {'ok':False,'error':'file expired'},410
     return send_file(path,as_attachment=True,download_name=str(row.get('filename') or path.name),max_age=0)
 
+
+
+# v263 hybrid storage control/evidence -----------------------------------------
+WORKER_STORAGE_CONTROL_CACHE_V263 = CACHE_DIR / 'storage_control_v263.json'
+
+def _worker_storage_checksum_v263(control:dict) -> str:
+    row={k:v for k,v in dict(control or {}).items() if k!='checksum'}
+    return hashlib.sha256(json.dumps(row,ensure_ascii=False,sort_keys=True,separators=(',',':'),default=str).encode('utf-8')).hexdigest()
+
+def _worker_storage_control_valid_v263(control) -> bool:
+    if not isinstance(control,dict): return False
+    try:
+        return int(control.get('schema_version') or 0)==1 and str(control.get('mode') or '') in {'auto','telegram_first','mega_first','newest_verified','render_only'} and bool(control.get('checksum')) and secrets.compare_digest(str(control.get('checksum')), _worker_storage_checksum_v263(control))
+    except Exception: return False
+
+def _worker_storage_control_remote_v263() -> str:
+    return mega_root().rstrip('/') + '/control/storage_control.json'
+
+def _worker_storage_control_cache_write_v263(control:dict) -> bool:
+    try:
+        tmp=WORKER_STORAGE_CONTROL_CACHE_V263.with_suffix('.tmp')
+        tmp.write_text(json.dumps(control,ensure_ascii=False,sort_keys=True,separators=(',',':'))+'\n',encoding='utf-8')
+        os.replace(tmp,WORKER_STORAGE_CONTROL_CACHE_V263); return True
+    except Exception: return False
+
+def _worker_storage_control_cache_read_v263() -> dict:
+    try:
+        row=json.loads(WORKER_STORAGE_CONTROL_CACHE_V263.read_text(encoding='utf-8'))
+        return dict(row) if _worker_storage_control_valid_v263(row) else {}
+    except Exception: return {}
+
+def worker_storage_control_read_v263(force_mega:bool=True) -> dict:
+    cached=_worker_storage_control_cache_read_v263()
+    if not force_mega or not worker_io_allowed_v263('mega_critical','worker:storage_control_read'):
+        return cached
+    work=Path(tempfile.mkdtemp(prefix='vys263_storage_control_get_'))
+    try:
+        ok,detail=mega_login()
+        if not ok: return cached
+        remote=_worker_storage_control_remote_v263()
+        p=run_cmd(['mega-get',remote,str(work)],timeout=60)
+        if p.returncode!=0: return cached
+        rows=list(work.rglob('storage_control.json'))
+        if not rows: return cached
+        row=json.loads(rows[0].read_text(encoding='utf-8'))
+        if not _worker_storage_control_valid_v263(row): return cached
+        _worker_storage_control_cache_write_v263(row)
+        return dict(row)
+    except Exception: return cached
+    finally: shutil.rmtree(work,ignore_errors=True)
+
+def worker_storage_control_write_v263(control:dict) -> tuple[bool,bool,str]:
+    if not _worker_storage_control_valid_v263(control): return False,False,'invalid control'
+    accepted=_worker_storage_control_cache_write_v263(control)
+    if not accepted: return False,False,'local control cache write failed'
+    if not worker_io_allowed_v263('mega_critical','worker:storage_control_write'):
+        return True,False,'MEGA blocked; control cached pending mirror'
+    work=Path(tempfile.mkdtemp(prefix='vys263_storage_control_put_'))
+    try:
+        ok,detail=mega_login()
+        if not ok: return True,False,detail
+        root=mega_root().rstrip('/'); control_dir=root+'/control'
+        ensure_mega_dir(root); ensure_mega_dir(control_dir)
+        stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+        name=f'storage_control_candidate_{stamp}.json'; local=work/name
+        local.write_text(json.dumps(control,ensure_ascii=False,sort_keys=True,separators=(',',':'))+'\n',encoding='utf-8')
+        put=run_cmd(['mega-put',str(local),control_dir],timeout=90)
+        if put.returncode!=0: return True,False,'mega-put control failed'
+        candidate=control_dir+'/'+name; final=_worker_storage_control_remote_v263()
+        # Preserve old final until candidate is uploaded. Rename old into a rollback slot.
+        rollback=control_dir+f'/storage_control_previous_{stamp}.json'
+        if mega_exists(final):
+            try: run_cmd(['mega-mv',final,rollback],timeout=60)
+            except Exception: rollback=''
+        mv=run_cmd(['mega-mv',candidate,final],timeout=60)
+        if mv.returncode!=0:
+            if rollback and mega_exists(rollback):
+                try: run_cmd(['mega-mv',rollback,final],timeout=60)
+                except Exception: pass
+            return True,False,'mega-mv control failed; rollback attempted'
+        verify=worker_storage_control_read_v263(True)
+        mirrored=bool(_worker_storage_control_valid_v263(verify) and str(verify.get('checksum'))==str(control.get('checksum')))
+        return True,mirrored,'MEGA control mirrored' if mirrored else 'MEGA control verify pending'
+    except Exception as exc: return True,False,f'{type(exc).__name__}: {str(exc)[:220]}'
+    finally: shutil.rmtree(work,ignore_errors=True)
+
+def worker_storage_evidence_v263() -> dict:
+    ok,detail,meta=_ensure_cache_db_v267()
+    out={'backend':'mega','available':bool(ok),'detail':detail,'generation':int(STATE.get('full_checkpoint_count') or 0),'user_state_seq':int((meta or {}).get('user_state_seq') or 0),'db_sha256':str((meta or {}).get('sha256_db') or ''),'lineage':'','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds')}
+    if ok and CACHE_DB.exists():
+        try:
+            con=sqlite3.connect(str(CACHE_DB))
+            try:
+                row=con.execute("SELECT v FROM meta WHERE kind='storage_lineage_v239' AND k='current'").fetchone()
+                payload=json.loads(row[0]) if row and row[0] else {}
+                out['lineage']=str((payload or {}).get('lineage') or '') if isinstance(payload,dict) else str(payload or '')
+                row=con.execute("SELECT v FROM meta WHERE kind='data_constitution_snapshot' AND k='main'").fetchone()
+                manifest=json.loads(row[0]) if row and row[0] else {}
+                if isinstance(manifest,dict):
+                    out['generation']=max(int(out.get('generation') or 0),int(manifest.get('generation') or manifest.get('ledger_highwater_seq') or 0))
+            finally: con.close()
+        except Exception: pass
+    return out
+
+@app.route('/internal/storage/control',methods=['GET','POST'])
+def internal_storage_control_v263():
+    if not authorized(): return {'ok':False},404
+    if request.method=='GET':
+        row=worker_storage_control_read_v263(True)
+        return {'ok':bool(row),'control':row,'version':VERSION},200
+    body=request.get_json(silent=True) or {}; control=body.get('control') or {}
+    accepted,mirrored,detail=worker_storage_control_write_v263(control)
+    return {'ok':bool(accepted),'accepted':bool(accepted),'mega_mirrored':bool(mirrored),'pending':bool(accepted and not mirrored),'detail':detail,'control':control if accepted else {}},200 if accepted else 400
+
+@app.route('/internal/storage/evidence',methods=['GET'])
+def internal_storage_evidence_v263():
+    if not authorized(): return {'ok':False},404
+    return {'ok':True,'evidence':worker_storage_evidence_v263(),'control':worker_storage_control_read_v263(False)},200
+# end v263 hybrid storage ------------------------------------------------------
+
 threading.Thread(target=file_loop,name='vys262-worker-files-r7',daemon=True).start()
 
 threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
@@ -2194,4 +2072,4 @@ threading.Thread(target=_reconcile_hash_loop_v268,name='vys262-worker-reconcile-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0',port=env_int('PORT',10000,1,65535),threaded=True)
-# v262
+# v263
