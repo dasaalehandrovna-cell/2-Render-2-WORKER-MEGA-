@@ -43,8 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r15-fast-hotpath'
-TRANSPORT_VERSION = 'vys-262-worker-r14-internal-config'
+VERSION = 'vys-262-worker-r18-exact-restore-rebase'
+TRANSPORT_VERSION = 'vys-262-worker-r18-internal-config'
 
 
 def env_bool(name, default=False):
@@ -294,8 +294,22 @@ def redis_store_snapshot(local_gz: Path, meta: dict, clear_deltas: bool=False):
         max_bytes = env_int('WORKER_REDIS_SNAPSHOT_MAX_MB',16,1,128) * 1024 * 1024
         if len(payload) > max_bytes:
             return False, f'snapshot too large for Redis: {len(payload)} > {max_bytes}'
+        incoming_revision = float((meta or {}).get('revision') or 0.0)
+        existing_revision = 0.0
+        try:
+            existing_raw = client.get(_REDIS_META_KEY)
+            if isinstance(existing_raw, (bytes, bytearray)):
+                existing_raw = existing_raw.decode('utf-8', 'replace')
+            existing_meta = json.loads(existing_raw) if isinstance(existing_raw, str) and existing_raw else {}
+            existing_revision = float((existing_meta or {}).get('revision') or 0.0)
+        except Exception:
+            existing_revision = 0.0
+        if existing_revision > incoming_revision + 0.000001:
+            with STATE_LOCK:
+                STATE['redis_cache_ok'] = True; STATE['redis_last_write'] = time.time(); STATE['redis_last_error'] = 'newer Redis snapshot preserved'
+            return True, f'Redis newer snapshot preserved existing={existing_revision} incoming={incoming_revision}'
         row = {
-            'revision': float((meta or {}).get('revision') or 0.0),
+            'revision': incoming_revision,
             'sha256_gz': str((meta or {}).get('sha256_gz') or hashlib.sha256(payload).hexdigest()),
             'size': len(payload), 'saved_at': time.time(), 'version': TRANSPORT_VERSION,
         }
@@ -434,7 +448,7 @@ def quick_check_gzip(gz_path: Path):
             row = con.execute('PRAGMA quick_check').fetchone()
             user_state_seq = 0
             try:
-                for kind in ('runtime_continuity_v263','user_state_shadow_v265'):
+                for kind in ('split_state_revision_r18','runtime_continuity_v263','user_state_shadow_v265'):
                     meta_row = con.execute("SELECT v FROM meta WHERE kind=? AND k=?", (kind,'latest')).fetchone()
                     if not meta_row:
                         continue
@@ -481,7 +495,7 @@ def _quick_check_db_v267(path: Path):
             revision = 0.0
             user_state_seq = 0
             try:
-                for kind in ('runtime_continuity_v263','user_state_shadow_v265'):
+                for kind in ('split_state_revision_r18','runtime_continuity_v263','user_state_shadow_v265'):
                     meta_row = con.execute("SELECT v FROM meta WHERE kind=? AND k=?", (kind,'latest')).fetchone()
                     if not meta_row:
                         continue

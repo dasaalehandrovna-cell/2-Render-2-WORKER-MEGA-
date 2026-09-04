@@ -69,3 +69,14 @@ All runtime tuning values (intervals, limits, ports, feature switches and intern
 
 ## R16 FAST FINANCE + ALL COLOR XLSX
 See FIXES_R16_FAST_FINANCE_ALL_COLOR_XLSX.txt.
+
+## R17 FAST TERMINAL CHAT + FULL RESTORE
+See FIXES_R17_FAST_TERMINAL_CHAT_FULL_RESTORE.txt.
+
+Render #2 remains the heavy durability/restore side. It receives/coalesces state from FAST; no new user-button dependency on HEAVY was introduced in R17.
+
+
+## R18 EXACT RESTORE REBASE
+See `FIXES_R18_INSTANT_CALLBACK_EXACT_DEPLOY_RESTORE.txt`.
+
+HEAVY now accepts immediate full-rebase requests when the delta base mismatches, preserves a newer Redis restore point, and can capture the still-live old FAST during the next FAST preboot. Full snapshot validation, Redis/MEGA promotion and other heavy durability remain outside the FAST user-button path.
