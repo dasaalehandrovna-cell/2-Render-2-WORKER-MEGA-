@@ -96,3 +96,8 @@ HEAVY owns the R20 durable config/user-state capsule: local cache + Redis + asyn
 See `FIXES_R21_EVERY_BUTTON_FAST_HEAVY_STAGE.txt`.
 
 Render #2 remains the heavy execution/durable service. R21 changes the Front boundary: every button is accepted by FAST first, while split-capable heavy work is dispatched here as a second stage. R20 durable capsule format/key stays compatible across the upgrade.
+
+## Пер-R22 — ZERO-BLOCKING FRONT RENDER
+See `FIXES_R22_ZERO_BLOCKING_BUTTON_RENDER.txt`.
+
+Render #2 remains the HEAVY/durable service. R22 changes only the Front critical path and keeps the existing R20 durable capsule key/format compatible.
