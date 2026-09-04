@@ -1,11 +1,3 @@
-# Render #2 HEAVY — R17 STATE CAS
-
-R17 is paired with the FAST-first front. HEAVY remains responsible for remote durability, Google/Drive/XLSX work and full checkpoints. Redis full-snapshot writes now use the R17 real-mutation revision and compare-and-set protection so a late old Render instance cannot overwrite newer state.
-
-Use the same `REDIS_URL`, `WORKER_REDIS_SNAPSHOT_KEY`, `WORKER_REDIS_DEPLOY_STATE_KEY` and `PEER_SHARED_SECRET` on both services.
-
----
-
 # Render #2 HEAVY — R13 Event Journal
 
 R13 adds a pre-commit remote Telegram event witness and monotonic operation states `RECEIVED → COMMITTED → MIRRORED`. Normal changes use compact SQLite page deltas. A full database moves from Front only after a rare hash mismatch or explicit deploy/shutdown checkpoint. Worker creates its own periodic checkpoints from the mirrored SQLite.
@@ -77,3 +69,20 @@ All runtime tuning values (intervals, limits, ports, feature switches and intern
 
 ## R16 FAST FINANCE + ALL COLOR XLSX
 See FIXES_R16_FAST_FINANCE_ALL_COLOR_XLSX.txt.
+
+## R17 FAST TERMINAL CHAT + FULL RESTORE
+See FIXES_R17_FAST_TERMINAL_CHAT_FULL_RESTORE.txt.
+
+Render #2 remains the heavy durability/restore side. It receives/coalesces state from FAST; no new user-button dependency on HEAVY was introduced in R17.
+
+
+## R18 EXACT RESTORE REBASE
+See `FIXES_R18_INSTANT_CALLBACK_EXACT_DEPLOY_RESTORE.txt`.
+
+HEAVY now accepts immediate full-rebase requests when the delta base mismatches, preserves a newer Redis restore point, and can capture the still-live old FAST during the next FAST preboot. Full snapshot validation, Redis/MEGA promotion and other heavy durability remain outside the FAST user-button path.
+
+
+## R19 FAST CALLBACK + AUTHORITATIVE RESTORE
+See `FIXES_R19_FAST_CALLBACK_AUTHORITATIVE_RESTORE.txt`.
+
+R19 removes the second legacy boot restore on FAST, gives lightweight navigation callbacks their own dedicated FAST UI lane, moves post-update cleanup off the UI lane, fixes the repeated full-state rebase loop by promoting the exact served full snapshot as the next delta baseline, and pauses automatic Google sync cleanly when no target table is configured.
