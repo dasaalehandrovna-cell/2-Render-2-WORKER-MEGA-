@@ -74,7 +74,7 @@ STATE = {
     'started_at': time.time(), 'peer_last_attempt':0.0, 'peer_last_ok':0.0, 'peer_last_error':'', 'peer_status':None,
     'front_health':{},
     'job_last_id':'', 'job_last_type':'', 'job_last_reason':'', 'job_last_started':0.0, 'job_last_done':0.0, 'job_last_error':'',
-    'sync_count':0, 'sync_failures':0, 'last_snapshot_sha256':'', 'last_snapshot_size':0, 'last_snapshot_at':0.0,
+    'sync_count':0, 'sync_failures':0, 'last_snapshot_sha256':'', 'last_snapshot_size':0, 'last_snapshot_at':0.0, 'last_full_fetch_started':0.0, 'full_fetch_suppressed':0,
     'last_mega_upload_at':0.0, 'last_restore_download_at':0.0, 'mega_layout_ok':False, 'mega_warmup_ok':False,
     'google_jobs':0, 'google_failures':0, 'google_last_ok':0.0, 'google_last_error':'',
     'cache_revision':0.0,
@@ -784,6 +784,8 @@ def mega_promote_snapshot(local_gz: Path):
 
 
 def sync_state_job(job):
+    with STATE_LOCK:
+        STATE['last_full_fetch_started'] = time.time()
     snap, detail, meta = fetch_front_snapshot()
     if not snap:
         return False, detail
@@ -925,14 +927,19 @@ def process_job(job):
                 # not trigger a second full SQLite download. Only a genuinely newer
                 # front state token deserves one follow-up fetch.
                 if SYNC_DIRTY and dirty_token and dirty_token != fetched_token:
-                    reason = str(SYNC_DIRTY_REASON or 'coalesced_changes')[:180]
+                    # R26: never chain another full Front snapshot just because state
+                    # changed while this full snapshot was in flight. FAST will send
+                    # compact deltas from the newly promoted baseline. If those deltas
+                    # truly diverge, the Front schedules one idle full reconcile.
+                    with STATE_LOCK:
+                        STATE['full_fetch_suppressed'] = int(STATE.get('full_fetch_suppressed') or 0) + 1
+                        STATE['last_full_suppressed_token'] = dirty_token
                     SYNC_DIRTY = False
                     SYNC_DIRTY_REASON = ''
+                    SYNC_PENDING = False
                     with STATE_LOCK:
-                        STATE['active_state_token'] = dirty_token
+                        STATE['active_state_token'] = ''
                         STATE['dirty_state_token'] = ''
-                    followup = {'id': secrets.token_hex(8), 'type': 'sync_state', 'reason': reason, 'state_token': dirty_token, 'created_at': time.time()}
-                    # Keep SYNC_PENDING=True while the follow-up is queued/running.
                 else:
                     SYNC_DIRTY = False
                     SYNC_DIRTY_REASON = ''
@@ -1369,6 +1376,17 @@ def internal_job():
         last_token = str(STATE.get('last_state_token') or '')
         active_token = str(STATE.get('active_state_token') or '')
         dirty_token = str(STATE.get('dirty_state_token') or '')
+        last_full_started = float(STATE.get('last_full_fetch_started') or 0.0)
+    try:
+        min_full_interval = max(10, min(300, int(os.getenv('WORKER_FULL_REBASE_MIN_INTERVAL_SEC','45') or '45')))
+    except Exception:
+        min_full_interval = 45
+    reason_l = str(body.get('reason') or '').lower()
+    force_full = any(x in reason_l for x in ('boot_ready_exact_rebase','shutdown','manual_force'))
+    if (not force_full) and last_full_started > 0 and time.time() - last_full_started < min_full_interval:
+        with STATE_LOCK:
+            STATE['full_fetch_suppressed'] = int(STATE.get('full_fetch_suppressed') or 0) + 1
+        return {'ok':True,'status':'full_rebase_rate_limited','retry_after':max(1,int(min_full_interval-(time.time()-last_full_started))),'state_token':token,'queue_size':JOB_Q.qsize()},202
     with SYNC_PENDING_LOCK:
         if not SYNC_PENDING and token and token == last_token:
             with STATE_LOCK: STATE['deduped_sync_requests'] += 1

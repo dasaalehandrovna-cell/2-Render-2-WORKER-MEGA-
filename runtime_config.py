@@ -1,4 +1,4 @@
-"""vys-262 R25 internal runtime configuration.
+"""vys-262 R26 internal runtime configuration.
 
 All non-secret operational tunables that used to be Render environment variables
 live here.  Render ENV is intentionally reserved for credentials, remote
@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r25-trace-fast-priority"
+CONFIG_VERSION = "vys-262-r26-fast-isolation"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {
@@ -32,6 +32,10 @@ FRONT_INTERNAL_ENV: Dict[str, str] = {
     "UI_MAX_PENDING": "800",
     "CALLBACK_ACK_WORKERS": "2",
     "UI_CLEANUP_WORKERS": "2",
+    "UI_DELETE_WORKERS": "2",
+    "UI_DELETE_MAX_PENDING": "1200",
+    "R26_TRACE_RING_ROWS": "4000",
+    "R26_TRACE_EXPORT_ROWS": "4000",
     "UI_CLEANUP_MAX_PENDING": "1200",
     "WEBHOOK_WORKERS": "3",
     "DELTA_WORKERS": "2",
@@ -61,7 +65,7 @@ FRONT_INTERNAL_ENV: Dict[str, str] = {
     "SPLIT_CONTINUITY_OTHER_DELAY_SEC": "2.5",
     "SPLIT_CONTINUITY_MAX_LATENCY_SEC": "5.0",
     "SPLIT_SYNC_MAX_LATENCY_SEC": "3.0",
-    "SPLIT_FULL_RECONCILE_QUIET_SEC": "12",
+    "SPLIT_FULL_RECONCILE_QUIET_SEC": "45",
     "SPLIT_DELTA_MAX_PAGES": "256",
     "SPLIT_DELTA_MAX_BYTES": "524288",
     "SPLIT_EVENT_RECEIPT_TIMEOUT_SEC": "1.2",
@@ -120,6 +124,7 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
     "WORKER_DELTA_MAX_PAGES": "4096",
     "WORKER_DELTA_MAX_DB_MB": "128",
     "WORKER_FRONT_FETCH_TIMEOUT": "30",
+    "WORKER_FULL_REBASE_MIN_INTERVAL_SEC": "45",
 
     # Local full checkpoint / reconcile cadence
     "WORKER_FULL_CHECKPOINT_SEC": "21600",

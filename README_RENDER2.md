@@ -101,3 +101,7 @@ Render #2 remains the heavy execution/durable service. R21 changes the Front bou
 See `FIXES_R25_TRACE_FAST_PRIORITY.txt`.
 
 Render #2 remains the HEAVY/durable service. FAST no longer launches repeated immediate full-state pulls on every delta mismatch; reconciliation is requested after UI quiet and arrives as a background snapshot push. R20 durable capsule key/format stays compatible, with Front-side batching to avoid competing with clicks.
+
+
+## Пер-R26 — FAST ISOLATION / NO BACKUP STORM
+See `FIXES_R26_FAST_ISOLATION.txt`. FAST/HEAVY keep R25 diagnostics while removing repeated full-state pulls from active UI, isolating Telegram delete, and making Google schedule settings a targeted SQLite write. Owner READY notice shows `Пер-R26`.
