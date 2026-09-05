@@ -97,13 +97,7 @@ See `FIXES_R21_EVERY_BUTTON_FAST_HEAVY_STAGE.txt`.
 
 Render #2 remains the heavy execution/durable service. R21 changes the Front boundary: every button is accepted by FAST first, while split-capable heavy work is dispatched here as a second stage. R20 durable capsule format/key stays compatible across the upgrade.
 
-## Пер-R22 — ZERO-BLOCKING FRONT RENDER
-See `FIXES_R22_ZERO_BLOCKING_BUTTON_RENDER.txt`.
+## Пер-R25 — TRACE FAST PRIORITY
+See `FIXES_R25_TRACE_FAST_PRIORITY.txt`.
 
-Render #2 remains the HEAVY/durable service. R22 changes only the Front critical path and keeps the existing R20 durable capsule key/format compatible.
-
-
-## Пер-R23 — HEAVY SECOND STAGE
-See `FIXES_R23_FAST_RAM_FIRST_REMOTE_GUARD.txt`.
-
-Render #2 remains the durable/heavy worker. R23 intentionally moves even more work out of the Front callback hot path; Redis/shared durability, Google, MEGA, snapshots, exports and other slow work stay on HEAVY/background stages. R20 durable capsule key/format remains compatible.
+Render #2 remains the HEAVY/durable service. FAST no longer launches repeated immediate full-state pulls on every delta mismatch; reconciliation is requested after UI quiet and arrives as a background snapshot push. R20 durable capsule key/format stays compatible, with Front-side batching to avoid competing with clicks.

@@ -1,0 +1,2 @@
+Пер-R24 HEAVY
+Render #2 business/heavy behavior is retained from stable R22. Only release metadata changes; heavy work remains isolated from FAST UI.
