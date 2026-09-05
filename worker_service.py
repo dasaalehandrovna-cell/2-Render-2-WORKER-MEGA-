@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R25.
+"""vys-262 Render #2 heavy worker · Пер-R27.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -43,8 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-per-r22-heavy-stage'
-TRANSPORT_VERSION = 'vys-262-worker-per-r22-internal-config'
+VERSION = 'vys-262-worker-per-r27-heavy'
+TRANSPORT_VERSION = 'vys-262-worker-per-r27-internal-config'
 
 
 def env_bool(name, default=False):

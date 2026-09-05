@@ -105,3 +105,7 @@ Render #2 remains the HEAVY/durable service. FAST no longer launches repeated im
 
 ## Пер-R26 — FAST ISOLATION / NO BACKUP STORM
 See `FIXES_R26_FAST_ISOLATION.txt`. FAST/HEAVY keep R25 diagnostics while removing repeated full-state pulls from active UI, isolating Telegram delete, and making Google schedule settings a targeted SQLite write. Owner READY notice shows `Пер-R26`.
+
+
+## Пер-R27 — FAST PRIORITY / PREVIOUS WINDOW BACK
+FAST active-UI snapshot storm removed; HEAVY contract retained.

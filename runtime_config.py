@@ -1,4 +1,4 @@
-"""vys-262 R26 internal runtime configuration.
+"""vys-262 R27 internal runtime configuration.
 
 All non-secret operational tunables that used to be Render environment variables
 live here.  Render ENV is intentionally reserved for credentials, remote
@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r26-fast-isolation"
+CONFIG_VERSION = "vys-262-r27-fast-priority-back-history"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {
@@ -59,13 +59,13 @@ FRONT_INTERNAL_ENV: Dict[str, str] = {
     "PEER_PING_INTERVAL_SEC": "120",
     "SPLIT_WORKER_SYNC_ENABLED": "1",
     "SPLIT_STATE_SYNC_DELAY_SEC": "1.2",
-    "SPLIT_STATE_SYNC_MIN_INTERVAL_SEC": "1.5",
+    "SPLIT_STATE_SYNC_MIN_INTERVAL_SEC": "30",
     "SPLIT_FINANCE_SYNC_DELAY_SEC": "0.8",
     "SPLIT_CONTINUITY_FINANCE_DELAY_SEC": "4.0",
     "SPLIT_CONTINUITY_OTHER_DELAY_SEC": "2.5",
     "SPLIT_CONTINUITY_MAX_LATENCY_SEC": "5.0",
     "SPLIT_SYNC_MAX_LATENCY_SEC": "3.0",
-    "SPLIT_FULL_RECONCILE_QUIET_SEC": "45",
+    "SPLIT_FULL_RECONCILE_QUIET_SEC": "20",
     "SPLIT_DELTA_MAX_PAGES": "256",
     "SPLIT_DELTA_MAX_BYTES": "524288",
     "SPLIT_EVENT_RECEIPT_TIMEOUT_SEC": "1.2",

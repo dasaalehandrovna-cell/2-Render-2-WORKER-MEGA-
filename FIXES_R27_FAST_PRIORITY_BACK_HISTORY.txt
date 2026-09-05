@@ -1,0 +1,3 @@
+Пер-R27 HEAVY
+
+HEAVY сохраняет R26 worker/durable логику. FAST больше не создаёт page-delta SQLite snapshot во время активного UI; HEAVY получает canonical full snapshot после пользовательской тишины и продолжает Redis/MEGA/Google/тяжёлые задачи.
