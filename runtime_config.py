@@ -1,4 +1,4 @@
-"""vys-262 R35 internal runtime configuration.
+"""vys-262 R36 internal runtime configuration.
 
 All non-secret operational tunables that used to be Render environment variables
 live here.  Render ENV is intentionally reserved for credentials, remote
@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r35-unified-bot"
+CONFIG_VERSION = "vys-262-r36-unified-bot"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {
@@ -120,6 +120,10 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
     "WORKER_R34_EXPORT_REVISION_WAIT_SEC": "180",
     "WORKER_R34_RESULT_RETRY_SEC": "8",
     "WORKER_R34_RESULT_RETRY_WINDOW_SEC": "900",
+    # R36 durable transport when REDIS_URL is absent.
+    "WORKER_R36_RESULT_ATTEMPT_WINDOW_SEC": "45",
+    "R36_MEGA_JOB_TIMEOUT": "180",
+    "R36_MEGA_RECOVERY_SCAN_SEC": "45",
     "WORKER_R32_MEGA_SEGMENT_EVENTS": "128",
     "WORKER_R32_MEGA_FLUSH_SEC": "30",
 
