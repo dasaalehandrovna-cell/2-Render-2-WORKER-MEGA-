@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R32.
+"""vys-262 Render #2 heavy worker · Пер-R33.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -43,8 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-per-r32-heavy'
-TRANSPORT_VERSION = 'vys-262-worker-per-r32-events'
+VERSION = 'vys-262-worker-per-r33-heavy'
+TRANSPORT_VERSION = 'vys-262-worker-per-r33-events'
 
 
 def env_bool(name, default=False):
@@ -2441,6 +2441,466 @@ def internal_export_download_r7(job_id):
     path=Path(str(row.get('path') or ''))
     if not path.is_file(): return {'ok':False,'error':'file expired'},410
     return send_file(path,as_attachment=True,download_name=str(row.get('filename') or path.name),max_age=0)
+
+
+
+# ---------------------------------------------------------------------------
+# R33 HEAVY-only export/document layer + Redis-optional state durability.
+# All expensive selection/serialization/compression/MEGA/Google work happens here.
+R33_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R33.py'
+STATE.update({'r33_heavy_exports':0,'r33_heavy_export_failures':0,'r33_direct_mega_events':0,
+              'r33_direct_mega_event_bytes':0,'r33_last_event_durability':'','r33_last_export':''})
+
+
+def _r33_json_load(raw, default=None):
+    try: return json.loads(raw) if raw is not None else default
+    except Exception: return default
+
+
+def _r33_cache_ready():
+    ok,detail,_meta=_ensure_cache_db_v267()
+    if not ok: raise RuntimeError('HEAVY restore DB unavailable: '+str(detail))
+    if not CACHE_DB.is_file(): raise RuntimeError('HEAVY restore DB missing')
+    return CACHE_DB
+
+
+def _r33_load_root():
+    db=_r33_cache_ready(); con=sqlite3.connect(str(db),timeout=20)
+    try:
+        row=con.execute("SELECT v FROM kv WHERE k='root'").fetchone()
+        return _r33_json_load(row[0],{}) if row else {}
+    finally: con.close()
+
+
+def _r33_load_store(chat_id):
+    db=_r33_cache_ready(); cid=str(int(chat_id)); con=sqlite3.connect(str(db),timeout=20)
+    try:
+        row=con.execute('SELECT v FROM chats WHERE chat_id=?',(cid,)).fetchone()
+        store=_r33_json_load(row[0],{}) if row else {}
+        if not isinstance(store,dict): store={}
+        try:
+            for k,v in con.execute('SELECT k,v FROM cold_fields WHERE chat_id=?',(cid,)).fetchall():
+                store[str(k)]=_r33_json_load(v,[] if str(k).endswith('records') or str(k)=='records' else {})
+        except sqlite3.OperationalError:
+            pass
+        return store
+    finally: con.close()
+
+
+def _r33_day(rec):
+    for key in ('day_key','date_key','date'):
+        v=str((rec or {}).get(key) or '')[:10]
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}',v): return v
+    ts=str((rec or {}).get('timestamp') or '')
+    m=re.search(r'(20\d\d-\d\d-\d\d)',ts)
+    return m.group(1) if m else ''
+
+
+def _r33_sort_key(rec):
+    return (_r33_day(rec),str((rec or {}).get('timestamp') or ''),int((rec or {}).get('id') or 0))
+
+
+def _r33_f(value):
+    try: return float(value or 0)
+    except Exception: return 0.0
+
+
+def _r33_ledger_rows(store,currency='ars'):
+    settings=store.get('settings') if isinstance(store.get('settings'),dict) else {}
+    active=str(settings.get('_active_currency_ledger') or settings.get('currency_mode') or 'ars').lower()
+    base=list(store.get('records') or [])
+    ars=list(base if active=='ars' else (store.get('ars_records') or []))
+    usd=list(base if active=='usd' else (store.get('usd_records') or []))
+    if currency=='ars':
+        out=[]
+        for rec in ars:
+            if not isinstance(rec,dict): continue
+            amount=_r33_f(rec.get('amount')); usd_amount=_r33_f(rec.get('usd_amount'))
+            explicit=str(rec.get('currency') or '').strip().lower()
+            pure=bool(rec.get('usd_only')) or explicit in {'usd','$','us$','u$s'} or (abs(amount)<1e-12 and abs(usd_amount)>1e-12)
+            if pure: continue
+            x=dict(rec); x['_amount']=amount; x['_note']=str(rec.get('note') or ''); out.append(x)
+        return sorted(out,key=_r33_sort_key)
+    out=[]; seen=set()
+    def key(rec,prefix=''):
+        op=str(rec.get('operation_key') or '')
+        mid=int(rec.get('source_msg_id') or 0)
+        if op:return ('op',op)
+        if mid:return ('msg',mid)
+        return (prefix,int(rec.get('id') or 0),str(rec.get('timestamp') or ''),_r33_day(rec))
+    for rec in usd:
+        if not isinstance(rec,dict): continue
+        x=dict(rec); x['_amount']=_r33_f(rec.get('amount')); x['_note']=str(rec.get('note') or rec.get('usd_note') or '')
+        kk=key(x,'usd'); seen.add(kk); out.append(x)
+    for rec in ars:
+        if not isinstance(rec,dict) or abs(_r33_f(rec.get('usd_amount')))<1e-12: continue
+        kk=key(rec,'embedded')
+        if kk in seen: continue
+        x=dict(rec); x['_amount']=_r33_f(rec.get('usd_amount')); x['_note']=str(rec.get('usd_note') or rec.get('note') or ''); out.append(x); seen.add(kk)
+    return sorted(out,key=_r33_sort_key)
+
+
+def _r33_bounds(mode,day_key,records):
+    mode=str(mode or 'all').replace('csv_','').replace('xlsx_','')
+    day=str(day_key or '')[:10]
+    try: base=datetime.strptime(day,'%Y-%m-%d')
+    except Exception: base=datetime.now(timezone.utc)
+    if mode=='day': return day,day
+    if mode=='week': return (base.replace(tzinfo=None)-__import__('datetime').timedelta(days=6)).strftime('%Y-%m-%d'),day
+    if mode=='month': return base.replace(day=1).strftime('%Y-%m-%d'),day
+    if mode=='wedthu':
+        d=base.replace(tzinfo=None)
+        while d.weekday()!=3: d-=__import__('datetime').timedelta(days=1)
+        return d.strftime('%Y-%m-%d'),(d+__import__('datetime').timedelta(days=6)).strftime('%Y-%m-%d')
+    days=[_r33_day(x) for x in records if _r33_day(x)]
+    return (min(days),max(days)) if days else (day,day)
+
+
+def _r33_fmt_day(day):
+    try:return datetime.strptime(str(day)[:10],'%Y-%m-%d').strftime('%d.%m.%y')
+    except Exception:return str(day or '')
+
+
+def _r33_select_finance(body):
+    cid=int(body.get('target_chat_id') or body.get('recipient_chat_id') or 0); store=_r33_load_store(cid)
+    ftype=str(body.get('source_file_type') or body.get('file_type') or 'csv').lower()
+    settings=store.get('settings') if isinstance(store.get('settings'),dict) else {}
+    currency='ars' if ftype in {'xlsx','xlsxstat','excel'} else ('usd' if bool(settings.get('usd_transactions_view')) else 'ars')
+    all_rows=_r33_ledger_rows(store,currency)
+    if str(body.get('operation'))=='exact_export_query':
+        start=str(body.get('start_key') or '')[:10]; end=str(body.get('end_key') or '')[:10]
+        sr=int(body.get('start_rid') or 0); er=int(body.get('end_rid') or 0)
+    else:
+        start,end=_r33_bounds(body.get('mode'),body.get('day_key'),all_rows); sr=er=0
+    selected=[]
+    for rec in all_rows:
+        d=_r33_day(rec); rid=int(rec.get('id') or 0)
+        if d<start or d>end: continue
+        if sr and d==start and rid<sr: continue
+        if er and d==end and rid>er: continue
+        selected.append(rec)
+    opening=sum(_r33_f(x.get('_amount')) for x in all_rows if _r33_day(x)<start or (sr and _r33_day(x)==start and int(x.get('id') or 0)<sr))
+    return store,currency,selected,opening,start,end
+
+
+def _r33_excel_rows(selected,opening):
+    rows=[['Дата','Описание','Приход','Расход'],['','Остаток с прошлого раза',opening,''],[]]
+    income=expense=0.0; prev=None
+    for rec in selected:
+        day=_r33_day(rec)
+        if prev is not None and day!=prev: rows.append([])
+        prev=day; amount=_r33_f(rec.get('_amount')); note=str(rec.get('_note') or '')
+        inc=amount if amount>=0 else ''; exp=abs(amount) if amount<0 else ''
+        rows.append([_r33_fmt_day(day),note,inc,exp]); income+=max(0,amount); expense+=max(0,-amount)
+    startrow=4; endrow=max(startrow,len(rows)); rows.append([])
+    ir=len(rows)+1; rows.append(['','Приход за период',{'formula':f'SUM(C{startrow}:C{endrow})','value':income},''])
+    er=len(rows)+1; rows.append(['','Расход за период','',{'formula':f'SUM(D{startrow}:D{endrow})','value':expense}])
+    rows.append(['','Остаток на руках',{'formula':f'C2+C{ir}-D{er}','value':opening+income-expense},''])
+    return rows
+
+
+def _r33_csv_rows(selected):
+    rows=[['date','amount','note']]; prev=None
+    for rec in selected:
+        day=_r33_day(rec)
+        if prev is not None and day!=prev: rows.append(['','',''])
+        prev=day; rows.append([_r33_fmt_day(day),_r33_f(rec.get('_amount')),str(rec.get('_note') or '')])
+    return rows
+
+
+def _r33_cat(note):
+    text=str(note or '').casefold()
+    mapping=[('Продукты',('продукт','еда','хлеб','мол','фрукт','овощ','мясо')),('Хоз общ',('хоз','салф','порош','клей','инструмент','батарей')),('Авто и (бус)',('авто','бенз','соляр','машин','шина','масло')),('орг. техника',('кабель','монитор','заряд','науш','принтер')),('Связь',('тел','связ','сим','интернет')),('переводы',('перевод','western','банков')),('Проживание',('прож','аренд','отель','дом')),('аптечка',('аптек','лекар','стомат'))]
+    for name,words in mapping:
+        if any(w in text for w in words): return name
+    return 'прочие'
+
+
+def _r33_tabl_rows(body):
+    cid=int(body.get('target_chat_id') or body.get('recipient_chat_id') or 0); store=_r33_load_store(cid); recs=_r33_ledger_rows(store,'ars')
+    ref=max([_r33_day(x) for x in recs if _r33_day(x)] or [datetime.now().strftime('%Y-%m-%d')]); d=datetime.strptime(ref,'%Y-%m-%d')
+    while d.weekday()!=3: d-=__import__('datetime').timedelta(days=1)
+    weeks=[]
+    for i in range(3,-1,-1):
+        s=d-__import__('datetime').timedelta(days=7*i); e=s+__import__('datetime').timedelta(days=6); weeks.append((s.strftime('%Y-%m-%d'),e.strftime('%Y-%m-%d')))
+    cats=['Продукты','Хоз общ','Авто и (бус)','прочие','орг. техника','Связь','переводы','Проживание','аптечка']
+    rows=[['Статья']+[f'{_r33_fmt_day(s)}–{_r33_fmt_day(e)}' for s,e in weeks]+['Итого']]
+    for cat in cats:
+        vals=[]
+        for s,e in weeks:
+            total=sum(abs(_r33_f(r.get('_amount'))) for r in recs if _r33_f(r.get('_amount'))<0 and s<=_r33_day(r)<=e and _r33_cat(r.get('_note'))==cat)
+            vals.append(total if total else '')
+        rows.append([cat]+vals+[sum(v for v in vals if isinstance(v,(int,float)))])
+    return rows
+
+
+def _r33_db_checksum(path):
+    con=sqlite3.connect(str(path)); h=hashlib.sha256()
+    try:
+        for table in ('kv','chats','meta','cold_fields'):
+            cols=[x[1] for x in con.execute(f'PRAGMA table_info({table})').fetchall()]
+            if not cols: continue
+            order=','.join(cols[:2])
+            for row in con.execute(f'SELECT * FROM {table} ORDER BY {order}').fetchall():
+                if table=='meta' and len(row)>=2 and str(row[0])=='v153_export' and str(row[1])=='manifest': continue
+                h.update(table.encode()); h.update(b'\0')
+                for v in row: h.update(str(v).encode('utf-8','replace')); h.update(b'\0')
+        return h.hexdigest()
+    finally: con.close()
+
+
+def _r33_sanitize(value):
+    if isinstance(value,dict):
+        out={}
+        for k,v in value.items():
+            low=str(k).lower()
+            if any(x in low for x in ('password','token','api_key','secret_key','private_key')) and low not in {'secret_messages'}:
+                out[str(k)]='***REDACTED***'
+            else: out[str(k)]=_r33_sanitize(v)
+        return out
+    if isinstance(value,list): return [_r33_sanitize(x) for x in value]
+    if isinstance(value,tuple): return [_r33_sanitize(x) for x in value]
+    return value
+
+
+def _r33_full_state(body,jid):
+    src=_r33_cache_ready(); folder=FILE_DIR/f'{jid}_full'; folder.mkdir(parents=True,exist_ok=True); raw=folder/'state.sqlite3'
+    srccon=sqlite3.connect(str(src),timeout=30); dst=sqlite3.connect(str(raw))
+    try: srccon.backup(dst,pages=256,sleep=0.01)
+    finally: dst.close(); srccon.close()
+    con=sqlite3.connect(str(raw),timeout=30)
+    try:
+        scope=str(body.get('scope') or 'global'); chat_ids={int(x) for x in (body.get('tenant_chat_ids') or []) if str(x).lstrip('-').isdigit()}
+        if scope=='tenant':
+            if chat_ids:
+                qs=','.join('?' for _ in chat_ids); vals=tuple(str(x) for x in chat_ids)
+                con.execute(f'DELETE FROM chats WHERE chat_id NOT IN ({qs})',vals); con.execute(f'DELETE FROM cold_fields WHERE chat_id NOT IN ({qs})',vals)
+            else: con.execute('DELETE FROM chats'); con.execute('DELETE FROM cold_fields')
+        # sanitize JSON-bearing rows on HEAVY, not FAST
+        for table,keycols in (('kv',('k',)),('chats',('chat_id',)),('meta',('kind','k')),('cold_fields',('chat_id','k'))):
+            cols=','.join(keycols+('v',))
+            try: rows=con.execute(f'SELECT {cols} FROM {table}').fetchall()
+            except sqlite3.OperationalError: continue
+            for row in rows:
+                keys=row[:-1]; val=row[-1]
+                try: safe=json.dumps(_r33_sanitize(json.loads(val)),ensure_ascii=False,separators=(',',':'),default=str)
+                except Exception: safe=str(val)
+                where=' AND '.join(f'{k}=?' for k in keycols); con.execute(f'UPDATE {table} SET v=? WHERE {where}',(safe,*keys))
+        con.execute("CREATE TABLE IF NOT EXISTS meta (kind TEXT NOT NULL,k TEXT NOT NULL,v TEXT NOT NULL,PRIMARY KEY(kind,k))")
+        count=con.execute('SELECT COUNT(*) FROM chats').fetchone()[0]
+        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R33_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids) if scope=='tenant' else [],'chat_count':int(count),'failed_tasks':0,'checksum':''}
+        con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','failed_tasks','[]') ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v")
+        con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','manifest',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(manifest,ensure_ascii=False,separators=(',',':')),)); con.commit()
+    finally: con.close()
+    checksum=_r33_db_checksum(raw); con=sqlite3.connect(str(raw));
+    try:
+        m=json.loads(con.execute("SELECT v FROM meta WHERE kind='v153_export' AND k='manifest'").fetchone()[0]); m['checksum']=checksum
+        con.execute("UPDATE meta SET v=? WHERE kind='v153_export' AND k='manifest'",(json.dumps(m,ensure_ascii=False,separators=(',',':')),)); con.commit()
+    finally: con.close()
+    gz=FILE_DIR/f'{jid}.sqlite3.gz'
+    with open(raw,'rb') as fin,gzip.open(gz,'wb',compresslevel=4) as fout: shutil.copyfileobj(fin,fout,1024*1024)
+    shutil.rmtree(folder,ignore_errors=True)
+    return gz,'latest_bot_state.sqlite3.gz'
+
+
+def _r33_sqlite(body,jid):
+    src=_r33_cache_ready(); path=FILE_DIR/f'{jid}.sqlite3'; sc=sqlite3.connect(str(src),timeout=30); dc=sqlite3.connect(str(path))
+    try: sc.backup(dc,pages=512,sleep=0.005)
+    finally: dc.close(); sc.close()
+    return path,'bot_state.sqlite3'
+
+
+def _r33_chat_json(body,jid):
+    cid=int(body.get('target_chat_id') or body.get('recipient_chat_id') or 0); store=_r33_load_store(cid)
+    obj={'schema':'per-r33-chat-state','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'chat_id':cid,'store':_r33_sanitize(store)}
+    path=FILE_DIR/f'{jid}.json'; path.write_text(json.dumps(obj,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+    return path,f'chat_{cid}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+
+
+def _r33_window_doc(body,jid):
+    root=_r33_load_root(); gs=root.get('_global_settings') if isinstance(root.get('_global_settings'),dict) else {}
+    catalog=gs.get('_window_marker_catalog_v160') if isinstance(gs.get('_window_marker_catalog_v160'),dict) else {}
+    tz=gs.get('_window_tz_v160') if isinstance(gs.get('_window_tz_v160'),list) else []
+    op=str(body.get('operation') or '')
+    lines=[f'Пер-R33 HEAVY export · {op}',f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}', '']
+    if op=='window_markers':
+        for marker,row in sorted(catalog.items()):
+            rr=row if isinstance(row,dict) else {}; lines.extend([f'{marker} — {rr.get("name") or "без имени"}',f'Последнее изменение: {rr.get("last_named_at") or "—"}','---'])
+        name='Маркировки_окон.txt'
+    else:
+        archive=op=='window_tz_archive'; selected=[]
+        for row in tz:
+            if not isinstance(row,dict): continue
+            status=str(row.get('status') or 'open').lower()
+            if (archive and status in {'archived','fixed'}) or ((not archive) and status=='open'): selected.append(row)
+        for row in selected:
+            src=row.get('source') if isinstance(row.get('source'),dict) else {}; marker=str(row.get('marker') or '')
+            lines.extend([f'[{row.get("at")}] {marker} — {row.get("window_name") or (catalog.get(marker) or {}).get("name") or "без имени"}',f'Статус: {row.get("status") or "open"}',f'Источник: chat={src.get("chat_id") or "—"} msg={src.get("message_id") or "—"} callback={src.get("callback") or "—"}',str(row.get('text') or ''),'','---',''])
+        name='Архив_ТЗ_окон.txt' if archive else 'ТЗ_окон.txt'
+    path=FILE_DIR/f'{jid}.txt'; path.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return path,name
+
+
+def _r33_mega_find(pattern,limit=400):
+    try:
+        with MEGA_LOCK:
+            ok,detail=prepare_mega_layout()
+            if not ok:return []
+            res=run_cmd(['mega-find',mega_root(),'--pattern='+pattern,'--type=f'],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+            if res.returncode!=0:return []
+            return sorted({x.strip() for x in (res.stdout or '').splitlines() if x.strip()})[-max(1,int(limit)):]
+    except Exception:return []
+
+
+def _r33_journal(body,jid,current=False):
+    limit=max(100,min(20000,int(body.get('limit') or 5000))); paths=_r33_mega_find('journal_*.json.gz',min(300,limit))
+    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R33' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R33'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
+    work=Path(tempfile.mkdtemp(prefix='r33_journal_'))
+    try:
+        with MEGA_LOCK:
+            for remote in paths:
+                if len(lines)>=limit+4: break
+                d=work/secrets.token_hex(4); d.mkdir(parents=True,exist_ok=True); g=run_cmd(['mega-get',remote,str(d)],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+                if g.returncode!=0: continue
+                for f in d.rglob('*.gz'):
+                    try:
+                        raw=gzip.decompress(f.read_bytes()).decode('utf-8','replace')
+                        # Preserve text/JSON as-is; current journal prefers lines mentioning current release.
+                        for line in raw.splitlines():
+                            if current and ('Пер-R33' not in line and 'r33' not in line.casefold()): continue
+                            lines.append(line)
+                            if len(lines)>=limit+4: break
+                    except Exception: pass
+        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R33.')
+        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R33.txt' if current else 'Журнал_бота_Пер-R33.txt')
+    finally: shutil.rmtree(work,ignore_errors=True)
+
+
+def _r33_runtime_zip(body,jid):
+    path=FILE_DIR/f'{jid}.zip'; paths=_r33_mega_find('runtime_*.json',180)
+    import zipfile
+    with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as z:
+        with STATE_LOCK: st=dict(STATE)
+        z.writestr('heavy_status.json',json.dumps(st,ensure_ascii=False,indent=2,default=str))
+        z.writestr('r33_manifest.txt',f'Пер-R33 HEAVY runtime export\ncreated={datetime.now(timezone.utc).isoformat(timespec="seconds")}\nindexed={len(paths)}\n')
+        z.writestr('mega_runtime_index.txt','\n'.join(paths)+'\n')
+        work=Path(tempfile.mkdtemp(prefix='r33_runtime_'))
+        try:
+            with MEGA_LOCK:
+                for idx,remote in enumerate(paths[-120:]):
+                    d=work/f'{idx:03d}'; d.mkdir(parents=True,exist_ok=True); g=run_cmd(['mega-get',remote,str(d)],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+                    if g.returncode!=0: continue
+                    for f in d.rglob('*.json'):
+                        try:z.write(f,arcname='runtime/'+f'{idx:03d}_{f.name}')
+                        except Exception:pass
+        finally: shutil.rmtree(work,ignore_errors=True)
+    return path,'Runtime_Watcher_Пер-R33.zip'
+
+
+def _r33_bot_source(body,jid):
+    if not R33_FRONT_SOURCE.is_file(): raise RuntimeError('R33 front source asset missing on HEAVY')
+    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R33_FRONT_SOURCE,path); return path,'Пер-R33.py'
+
+
+def _r33_prepare_file(body,jid):
+    op=str(body.get('operation') or '')
+    if op in {'period_export_query','exact_export_query'}:
+        store,currency,selected,opening,start,end=_r33_select_finance(body); ftype=str(body.get('source_file_type') or body.get('file_type') or 'csv').lower()
+        cid=int(body.get('target_chat_id') or body.get('recipient_chat_id') or 0)
+        body=dict(body); body['rows']=_r33_excel_rows(selected,opening) if ftype in {'xlsx','xlsxstat','excel'} else _r33_csv_rows(selected)
+        body['sheet_name']='Экспорт'; body['layout']='category' if ftype=='xlsxstat' else 'simple'; body['file_type']='xlsx' if ftype in {'xlsx','xlsxstat','excel'} else 'csv'
+        body['filename']=f'chat_{cid}_{start}_{end}.{body["file_type"]}'
+        body['caption']=f'📂 {"Excel" if body["file_type"]=="xlsx" else "CSV"} · {currency.upper()} · {start}—{end}'
+        return _render_export_file(body,jid),body
+    if op=='tabl_lsx':
+        b=dict(body); b['rows']=_r33_tabl_rows(body); b['file_type']='xlsx'; b['sheet_name']='4 недели'; b['filename']=f'tabl_lsx_{int(body.get("target_chat_id") or 0)}.xlsx'; b['caption']='📊 Excel /tabl_lsx · 4 недели'; return _render_export_file(b,jid),b
+    if op=='chat_json': return _r33_chat_json(body,jid),body
+    if op=='full_state': return _r33_full_state(body,jid),body
+    if op=='sqlite': return _r33_sqlite(body,jid),body
+    if op=='runtime_zip': return _r33_runtime_zip(body,jid),body
+    if op=='journal': return _r33_journal(body,jid,False),body
+    if op=='journal_current': return _r33_journal(body,jid,True),body
+    if op=='bot_source': return _r33_bot_source(body,jid),body
+    if op in {'window_markers','window_tz','window_tz_archive'}: return _r33_window_doc(body,jid),body
+    return _render_export_file(body,jid),body
+
+
+def _r33_process_file_job(job):
+    jid=str(job.get('id') or ''); body=dict(job.get('payload') or {}); _file_status_put(jid,status='running')
+    try:
+        prepared,body2=_r33_prepare_file(body,jid); path,filename=prepared
+        delivery=str(body2.get('delivery') or 'chat'); url=''
+        if delivery=='drive': url=_drive_upload_file(path,filename,str(body2.get('drive_folder_id') or ''))
+        elif delivery=='google':
+            gb=dict(body2); gb['title']=str(body2.get('title') or body2.get('label') or filename)[:95]; gb['spreadsheet_id']=str(body2.get('spreadsheet_id') or '')
+            if not gb['spreadsheet_id']: raise RuntimeError('Google spreadsheet_id missing in R33 job')
+            url=create_google_sheet(gb)
+        with STATE_LOCK:
+            STATE['file_jobs']=int(STATE.get('file_jobs') or 0)+1; STATE['file_last_ok']=time.time(); STATE['file_last_error']=''; STATE['r33_heavy_exports']=int(STATE.get('r33_heavy_exports') or 0)+1; STATE['r33_last_export']=str(body2.get('operation') or body2.get('file_type') or '')
+        _file_status_put(jid,status='done',ok=True,path=str(path),filename=filename,url=url,delivery=delivery)
+        # notify needs body fields; preserve prepared caption/filename.
+        job2=dict(job); job2['payload']=body2; job2['payload']['filename']=filename; job2['payload']['caption']=str(body2.get('caption') or '')
+        delivered=_notify_front_export_result(job2,True,url=url,filename=filename); _file_status_put(jid,callback_delivered=bool(delivered))
+        if delivery in {'drive','google'}: path.unlink(missing_ok=True)
+        print(f'[R33 HEAVY EXPORT] {jid} op={body2.get("operation")} ok=True delivery={delivery} callback={delivered}',flush=True)
+    except Exception as exc:
+        detail=f'{type(exc).__name__}: {str(exc)[:700]}'
+        with STATE_LOCK:
+            STATE['file_failures']=int(STATE.get('file_failures') or 0)+1; STATE['file_last_error']=detail[:240]; STATE['r33_heavy_export_failures']=int(STATE.get('r33_heavy_export_failures') or 0)+1
+        _file_status_put(jid,status='done',ok=False,error=detail); _notify_front_export_result(job,False,error=detail)
+        print(f'[R33 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
+
+# file_loop resolves this global at execution time.
+process_file_job=_r33_process_file_job
+
+
+def _r33_archive_events_direct(events):
+    if not events: return True,'no events',0
+    packed=gzip.compress(json.dumps({'schema':32,'created_at':time.time(),'events':events},ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
+    stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f'); day=datetime.now(timezone.utc).strftime('%Y%m%d'); work=Path(tempfile.mkdtemp(prefix='r33_event_direct_')); local=work/f'events_{stamp}_direct.json.gz'; local.write_bytes(packed)
+    try:
+        with MEGA_LOCK:
+            ok,detail=prepare_mega_layout()
+            if not ok:return False,detail,0
+            root=_r32_events_mega_dir(); remote_day=root.rstrip('/')+'/'+day
+            if not ensure_mega_dir(root) or not ensure_mega_dir(remote_day): return False,'cannot create R33 event MEGA dir',0
+            put=run_cmd(['mega-put',str(local),remote_day],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+            if put.returncode!=0:return False,'mega-put direct events failed: '+(put.stderr or put.stdout or '')[:180],0
+        with STATE_LOCK:
+            STATE['r33_direct_mega_events']=int(STATE.get('r33_direct_mega_events') or 0)+len(events); STATE['r33_direct_mega_event_bytes']=int(STATE.get('r33_direct_mega_event_bytes') or 0)+len(packed); STATE['r33_last_event_durability']='mega-direct'
+        return True,f'MEGA direct events={len(events)} bytes={len(packed)}',len(packed)
+    finally: shutil.rmtree(work,ignore_errors=True)
+
+
+def _r33_state_events_view():
+    if not authorized(): return {'ok':False},404
+    wire=request.get_data(cache=False,as_text=False) or b''; max_wire=env_int('WORKER_R32_EVENT_MAX_WIRE_KB',1024,32,8192)*1024
+    if not wire or len(wire)>max_wire:return {'ok':False,'error':'R33 event batch size invalid'},413
+    try:
+        raw=gzip.decompress(wire) if str(request.headers.get('Content-Encoding') or '').lower()=='gzip' else wire; body=json.loads(raw.decode('utf-8')); events=body.get('events') if isinstance(body,dict) else None
+        if not isinstance(events,list) or not events or len(events)>512: raise ValueError('events invalid')
+        events=[x for x in events if _r32_event_valid(x)]
+        if not events: raise ValueError('no valid events')
+    except Exception as exc:return {'ok':False,'error':f'R33 event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
+    durable=''; new_ids=[]; rok,rdetail,new_ids=_r32_redis_store_events(events)
+    if rok: durable='redis'; _R32_MEGA_WAKE.set() if new_ids else None
+    else:
+        mok,mdetail,_bytes=_r33_archive_events_direct(events)
+        if not mok:
+            with STATE_LOCK: STATE['r32_state_last_error']=f'Redis={rdetail}; MEGA={mdetail}'[:220]
+            return {'ok':False,'error':'R33 durability unavailable: '+str(rdetail)[:80]+'; '+str(mdetail)[:100]},503
+        durable='mega-direct'
+    try: ok,detail,applied,stale=_r32_apply_events(events)
+    except Exception as exc: ok=False; detail=f'{type(exc).__name__}: {str(exc)[:220]}'; applied=stale=0
+    # Once the event is in Redis or MEGA it is safe to ACK FAST even if the local cache
+    # momentarily cannot apply it; HEAVY will replay the immutable event journal.
+    with STATE_LOCK:
+        STATE['r32_state_events_received']=int(STATE.get('r32_state_events_received') or 0)+len(events); STATE['r32_state_event_bytes']=int(STATE.get('r32_state_event_bytes') or 0)+len(wire); STATE['r33_last_event_durability']=durable
+        if not ok: STATE['r32_state_last_error']='durable but apply pending: '+str(detail)[:180]
+    return {'ok':True,'durable':durable,'events':len(events),'new':len(new_ids),'applied':applied,'stale':stale,'apply_ok':bool(ok),'apply_detail':str(detail)[:180]},200
+
+# Replace Flask endpoint without registering a duplicate route.
+app.view_functions['internal_r32_state_events']=_r33_state_events_view
+
 
 threading.Thread(target=file_loop,name='vys262-worker-files-r7',daemon=True).start()
 threading.Thread(target=_capsule_mega_loop_r20,name='vys262-worker-capsule-mega-r20',daemon=True).start()
