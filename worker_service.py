@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R34.
+"""vys-262 Render #2 heavy worker · Пер-R35.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -43,8 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-per-r34-heavy'
-TRANSPORT_VERSION = 'vys-262-worker-per-r34-events'
+VERSION = 'vys-262-worker-per-r35-heavy'
+TRANSPORT_VERSION = 'vys-262-worker-per-r35-events'
 
 
 def env_bool(name, default=False):
@@ -2375,7 +2375,7 @@ def _notify_front_export_result(job, ok, **extra):
     delay=1.0
     while time.time()<deadline:
         try:
-            r=requests.post(base+'/internal/split/export-result',json=payload,headers={'X-Peer-Secret':secret,'User-Agent':'per-r34-worker-export-result'},timeout=20)
+            r=requests.post(base+'/internal/split/export-result',json=payload,headers={'X-Peer-Secret':secret,'User-Agent':'per-r35-worker-export-result'},timeout=20)
             data=r.json() if r.content and 'json' in str(r.headers.get('content-type','')).lower() else {}
             if r.status_code==200 and bool(data.get('delivered')): return True
         except Exception: pass
@@ -2452,7 +2452,7 @@ def internal_export_download_r7(job_id):
     if not authorized(): return {'ok':False},404
     jid=str(job_id or '')[:80]
     with FILE_JOB_LOCK: row=dict(FILE_JOB_STATUS.get(jid) or {})
-    if not row or row.get('status')!='done' or not row.get('ok'): return {'ok':False,'error':'file not ready'},404
+    if not row or str(row.get('status') or '') not in {'ready','delivering','done','delivered'} or not row.get('ok'): return {'ok':False,'error':'file not ready'},404
     path=Path(str(row.get('path') or ''))
     if not path.is_file(): return {'ok':False,'error':'file expired'},410
     return send_file(path,as_attachment=True,download_name=str(row.get('filename') or path.name),max_age=0)
@@ -2460,9 +2460,9 @@ def internal_export_download_r7(job_id):
 
 
 # ---------------------------------------------------------------------------
-# R34 HEAVY-only export/document layer + Redis-optional state durability.
+# R35 HEAVY-only export/document layer + Redis-optional state durability.
 # All expensive selection/serialization/compression/MEGA/Google work happens here.
-R34_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R34.py'
+R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R35.py'
 STATE.update({'r33_heavy_exports':0,'r33_heavy_export_failures':0,'r33_direct_mega_events':0,
               'r33_direct_mega_event_bytes':0,'r33_last_event_durability':'','r33_last_export':''})
 
@@ -2637,17 +2637,35 @@ def _r33_tabl_rows(body):
     while d.weekday()!=3: d-=__import__('datetime').timedelta(days=1)
     weeks=[]
     for i in range(3,-1,-1):
-        s=d-__import__('datetime').timedelta(days=7*i); e=s+__import__('datetime').timedelta(days=6); weeks.append((s.strftime('%Y-%m-%d'),e.strftime('%Y-%m-%d')))
-    cats=['Продукты','Хоз общ','Авто и (бус)','прочие','орг. техника','Связь','переводы','Проживание','аптечка']
-    rows=[['Статья']+[f'{_r33_fmt_day(s)}–{_r33_fmt_day(e)}' for s,e in weeks]+['Итого']]
-    for cat in cats:
-        vals=[]
-        for s,e in weeks:
-            total=sum(abs(_r33_f(r.get('_amount'))) for r in recs if _r33_f(r.get('_amount'))<0 and s<=_r33_day(r)<=e and _r33_cat(r.get('_note'))==cat)
-            vals.append(total if total else '')
-        rows.append([cat]+vals+[sum(v for v in vals if isinstance(v,(int,float)))])
+        st=d-__import__('datetime').timedelta(days=7*i); en=st+__import__('datetime').timedelta(days=6); weeks.append((st.strftime('%Y-%m-%d'),en.strftime('%Y-%m-%d')))
+    cats=['Продукты','Хоз общ','Авто и (бус)','прочие','орг. техника','Еда доп и ШБ','Связь','переводы','Проживание','Хоз за ашр','аптечка']
+    cols=['Дата','Приход/выдача','Откуда/кому']+cats; rows=[]
+    settings=store.get('settings') if isinstance(store.get('settings'),dict) else {}
+    reserve=_r33_f(settings.get('cash_reserve') or settings.get('reserve') or store.get('cash_reserve') or 0)
+    for start_key,end_key in weeks:
+        rows.append(['Неделя',f'{_r33_fmt_day(start_key)} — {_r33_fmt_day(end_key)}']); rows.append(cols)
+        opening=sum(_r33_f(r.get('_amount')) for r in recs if _r33_day(r)<start_key)
+        rows.append([_r33_fmt_day(start_key),opening,'Остаток с прошлого раза']+['']*len(cats))
+        income=expense=0.0; totals={c:0.0 for c in cats}; cur=datetime.strptime(start_key,'%Y-%m-%d')
+        for off in range(7):
+            dk=(cur+__import__('datetime').timedelta(days=off)).strftime('%Y-%m-%d'); dayrecs=[r for r in recs if _r33_day(r)==dk]
+            if not dayrecs: rows.append([_r33_fmt_day(dk)]+['']*(len(cols)-1)); continue
+            first=True
+            for rec in dayrecs:
+                amount=_r33_f(rec.get('_amount')); note=str(rec.get('_note') or ''); row=[_r33_fmt_day(dk) if first else '','','']+['']*len(cats); first=False
+                if amount>=0: income+=amount; row[1]=amount; row[2]=note
+                else:
+                    value=abs(amount); expense+=value; cat=_r35_record_category(rec,store)
+                    if cat not in totals: cat='прочие'
+                    totals[cat]+=value; row[3+cats.index(cat)]=value
+                rows.append(row)
+        closing=opening+income-expense; turnover=closing-reserve
+        rows.extend([['Итог:',income,'']+[totals.get(c,0.0) or '' for c in cats],['расход:',expense]+['']*(len(cols)-2),['Остаток на руках',closing]+['']*(len(cols)-2),['Гомонковые',reserve]+['']*(len(cols)-2),['Остаток в обороте',turnover]+['']*(len(cols)-2),[],['Расход еды на человека в сутки','']+['']*(len(cols)-2),[]])
+    usd=_r33_ledger_rows(store,'usd')
+    if usd and weeks:
+        st,en=weeks[0][0],weeks[-1][1]; selected=_r35_rows_between(usd,st,en); opening=sum(_r33_f(r.get('_amount')) for r in usd if _r33_day(r)<st)
+        rows.extend([[],[]]+_r33_excel_rows(selected,opening))
     return rows
-
 
 def _r33_db_checksum(path):
     con=sqlite3.connect(str(path)); h=hashlib.sha256()
@@ -2678,6 +2696,134 @@ def _r33_sanitize(value):
     return value
 
 
+
+def _r35_record_category(rec, store=None):
+    rec=rec or {}; store=store or {}
+    for key in ('category_override_name','expense_category','category_name','category'):
+        val=str(rec.get(key) or '').strip()
+        if val: return val
+    slug=str(rec.get('category_override_slug') or '').strip()
+    if slug:
+        cats=(store.get('expense_categories') or store.get('categories') or {}) if isinstance(store,dict) else {}
+        if isinstance(cats,dict):
+            row=cats.get(slug) or {}
+            if isinstance(row,dict) and row.get('name'): return str(row.get('name'))
+    return _r33_cat(rec.get('_note') or rec.get('note') or '')
+
+
+def _r35_category_rows(selected, opening, store, currency='ARS'):
+    expenses=[]
+    for rec in selected or []:
+        if _r33_f((rec or {}).get('_amount'))<0:
+            cat=_r35_record_category(rec,store)
+            if cat not in expenses: expenses.append(cat)
+    canonical=['Продукты','Хоз общ','Авто и (бус)','прочие','орг. техника','Еда доп и ШБ','Связь','переводы','Проживание','Хоз за ашр','аптечка']
+    categories=[c for c in canonical if c in expenses]
+    categories += [c for c in expenses if c not in categories]
+    if not categories: categories=['прочие']
+    rows=[[str(currency).upper()]+['']*(2+len(categories)),['Дата','Описание','Приход']+categories,['','Остаток с прошлого раза',opening]+['']*len(categories),[]]
+    totals={c:0.0 for c in categories}; income=expense=0.0; prev=None
+    for rec in selected or []:
+        day=_r33_day(rec)
+        if prev is not None and day!=prev: rows.append([])
+        prev=day; amount=_r33_f(rec.get('_amount')); note=str(rec.get('_note') or '')
+        row=[_r33_fmt_day(day),note,'']+['']*len(categories)
+        if amount>=0:
+            income+=amount; row[2]=amount
+        else:
+            value=abs(amount); expense+=value; cat=_r35_record_category(rec,store)
+            if cat not in totals:
+                cat='прочие' if 'прочие' in totals else categories[-1]
+            totals[cat]=totals.get(cat,0.0)+value; row[3+categories.index(cat)]=value
+        rows.append(row)
+    closing=opening+income-expense
+    settings=store.get('settings') if isinstance(store.get('settings'),dict) else {}
+    reserve=0.0
+    for key in ('cash_reserve','reserve','gomonkovie','гомонковые'):
+        if key in settings: reserve=_r33_f(settings.get(key)); break
+        if key in store: reserve=_r33_f(store.get(key)); break
+    turnover=closing-min(reserve,max(0.0,closing))
+    rows.extend([[],['','Сумма по статьям',income]+[totals.get(c,0.0) for c in categories],[],['','Расход',expense]+['']*len(categories),['','Приход',income]+['']*len(categories),['','Остаток на руках',closing]+['']*len(categories),['','Гомонковые',reserve]+['']*len(categories),['','Остаток в обороте',turnover]+['']*len(categories)])
+    return rows
+
+
+def _r35_rows_between(records,start,end,start_rid=0,end_rid=0):
+    out=[]
+    for rec in records or []:
+        d=_r33_day(rec); rid=int((rec or {}).get('id') or 0)
+        if d<start or d>end: continue
+        if start_rid and d==start and rid<start_rid: continue
+        if end_rid and d==end and rid>end_rid: continue
+        out.append(rec)
+    return out
+
+
+def _r35_category_export_rows(store, selected, opening, start, end, body):
+    ars=_r35_category_rows(selected,opening,store,'ARS')
+    usd_all=_r33_ledger_rows(store,'usd')
+    sr=int(body.get('start_rid') or 0) if str(body.get('operation'))=='exact_export_query' else 0
+    er=int(body.get('end_rid') or 0) if str(body.get('operation'))=='exact_export_query' else 0
+    usd=_r35_rows_between(usd_all,start,end,sr,er)
+    if not usd: return ars
+    usd_open=sum(_r33_f(x.get('_amount')) for x in usd_all if _r33_day(x)<start or (sr and _r33_day(x)==start and int(x.get('id') or 0)<sr))
+    return ars+[[],[]]+_r33_excel_rows(usd,usd_open)
+
+
+def _r35_filter_item_scope(item,tenant_id,chat_ids,key=''):
+    if str(key).lstrip('-').isdigit() and int(str(key)) in chat_ids: return True
+    if not isinstance(item,dict): return False
+    for k in ('chat_id','target_chat_id','owner_chat_id','source_chat_id','recipient_chat_id','parent_first_chat_id'):
+        try:
+            if int(item.get(k) or 0) in chat_ids: return True
+        except Exception: pass
+    for k in ('tenant_id','tenant','space_id'):
+        if str(item.get(k) or '')==str(tenant_id): return True
+    return False
+
+
+def _r35_filter_root_for_tenant(root,tenant_id,chat_ids):
+    root=root if isinstance(root,dict) else {}; out={}
+    gs=root.get('_global_settings') if isinstance(root.get('_global_settings'),dict) else {}
+    safe_gs={}
+    troot=gs.get('tenants_v148') if isinstance(gs.get('tenants_v148'),dict) else {}
+    tenants=troot.get('tenants') if isinstance(troot.get('tenants'),dict) else {}
+    if tenant_id:
+        safe_gs['tenants_v148']={'schema_version':troot.get('schema_version',1),'tenants':{str(tenant_id):_r33_sanitize(tenants.get(str(tenant_id)) or {})},'chat_to_tenant':{str(cid):str(tenant_id) for cid in sorted(chat_ids)},'invite_tokens':{},'legacy_migrated':True}
+    for gk,gv in gs.items():
+        if gk=='tenants_v148': continue
+        if isinstance(gv,list):
+            rows=[_r33_sanitize(x) for x in gv if _r35_filter_item_scope(x,tenant_id,chat_ids)]
+            if rows: safe_gs[gk]=rows
+        elif isinstance(gv,dict):
+            filtered={str(k):_r33_sanitize(v) for k,v in gv.items() if _r35_filter_item_scope(v,tenant_id,chat_ids,str(k))}
+            if filtered: safe_gs[gk]=filtered
+    out['_global_settings']=safe_gs
+    for key,value in root.items():
+        if key in {'_global_settings','chats','_restore_mode_chat_v150'}: continue
+        if isinstance(value,list):
+            rows=[_r33_sanitize(x) for x in value if _r35_filter_item_scope(x,tenant_id,chat_ids)]
+            if rows: out[key]=rows
+        elif isinstance(value,dict):
+            filtered={str(k):_r33_sanitize(v) for k,v in value.items() if _r35_filter_item_scope(v,tenant_id,chat_ids,str(k))}
+            if filtered: out[key]=filtered
+    return out
+
+
+def _r35_failed_tasks_snapshot(chat_ids=None):
+    rows=[]; allowed=set(chat_ids or [])
+    try:
+        with FILE_JOB_LOCK:
+            source=list(FILE_JOB_STATUS.items())
+        for jid,row in source:
+            if bool((row or {}).get('ok')): continue
+            if str((row or {}).get('status') or '') not in {'done','failed','delivery_timeout'}: continue
+            cid=int((row or {}).get('recipient_chat_id') or (row or {}).get('target_chat_id') or 0)
+            if allowed and cid not in allowed: continue
+            rows.append({'job_id':str(jid),'status':str((row or {}).get('status') or ''),'error':str((row or {}).get('error') or '')[:500],'chat_id':cid})
+    except Exception as exc:
+        rows.append({'load_error':f'{type(exc).__name__}: {str(exc)[:300]}'})
+    return rows[:500]
+
 def _r33_full_state(body,jid):
     src=_r33_cache_ready(); folder=FILE_DIR/f'{jid}_full'; folder.mkdir(parents=True,exist_ok=True); raw=folder/'state.sqlite3'
     srccon=sqlite3.connect(str(src),timeout=30); dst=sqlite3.connect(str(raw))
@@ -2691,6 +2837,13 @@ def _r33_full_state(body,jid):
                 qs=','.join('?' for _ in chat_ids); vals=tuple(str(x) for x in chat_ids)
                 con.execute(f'DELETE FROM chats WHERE chat_id NOT IN ({qs})',vals); con.execute(f'DELETE FROM cold_fields WHERE chat_id NOT IN ({qs})',vals)
             else: con.execute('DELETE FROM chats'); con.execute('DELETE FROM cold_fields')
+            try:
+                rr=con.execute("SELECT v FROM kv WHERE k='root'").fetchone()
+                if rr:
+                    filtered=_r35_filter_root_for_tenant(_r33_json_load(rr[0],{}),str(body.get('tenant_id') or ''),chat_ids)
+                    con.execute("UPDATE kv SET v=? WHERE k='root'",(json.dumps(filtered,ensure_ascii=False,separators=(',',':'),default=str),))
+            except Exception as exc:
+                raise RuntimeError('tenant kv.root filtering failed: '+str(exc)[:300])
         # sanitize JSON-bearing rows on HEAVY, not FAST
         for table,keycols in (('kv',('k',)),('chats',('chat_id',)),('meta',('kind','k')),('cold_fields',('chat_id','k'))):
             cols=','.join(keycols+('v',))
@@ -2703,8 +2856,9 @@ def _r33_full_state(body,jid):
                 where=' AND '.join(f'{k}=?' for k in keycols); con.execute(f'UPDATE {table} SET v=? WHERE {where}',(safe,*keys))
         con.execute("CREATE TABLE IF NOT EXISTS meta (kind TEXT NOT NULL,k TEXT NOT NULL,v TEXT NOT NULL,PRIMARY KEY(kind,k))")
         count=con.execute('SELECT COUNT(*) FROM chats').fetchone()[0]
-        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R34_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids) if scope=='tenant' else [],'chat_count':int(count),'failed_tasks':0,'checksum':''}
-        con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','failed_tasks','[]') ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v")
+        failed=_r35_failed_tasks_snapshot(chat_ids if scope=='tenant' else None)
+        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R35_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids) if scope=='tenant' else [],'chat_count':int(count),'failed_tasks':len(failed),'checksum':''}
+        con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','failed_tasks',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(failed,ensure_ascii=False,separators=(',',':'),default=str),))
         con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','manifest',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(manifest,ensure_ascii=False,separators=(',',':')),)); con.commit()
     finally: con.close()
     checksum=_r33_db_checksum(raw); con=sqlite3.connect(str(raw));
@@ -2727,7 +2881,7 @@ def _r33_sqlite(body,jid):
 
 def _r33_chat_json(body,jid):
     cid=int(body.get('target_chat_id') or body.get('recipient_chat_id') or 0); store=_r33_load_store(cid)
-    obj={'schema':'per-r34-chat-state','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'chat_id':cid,'store':_r33_sanitize(store)}
+    obj={'schema':'per-r35-chat-state','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'chat_id':cid,'store':_r33_sanitize(store)}
     path=FILE_DIR/f'{jid}.json'; path.write_text(json.dumps(obj,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
     return path,f'chat_{cid}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
 
@@ -2737,7 +2891,7 @@ def _r33_window_doc(body,jid):
     catalog=gs.get('_window_marker_catalog_v160') if isinstance(gs.get('_window_marker_catalog_v160'),dict) else {}
     tz=gs.get('_window_tz_v160') if isinstance(gs.get('_window_tz_v160'),list) else []
     op=str(body.get('operation') or '')
-    lines=[f'Пер-R34 HEAVY export · {op}',f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}', '']
+    lines=[f'Пер-R35 HEAVY export · {op}',f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}', '']
     if op=='window_markers':
         for marker,row in sorted(catalog.items()):
             rr=row if isinstance(row,dict) else {}; lines.extend([f'{marker} — {rr.get("name") or "без имени"}',f'Последнее изменение: {rr.get("last_named_at") or "—"}','---'])
@@ -2768,7 +2922,9 @@ def _r33_mega_find(pattern,limit=400):
 
 def _r33_journal(body,jid,current=False):
     limit=max(100,min(20000,int(body.get('limit') or 5000))); paths=_r33_mega_find('journal_*.json.gz',min(300,limit))
-    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R34' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R34'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
+    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R35' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R35'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
+    snap=body.get('front_runtime_snapshot') if isinstance(body.get('front_runtime_snapshot'),dict) else {}
+    if snap: lines.extend(['--- FAST Render #1 snapshot ---',json.dumps(snap,ensure_ascii=False,indent=2,default=str),'--- end FAST snapshot ---',''])
     work=Path(tempfile.mkdtemp(prefix='r33_journal_'))
     try:
         with MEGA_LOCK:
@@ -2781,12 +2937,12 @@ def _r33_journal(body,jid,current=False):
                         raw=gzip.decompress(f.read_bytes()).decode('utf-8','replace')
                         # Preserve text/JSON as-is; current journal prefers lines mentioning current release.
                         for line in raw.splitlines():
-                            if current and ('Пер-R34' not in line and 'r34' not in line.casefold()): continue
+                            if current and ('Пер-R35' not in line and 'r34' not in line.casefold()): continue
                             lines.append(line)
                             if len(lines)>=limit+4: break
                     except Exception: pass
-        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R34.')
-        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R34.txt' if current else 'Журнал_бота_Пер-R34.txt')
+        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R35.')
+        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R35.txt' if current else 'Журнал_бота_Пер-R35.txt')
     finally: shutil.rmtree(work,ignore_errors=True)
 
 
@@ -2796,7 +2952,9 @@ def _r33_runtime_zip(body,jid):
     with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as z:
         with STATE_LOCK: st=dict(STATE)
         z.writestr('heavy_status.json',json.dumps(st,ensure_ascii=False,indent=2,default=str))
-        z.writestr('r34_manifest.txt',f'Пер-R34 HEAVY runtime export\ncreated={datetime.now(timezone.utc).isoformat(timespec="seconds")}\nindexed={len(paths)}\n')
+        snap=body.get('front_runtime_snapshot') if isinstance(body.get('front_runtime_snapshot'),dict) else {}
+        z.writestr('fast_render1_snapshot.json',json.dumps(snap,ensure_ascii=False,indent=2,default=str))
+        z.writestr('r34_manifest.txt',f'Пер-R35 HEAVY runtime export\ncreated={datetime.now(timezone.utc).isoformat(timespec="seconds")}\nindexed={len(paths)}\n')
         z.writestr('mega_runtime_index.txt','\n'.join(paths)+'\n')
         work=Path(tempfile.mkdtemp(prefix='r33_runtime_'))
         try:
@@ -2808,12 +2966,12 @@ def _r33_runtime_zip(body,jid):
                         try:z.write(f,arcname='runtime/'+f'{idx:03d}_{f.name}')
                         except Exception:pass
         finally: shutil.rmtree(work,ignore_errors=True)
-    return path,'Runtime_Watcher_Пер-R34.zip'
+    return path,'Runtime_Watcher_Пер-R35.zip'
 
 
 def _r33_bot_source(body,jid):
-    if not R34_FRONT_SOURCE.is_file(): raise RuntimeError('R34 front source asset missing on HEAVY')
-    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R34_FRONT_SOURCE,path); return path,'Пер-R34.py'
+    if not R35_FRONT_SOURCE.is_file(): raise RuntimeError('R35 front source asset missing on HEAVY')
+    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R35_FRONT_SOURCE,path); return path,'Пер-R35.py'
 
 
 def _r34_current_applied_revision(refresh=False):
@@ -2856,8 +3014,14 @@ def _r33_prepare_file(body,jid):
     if op in {'period_export_query','exact_export_query'}:
         store,currency,selected,opening,start,end=_r33_select_finance(body); ftype=str(body.get('source_file_type') or body.get('file_type') or 'csv').lower()
         cid=int(body.get('target_chat_id') or body.get('recipient_chat_id') or 0)
-        body=dict(body); body['rows']=_r33_excel_rows(selected,opening) if ftype in {'xlsx','xlsxstat','excel'} else _r33_csv_rows(selected)
-        body['sheet_name']='Экспорт'; body['layout']='category' if ftype=='xlsxstat' else 'simple'; body['file_type']='xlsx' if ftype in {'xlsx','xlsxstat','excel'} else 'csv'
+        body=dict(body)
+        if ftype=='xlsxstat':
+            body['rows']=_r35_category_export_rows(store,selected,opening,start,end,body); body['sheet_name']='Статьи'; body['layout']='category'; body['category_layout']=True
+        elif ftype in {'xlsx','excel'}:
+            body['rows']=_r33_excel_rows(selected,opening); body['sheet_name']='Экспорт'; body['layout']='simple'
+        else:
+            body['rows']=_r33_csv_rows(selected); body['sheet_name']='Экспорт'; body['layout']='simple'
+        body['file_type']='xlsx' if ftype in {'xlsx','xlsxstat','excel'} else 'csv'
         body['filename']=f'chat_{cid}_{start}_{end}.{body["file_type"]}'
         body['caption']=f'📂 {"Excel" if body["file_type"]=="xlsx" else "CSV"} · {currency.upper()} · {start}—{end}'
         return _render_export_file(body,jid),body
@@ -2895,13 +3059,13 @@ def _r33_process_file_job(job):
         job2=dict(job); job2['payload']=body2; job2['payload']['filename']=filename; job2['payload']['caption']=str(body2.get('caption') or '')
         delivered=_notify_front_export_result(job2,True,url=url,filename=filename); _file_status_put(jid,callback_delivered=bool(delivered))
         if delivery in {'drive','google'}: path.unlink(missing_ok=True)
-        print(f'[R34 HEAVY EXPORT] {jid} op={body2.get("operation")} ok=True delivery={delivery} callback={delivered}',flush=True)
+        print(f'[R35 HEAVY EXPORT] {jid} op={body2.get("operation")} ok=True delivery={delivery} callback={delivered}',flush=True)
     except Exception as exc:
         detail=f'{type(exc).__name__}: {str(exc)[:700]}'
         with STATE_LOCK:
             STATE['file_failures']=int(STATE.get('file_failures') or 0)+1; STATE['file_last_error']=detail[:240]; STATE['r33_heavy_export_failures']=int(STATE.get('r33_heavy_export_failures') or 0)+1
         _file_status_put(jid,status='done',ok=False,error=detail); _notify_front_export_result(job,False,error=detail)
-        print(f'[R34 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
+        print(f'[R35 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
 
 # file_loop resolves this global at execution time.
 process_file_job=_r33_process_file_job
@@ -2953,7 +3117,9 @@ def _r34_process_state_event_wire(wire,max_wire):
         STATE['r33_last_event_durability']=durable
         if ok: STATE['r34_max_applied_revision']=max(int(STATE.get('r34_max_applied_revision') or 0),max_rev)
         else: STATE['r32_state_last_error']='durable but apply pending: '+str(detail)[:180]
-    return {'ok':True,'durable':durable,'events':len(events),'new':len(new_ids),'applied':applied,'stale':stale,'apply_ok':bool(ok),'apply_detail':str(detail)[:180],'max_revision':max_rev},200
+    try: applied_revision=_r34_current_applied_revision(refresh=True)
+    except Exception: applied_revision=(max_rev if ok else int(STATE.get('r34_max_applied_revision') or 0))
+    return {'ok':True,'durable':durable,'events':len(events),'new':len(new_ids),'applied':applied,'stale':stale,'apply_ok':bool(ok),'apply_detail':str(detail)[:180],'max_revision':max_rev,'durable_revision':max_rev,'applied_revision':int(applied_revision or 0)},200
 
 
 def _r33_state_events_view():
@@ -2973,9 +3139,178 @@ def internal_r34_state_event_large():
 app.view_functions['internal_r32_state_events']=_r33_state_events_view
 
 
-threading.Thread(target=file_loop,name='per-r34-worker-files-1',daemon=True).start()
-threading.Thread(target=file_loop,name='per-r34-worker-files-2',daemon=True).start()
-threading.Thread(target=file_loop,name='per-r34-worker-files-3',daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# Пер-R35 durable file transport. Redis is the durable job ledger; FILE_Q is only
+# an execution cache. A worker restart rehydrates unfinished jobs from Redis.
+_R35_JOB_PENDING_KEY='per:r35:heavy:filejobs:pending'
+_R35_JOB_PREFIX='per:r35:heavy:filejob:'
+_R35_ENQUEUED=set(); _R35_ENQUEUED_LOCK=threading.RLock()
+_R35_RESULT_Q=queue.Queue(maxsize=64); _R35_RESULT_ENQUEUED=set(); _R35_RESULT_LOCK=threading.RLock()
+_R35_BASE_FILE_STATUS_PUT=_file_status_put
+
+def _r35_job_key(jid): return _R35_JOB_PREFIX+str(jid or '')[:80]
+
+def _r35_job_get(jid):
+    c=_redis_client()
+    if c is None: return {}
+    try:
+        raw=c.get(_r35_job_key(jid))
+        if not raw:return {}
+        obj=json.loads(raw.decode('utf-8') if isinstance(raw,(bytes,bytearray)) else raw)
+        return obj if isinstance(obj,dict) else {}
+    except Exception:return {}
+
+def _r35_job_put(jid,row,pending=True):
+    c=_redis_client()
+    if c is None:return False
+    try:
+        row=dict(row or {}); row['job_id']=str(jid); row['updated_at']=time.time()
+        pipe=c.pipeline(transaction=False); pipe.set(_r35_job_key(jid),json.dumps(row,ensure_ascii=False,separators=(',',':'),default=str),ex=259200)
+        if pending: pipe.sadd(_R35_JOB_PENDING_KEY,str(jid))
+        else: pipe.srem(_R35_JOB_PENDING_KEY,str(jid))
+        pipe.execute(); return True
+    except Exception:return False
+
+def _file_status_put(job_id,**fields):
+    _R35_BASE_FILE_STATUS_PUT(job_id,**fields)
+    try:
+        old=_r35_job_get(job_id); old.update(fields); _r35_job_put(job_id,old,pending=str(fields.get('status') or old.get('status') or '') not in {'delivered','closed'})
+    except Exception: pass
+
+def _r35_enqueue_file(job):
+    jid=str((job or {}).get('id') or '')
+    if not jid:return False
+    with _R35_ENQUEUED_LOCK:
+        if jid in _R35_ENQUEUED:return True
+        try: FILE_Q.put_nowait(job); _R35_ENQUEUED.add(jid); return True
+        except queue.Full:return False
+
+def _r35_enqueue_result(task):
+    jid=str((task or {}).get('job',{}).get('id') or '')
+    if not jid:return False
+    with _R35_RESULT_LOCK:
+        if jid in _R35_RESULT_ENQUEUED:return True
+        try: _R35_RESULT_Q.put_nowait(task); _R35_RESULT_ENQUEUED.add(jid); return True
+        except queue.Full:return False
+
+def internal_export_file_r35():
+    if not authorized(): return {'ok':False},404
+    body=request.get_json(silent=True) or {}
+    try: cid=int(body.get('recipient_chat_id') or 0)
+    except Exception: cid=0
+    if not cid:return {'ok':False,'error':'recipient_chat_id required'},400
+    rows=body.get('rows') or []
+    if not isinstance(rows,list) or len(rows)>100000:return {'ok':False,'error':'invalid/too many rows'},400
+    jid=str(body.get('job_id') or secrets.token_hex(12)).strip()[:80]
+    with FILE_JOB_LOCK: mem=dict(FILE_JOB_STATUS.get(jid) or {})
+    existing=mem or _r35_job_get(jid)
+    if existing:
+        status=str(existing.get('status') or 'queued'); ok=existing.get('ok')
+        if status in {'queued','running','ready','delivering','delivered','done'}:
+            return {'ok':True,'duplicate':True,'status':status,'job_id':jid},200 if status in {'delivered','done'} and ok is True else 202
+        if ok is False and status in {'failed','closed'}:
+            return {'ok':False,'duplicate':True,'status':status,'job_id':jid,'error':str(existing.get('error') or 'HEAVY job failed')[:500]},200
+    job={'id':jid,'type':'file_export','created_at':time.time(),'payload':body}
+    durable=_r35_job_put(jid,{'status':'queued','ok':None,'job':job,'recipient_chat_id':cid,'target_chat_id':body.get('target_chat_id')},pending=True)
+    _file_status_put(jid,status='queued',ok=None,recipient_chat_id=cid,target_chat_id=body.get('target_chat_id'))
+    queued=_r35_enqueue_file(job)
+    if not queued and not durable:
+        with FILE_JOB_LOCK: FILE_JOB_STATUS.pop(jid,None)
+        return {'ok':False,'error':'file worker queue full and Redis durability unavailable'},503
+    return {'ok':True,'status':'queued','job_id':jid,'queue_size':FILE_Q.qsize(),'durable':bool(durable)},202
+
+try: app.view_functions['internal_export_file_r7']=internal_export_file_r35
+except Exception: pass
+
+def _r35_process_file_job(job):
+    jid=str(job.get('id') or ''); body=dict(job.get('payload') or {}); _file_status_put(jid,status='running',ok=None)
+    try:
+        required=int(body.get('required_revision') or 0)
+        if required and _r34_state_dependent_operation(body.get('operation')):
+            ok_rev,cur_rev=_r34_wait_revision(required)
+            if not ok_rev: raise RuntimeError(f'HEAVY state revision behind required={required} applied={cur_rev}')
+        prepared,body2=_r33_prepare_file(body,jid); path,filename=prepared; delivery=str(body2.get('delivery') or 'chat'); url=''
+        if delivery=='drive': url=_drive_upload_file(path,filename,str(body2.get('drive_folder_id') or ''))
+        elif delivery=='google':
+            gb=dict(body2); gb['title']=str(body2.get('title') or body2.get('label') or filename)[:95]; gb['spreadsheet_id']=str(body2.get('spreadsheet_id') or '')
+            if not gb['spreadsheet_id']: raise RuntimeError('Google spreadsheet_id missing in R35 job')
+            url=create_google_sheet(gb)
+        with STATE_LOCK:
+            STATE['file_jobs']=int(STATE.get('file_jobs') or 0)+1; STATE['file_last_ok']=time.time(); STATE['file_last_error']=''; STATE['r33_heavy_exports']=int(STATE.get('r33_heavy_exports') or 0)+1; STATE['r33_last_export']=str(body2.get('operation') or body2.get('file_type') or '')
+        job2=dict(job); job2['payload']=dict(body2); job2['payload']['filename']=filename; job2['payload']['caption']=str(body2.get('caption') or '')
+        rec=_r35_job_get(jid); rec.update({'status':'ready','ok':True,'job':job2,'path':str(path),'filename':filename,'url':url,'delivery':delivery}); _r35_job_put(jid,rec,pending=True)
+        _file_status_put(jid,status='ready',ok=True,path=str(path),filename=filename,url=url,delivery=delivery)
+        if not _r35_enqueue_result({'job':job2,'ok':True,'extra':{'url':url,'filename':filename}}): raise RuntimeError('R35 result queue full')
+        print(f'[R35 HEAVY EXPORT] {jid} op={body2.get("operation")} ready delivery={delivery}',flush=True)
+    except Exception as exc:
+        detail=f'{type(exc).__name__}: {str(exc)[:700]}'
+        with STATE_LOCK: STATE['file_failures']=int(STATE.get('file_failures') or 0)+1; STATE['file_last_error']=detail[:240]
+        rec=_r35_job_get(jid); rec.update({'status':'failed','ok':False,'job':job,'error':detail}); _r35_job_put(jid,rec,pending=True)
+        _file_status_put(jid,status='failed',ok=False,error=detail,recipient_chat_id=body.get('recipient_chat_id'),target_chat_id=body.get('target_chat_id'))
+        _r35_enqueue_result({'job':job,'ok':False,'extra':{'error':detail}})
+        print(f'[R35 HEAVY EXPORT] {jid} failed {detail}',flush=True)
+
+process_file_job=_r35_process_file_job
+
+def file_loop():
+    while True:
+        job=FILE_Q.get(); jid=str((job or {}).get('id') or '')
+        try: process_file_job(job)
+        except Exception as exc: print(f'[R35 EXPORT LOOP ERROR] {type(exc).__name__}: {str(exc)[:300]}',flush=True)
+        finally:
+            with _R35_ENQUEUED_LOCK: _R35_ENQUEUED.discard(jid)
+            FILE_Q.task_done()
+
+def _r35_result_loop():
+    while True:
+        task=_R35_RESULT_Q.get(); job=task.get('job') or {}; jid=str(job.get('id') or '')
+        try:
+            _file_status_put(jid,status='delivering')
+            delivered=bool(_notify_front_export_result(job,bool(task.get('ok')),**dict(task.get('extra') or {})))
+            if delivered:
+                rec=_r35_job_get(jid); rec.update({'status':'delivered','callback_delivered':True}); _r35_job_put(jid,rec,pending=False)
+                _file_status_put(jid,status='delivered',callback_delivered=True)
+                try:
+                    path=Path(str(rec.get('path') or ''))
+                    if path.is_file(): path.unlink(missing_ok=True)
+                except Exception: pass
+            else:
+                rec=_r35_job_get(jid); rec.update({'status':'ready' if task.get('ok') else 'failed','callback_delivered':False}); _r35_job_put(jid,rec,pending=True)
+                _file_status_put(jid,status=rec.get('status'),callback_delivered=False)
+        except Exception as exc:
+            rec=_r35_job_get(jid); rec.update({'status':'ready' if task.get('ok') else 'failed','callback_delivered':False,'delivery_error':f'{type(exc).__name__}: {str(exc)[:500]}'}); _r35_job_put(jid,rec,pending=True)
+        finally:
+            with _R35_RESULT_LOCK: _R35_RESULT_ENQUEUED.discard(jid)
+            _R35_RESULT_Q.task_done()
+
+def _r35_recover_loop():
+    while True:
+        try:
+            c=_redis_client(); ids=[]
+            if c is not None:
+                ids=[x.decode() if isinstance(x,(bytes,bytearray)) else str(x) for x in list(c.smembers(_R35_JOB_PENDING_KEY) or [])[:200]]
+            for jid in ids:
+                rec=_r35_job_get(jid); status=str(rec.get('status') or 'queued'); job=rec.get('job') if isinstance(rec.get('job'),dict) else None
+                if not job: continue
+                if status in {'ready','delivering'} and bool(rec.get('ok')) and Path(str(rec.get('path') or '')).is_file():
+                    _r35_enqueue_result({'job':job,'ok':True,'extra':{'url':rec.get('url') or '','filename':rec.get('filename') or ''}})
+                elif status=='failed' and rec.get('error'):
+                    _r35_enqueue_result({'job':job,'ok':False,'extra':{'error':rec.get('error')}})
+                elif status not in {'delivered','closed'}:
+                    # after a container restart a local ready file is gone, so regenerate from durable payload
+                    _r35_enqueue_file(job)
+        except Exception as exc:
+            with STATE_LOCK: STATE['file_last_error']=f'R35 recovery {type(exc).__name__}: {str(exc)[:180]}'
+        time.sleep(2.0)
+
+threading.Thread(target=file_loop,name='per-r35-worker-files-1',daemon=True).start()
+threading.Thread(target=file_loop,name='per-r35-worker-files-2',daemon=True).start()
+threading.Thread(target=file_loop,name='per-r35-worker-files-3',daemon=True).start()
+threading.Thread(target=_r35_result_loop,name='per-r35-result-1',daemon=True).start()
+threading.Thread(target=_r35_result_loop,name='per-r35-result-2',daemon=True).start()
+threading.Thread(target=_r35_result_loop,name='per-r35-result-3',daemon=True).start()
+threading.Thread(target=_r35_result_loop,name='per-r35-result-4',daemon=True).start()
 threading.Thread(target=_capsule_mega_loop_r20,name='vys262-worker-capsule-mega-r20',daemon=True).start()
 
 threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
@@ -2992,9 +3327,10 @@ try:
         print(f'[R12 DELTA REPLAY] ok={_r12_replay_ok} {_r12_replay_detail}', flush=True)
         _r32_replay_ok, _r32_replay_detail = _r32_replay_state_events_from_redis()
         print(f'[R32 EVENT REPLAY] ok={_r32_replay_ok} {_r32_replay_detail}', flush=True)
-        print(f'[R34 REVISION] applied={_r34_current_applied_revision(refresh=True)}', flush=True)
+        print(f'[R35 REVISION] applied={_r34_current_applied_revision(refresh=True)}', flush=True)
 except Exception as _r6_exc:
     print(f'[R6 RESTORE CACHE] redis error={type(_r6_exc).__name__}: {str(_r6_exc)[:180]}', flush=True)
+threading.Thread(target=_r35_recover_loop,name='per-r35-job-recovery',daemon=True).start()
 threading.Thread(target=_restore_refresh_background,name='vys262-worker-mega-warmup',daemon=True).start()
 threading.Thread(target=_checkpoint_loop_v267,name='vys262-worker-checkpoint-r13',daemon=True).start()
 threading.Thread(target=_event_reconcile_loop_v268,name='vys262-worker-events-r13',daemon=True).start()
