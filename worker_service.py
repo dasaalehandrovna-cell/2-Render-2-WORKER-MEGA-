@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R33.
+"""vys-262 Render #2 heavy worker · Пер-R34.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -43,8 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-per-r33-heavy'
-TRANSPORT_VERSION = 'vys-262-worker-per-r33-events'
+VERSION = 'vys-262-worker-per-r34-heavy'
+TRANSPORT_VERSION = 'vys-262-worker-per-r34-events'
 
 
 def env_bool(name, default=False):
@@ -1901,6 +1901,8 @@ def internal_snapshot_upload():
             STATE['last_snapshot_size'] = int(meta.get('size') or len(raw))
             STATE['last_snapshot_at'] = time.time()
             STATE['last_state_token'] = str(request.headers.get('X-Split-State-Token') or STATE.get('last_state_token') or '')[:120]
+            STATE['r34_seeded'] = True
+            STATE['r34_seeded_at'] = time.time()
         try:
             CACHE_DB.unlink(missing_ok=True)
             _ensure_cache_db_v267()
@@ -2203,6 +2205,12 @@ def internal_restore_latest():
     resp.headers['X-State-Revision']=str(float(meta.get('revision') or 0.0))
     return resp
 
+@app.route('/internal/r34/seed-status',methods=['GET'])
+def internal_r34_seed_status():
+    if not authorized(): return {'ok':False},404
+    with STATE_LOCK:
+        return {'ok':True,'seeded':bool(STATE.get('r34_seeded')),'seeded_at':float(STATE.get('r34_seeded_at') or 0.0),'max_applied_revision':int(STATE.get('r34_max_applied_revision') or 0)},200
+
 @app.route('/internal/status', methods=['GET'])
 def internal_status():
     if not authorized(): return {'ok':False},404
@@ -2350,6 +2358,11 @@ def _drive_upload_file(path: Path, filename: str, folder_id: str=''):
 
 
 def _notify_front_export_result(job, ok, **extra):
+    """R34: callback is complete only when FAST confirms actual user delivery.
+
+    202 means FAST accepted/continues sending the document. HEAVY keeps retrying the
+    tiny result callback; the file itself stays on HEAVY and is not regenerated.
+    """
     base,secret=front_base(),peer_secret()
     if not base or not secret: return False
     body=dict(job.get('payload') or {})
@@ -2358,14 +2371,16 @@ def _notify_front_export_result(job, ok, **extra):
         'file_type':str(body.get('file_type') or ''),'delivery':str(body.get('delivery') or 'chat'),
         'recipient_chat_id':body.get('recipient_chat_id'),'target_chat_id':body.get('target_chat_id'),
         'tenant_id':body.get('tenant_id'),'label':str(body.get('label') or ''),'chat_name':str(body.get('chat_name') or ''),'caption':str(body.get('caption') or '')[:1000]}
-    for attempt in range(3):
+    deadline=time.time()+max(30,env_int('WORKER_R34_RESULT_RETRY_WINDOW_SEC',900,30,7200))
+    delay=1.0
+    while time.time()<deadline:
         try:
-            r=requests.post(base+'/internal/split/export-result',json=payload,headers={'X-Peer-Secret':secret,'User-Agent':'vys-262-worker-export-r7'},timeout=15)
-            if 200 <= r.status_code < 300: return True
+            r=requests.post(base+'/internal/split/export-result',json=payload,headers={'X-Peer-Secret':secret,'User-Agent':'per-r34-worker-export-result'},timeout=20)
+            data=r.json() if r.content and 'json' in str(r.headers.get('content-type','')).lower() else {}
+            if r.status_code==200 and bool(data.get('delivered')): return True
         except Exception: pass
-        time.sleep(attempt+1)
+        time.sleep(delay); delay=min(max(2.0,env_int('WORKER_R34_RESULT_RETRY_SEC',8,1,60)),delay*1.5)
     return False
-
 
 def process_file_job(job):
     jid=str(job.get('id') or ''); body=dict(job.get('payload') or {})
@@ -2445,9 +2460,9 @@ def internal_export_download_r7(job_id):
 
 
 # ---------------------------------------------------------------------------
-# R33 HEAVY-only export/document layer + Redis-optional state durability.
+# R34 HEAVY-only export/document layer + Redis-optional state durability.
 # All expensive selection/serialization/compression/MEGA/Google work happens here.
-R33_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R33.py'
+R34_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R34.py'
 STATE.update({'r33_heavy_exports':0,'r33_heavy_export_failures':0,'r33_direct_mega_events':0,
               'r33_direct_mega_event_bytes':0,'r33_last_event_durability':'','r33_last_export':''})
 
@@ -2688,7 +2703,7 @@ def _r33_full_state(body,jid):
                 where=' AND '.join(f'{k}=?' for k in keycols); con.execute(f'UPDATE {table} SET v=? WHERE {where}',(safe,*keys))
         con.execute("CREATE TABLE IF NOT EXISTS meta (kind TEXT NOT NULL,k TEXT NOT NULL,v TEXT NOT NULL,PRIMARY KEY(kind,k))")
         count=con.execute('SELECT COUNT(*) FROM chats').fetchone()[0]
-        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R33_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids) if scope=='tenant' else [],'chat_count':int(count),'failed_tasks':0,'checksum':''}
+        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R34_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids) if scope=='tenant' else [],'chat_count':int(count),'failed_tasks':0,'checksum':''}
         con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','failed_tasks','[]') ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v")
         con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','manifest',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(manifest,ensure_ascii=False,separators=(',',':')),)); con.commit()
     finally: con.close()
@@ -2712,7 +2727,7 @@ def _r33_sqlite(body,jid):
 
 def _r33_chat_json(body,jid):
     cid=int(body.get('target_chat_id') or body.get('recipient_chat_id') or 0); store=_r33_load_store(cid)
-    obj={'schema':'per-r33-chat-state','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'chat_id':cid,'store':_r33_sanitize(store)}
+    obj={'schema':'per-r34-chat-state','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'chat_id':cid,'store':_r33_sanitize(store)}
     path=FILE_DIR/f'{jid}.json'; path.write_text(json.dumps(obj,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
     return path,f'chat_{cid}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
 
@@ -2722,7 +2737,7 @@ def _r33_window_doc(body,jid):
     catalog=gs.get('_window_marker_catalog_v160') if isinstance(gs.get('_window_marker_catalog_v160'),dict) else {}
     tz=gs.get('_window_tz_v160') if isinstance(gs.get('_window_tz_v160'),list) else []
     op=str(body.get('operation') or '')
-    lines=[f'Пер-R33 HEAVY export · {op}',f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}', '']
+    lines=[f'Пер-R34 HEAVY export · {op}',f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}', '']
     if op=='window_markers':
         for marker,row in sorted(catalog.items()):
             rr=row if isinstance(row,dict) else {}; lines.extend([f'{marker} — {rr.get("name") or "без имени"}',f'Последнее изменение: {rr.get("last_named_at") or "—"}','---'])
@@ -2753,7 +2768,7 @@ def _r33_mega_find(pattern,limit=400):
 
 def _r33_journal(body,jid,current=False):
     limit=max(100,min(20000,int(body.get('limit') or 5000))); paths=_r33_mega_find('journal_*.json.gz',min(300,limit))
-    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R33' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R33'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
+    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R34' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R34'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
     work=Path(tempfile.mkdtemp(prefix='r33_journal_'))
     try:
         with MEGA_LOCK:
@@ -2766,12 +2781,12 @@ def _r33_journal(body,jid,current=False):
                         raw=gzip.decompress(f.read_bytes()).decode('utf-8','replace')
                         # Preserve text/JSON as-is; current journal prefers lines mentioning current release.
                         for line in raw.splitlines():
-                            if current and ('Пер-R33' not in line and 'r33' not in line.casefold()): continue
+                            if current and ('Пер-R34' not in line and 'r34' not in line.casefold()): continue
                             lines.append(line)
                             if len(lines)>=limit+4: break
                     except Exception: pass
-        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R33.')
-        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R33.txt' if current else 'Журнал_бота_Пер-R33.txt')
+        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R34.')
+        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R34.txt' if current else 'Журнал_бота_Пер-R34.txt')
     finally: shutil.rmtree(work,ignore_errors=True)
 
 
@@ -2781,7 +2796,7 @@ def _r33_runtime_zip(body,jid):
     with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as z:
         with STATE_LOCK: st=dict(STATE)
         z.writestr('heavy_status.json',json.dumps(st,ensure_ascii=False,indent=2,default=str))
-        z.writestr('r33_manifest.txt',f'Пер-R33 HEAVY runtime export\ncreated={datetime.now(timezone.utc).isoformat(timespec="seconds")}\nindexed={len(paths)}\n')
+        z.writestr('r34_manifest.txt',f'Пер-R34 HEAVY runtime export\ncreated={datetime.now(timezone.utc).isoformat(timespec="seconds")}\nindexed={len(paths)}\n')
         z.writestr('mega_runtime_index.txt','\n'.join(paths)+'\n')
         work=Path(tempfile.mkdtemp(prefix='r33_runtime_'))
         try:
@@ -2793,13 +2808,48 @@ def _r33_runtime_zip(body,jid):
                         try:z.write(f,arcname='runtime/'+f'{idx:03d}_{f.name}')
                         except Exception:pass
         finally: shutil.rmtree(work,ignore_errors=True)
-    return path,'Runtime_Watcher_Пер-R33.zip'
+    return path,'Runtime_Watcher_Пер-R34.zip'
 
 
 def _r33_bot_source(body,jid):
-    if not R33_FRONT_SOURCE.is_file(): raise RuntimeError('R33 front source asset missing on HEAVY')
-    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R33_FRONT_SOURCE,path); return path,'Пер-R33.py'
+    if not R34_FRONT_SOURCE.is_file(): raise RuntimeError('R34 front source asset missing on HEAVY')
+    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R34_FRONT_SOURCE,path); return path,'Пер-R34.py'
 
+
+def _r34_current_applied_revision(refresh=False):
+    with STATE_LOCK:
+        cached=int(STATE.get('r34_max_applied_revision') or 0)
+    if cached and not refresh: return cached
+    try:
+        _r33_cache_ready()
+        con=sqlite3.connect(str(CACHE_DB),timeout=5)
+        try:
+            row=con.execute('SELECT MAX(revision) FROM r32_state_revisions').fetchone()
+            val=int((row or [0])[0] or 0)
+        finally: con.close()
+        with STATE_LOCK: STATE['r34_max_applied_revision']=max(int(STATE.get('r34_max_applied_revision') or 0),val)
+        return val
+    except Exception:
+        return cached
+
+
+def _r34_wait_revision(required, timeout=None):
+    required=int(required or 0)
+    if required<=0: return True,0
+    timeout=float(timeout if timeout is not None else env_int('WORKER_R34_EXPORT_REVISION_WAIT_SEC',180,5,900))
+    deadline=time.time()+max(1.0,timeout)
+    while time.time()<deadline:
+        cur=_r34_current_applied_revision(refresh=True)
+        if cur>=required: return True,cur
+        # Redis replay can close a transient local apply gap without contacting FAST.
+        try: _r32_replay_state_events_from_redis(limit=50000)
+        except Exception: pass
+        time.sleep(0.4)
+    return False,_r34_current_applied_revision(refresh=True)
+
+
+def _r34_state_dependent_operation(op):
+    return str(op or '') in {'period_export_query','exact_export_query','tabl_lsx','chat_json','full_state','sqlite','google_period_query','google_exact_query','google_tabl_query'}
 
 def _r33_prepare_file(body,jid):
     op=str(body.get('operation') or '')
@@ -2827,12 +2877,16 @@ def _r33_prepare_file(body,jid):
 def _r33_process_file_job(job):
     jid=str(job.get('id') or ''); body=dict(job.get('payload') or {}); _file_status_put(jid,status='running')
     try:
+        required=int(body.get('required_revision') or 0)
+        if required and _r34_state_dependent_operation(body.get('operation')):
+            ok_rev,cur_rev=_r34_wait_revision(required)
+            if not ok_rev: raise RuntimeError(f'HEAVY state revision behind required={required} applied={cur_rev}')
         prepared,body2=_r33_prepare_file(body,jid); path,filename=prepared
         delivery=str(body2.get('delivery') or 'chat'); url=''
         if delivery=='drive': url=_drive_upload_file(path,filename,str(body2.get('drive_folder_id') or ''))
         elif delivery=='google':
             gb=dict(body2); gb['title']=str(body2.get('title') or body2.get('label') or filename)[:95]; gb['spreadsheet_id']=str(body2.get('spreadsheet_id') or '')
-            if not gb['spreadsheet_id']: raise RuntimeError('Google spreadsheet_id missing in R33 job')
+            if not gb['spreadsheet_id']: raise RuntimeError('Google spreadsheet_id missing in R34 job')
             url=create_google_sheet(gb)
         with STATE_LOCK:
             STATE['file_jobs']=int(STATE.get('file_jobs') or 0)+1; STATE['file_last_ok']=time.time(); STATE['file_last_error']=''; STATE['r33_heavy_exports']=int(STATE.get('r33_heavy_exports') or 0)+1; STATE['r33_last_export']=str(body2.get('operation') or body2.get('file_type') or '')
@@ -2841,13 +2895,13 @@ def _r33_process_file_job(job):
         job2=dict(job); job2['payload']=body2; job2['payload']['filename']=filename; job2['payload']['caption']=str(body2.get('caption') or '')
         delivered=_notify_front_export_result(job2,True,url=url,filename=filename); _file_status_put(jid,callback_delivered=bool(delivered))
         if delivery in {'drive','google'}: path.unlink(missing_ok=True)
-        print(f'[R33 HEAVY EXPORT] {jid} op={body2.get("operation")} ok=True delivery={delivery} callback={delivered}',flush=True)
+        print(f'[R34 HEAVY EXPORT] {jid} op={body2.get("operation")} ok=True delivery={delivery} callback={delivered}',flush=True)
     except Exception as exc:
         detail=f'{type(exc).__name__}: {str(exc)[:700]}'
         with STATE_LOCK:
             STATE['file_failures']=int(STATE.get('file_failures') or 0)+1; STATE['file_last_error']=detail[:240]; STATE['r33_heavy_export_failures']=int(STATE.get('r33_heavy_export_failures') or 0)+1
         _file_status_put(jid,status='done',ok=False,error=detail); _notify_front_export_result(job,False,error=detail)
-        print(f'[R33 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
+        print(f'[R34 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
 
 # file_loop resolves this global at execution time.
 process_file_job=_r33_process_file_job
@@ -2862,7 +2916,7 @@ def _r33_archive_events_direct(events):
             ok,detail=prepare_mega_layout()
             if not ok:return False,detail,0
             root=_r32_events_mega_dir(); remote_day=root.rstrip('/')+'/'+day
-            if not ensure_mega_dir(root) or not ensure_mega_dir(remote_day): return False,'cannot create R33 event MEGA dir',0
+            if not ensure_mega_dir(root) or not ensure_mega_dir(remote_day): return False,'cannot create R34 event MEGA dir',0
             put=run_cmd(['mega-put',str(local),remote_day],timeout=env_int('MEGA_TIMEOUT',180,30,900))
             if put.returncode!=0:return False,'mega-put direct events failed: '+(put.stderr or put.stdout or '')[:180],0
         with STATE_LOCK:
@@ -2871,38 +2925,57 @@ def _r33_archive_events_direct(events):
     finally: shutil.rmtree(work,ignore_errors=True)
 
 
-def _r33_state_events_view():
-    if not authorized(): return {'ok':False},404
-    wire=request.get_data(cache=False,as_text=False) or b''; max_wire=env_int('WORKER_R32_EVENT_MAX_WIRE_KB',1024,32,8192)*1024
-    if not wire or len(wire)>max_wire:return {'ok':False,'error':'R33 event batch size invalid'},413
+def _r34_process_state_event_wire(wire,max_wire):
+    if not wire or len(wire)>int(max_wire): return {'ok':False,'error':f'R34 event batch size invalid bytes={len(wire)} max={int(max_wire)}'},413
     try:
-        raw=gzip.decompress(wire) if str(request.headers.get('Content-Encoding') or '').lower()=='gzip' else wire; body=json.loads(raw.decode('utf-8')); events=body.get('events') if isinstance(body,dict) else None
+        raw=gzip.decompress(wire) if str(request.headers.get('Content-Encoding') or '').lower()=='gzip' else wire
+        body=json.loads(raw.decode('utf-8')); events=body.get('events') if isinstance(body,dict) else None
         if not isinstance(events,list) or not events or len(events)>512: raise ValueError('events invalid')
         events=[x for x in events if _r32_event_valid(x)]
         if not events: raise ValueError('no valid events')
-    except Exception as exc:return {'ok':False,'error':f'R33 event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
+    except Exception as exc: return {'ok':False,'error':f'R34 event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
     durable=''; new_ids=[]; rok,rdetail,new_ids=_r32_redis_store_events(events)
-    if rok: durable='redis'; _R32_MEGA_WAKE.set() if new_ids else None
+    if rok:
+        durable='redis'
+        if new_ids: _R32_MEGA_WAKE.set()
     else:
         mok,mdetail,_bytes=_r33_archive_events_direct(events)
         if not mok:
             with STATE_LOCK: STATE['r32_state_last_error']=f'Redis={rdetail}; MEGA={mdetail}'[:220]
-            return {'ok':False,'error':'R33 durability unavailable: '+str(rdetail)[:80]+'; '+str(mdetail)[:100]},503
+            return {'ok':False,'error':'R34 durability unavailable: '+str(rdetail)[:80]+'; '+str(mdetail)[:100]},503
         durable='mega-direct'
     try: ok,detail,applied,stale=_r32_apply_events(events)
     except Exception as exc: ok=False; detail=f'{type(exc).__name__}: {str(exc)[:220]}'; applied=stale=0
-    # Once the event is in Redis or MEGA it is safe to ACK FAST even if the local cache
-    # momentarily cannot apply it; HEAVY will replay the immutable event journal.
+    max_rev=max([int(x.get('revision') or 0) for x in events] or [0])
     with STATE_LOCK:
-        STATE['r32_state_events_received']=int(STATE.get('r32_state_events_received') or 0)+len(events); STATE['r32_state_event_bytes']=int(STATE.get('r32_state_event_bytes') or 0)+len(wire); STATE['r33_last_event_durability']=durable
-        if not ok: STATE['r32_state_last_error']='durable but apply pending: '+str(detail)[:180]
-    return {'ok':True,'durable':durable,'events':len(events),'new':len(new_ids),'applied':applied,'stale':stale,'apply_ok':bool(ok),'apply_detail':str(detail)[:180]},200
+        STATE['r32_state_events_received']=int(STATE.get('r32_state_events_received') or 0)+len(events)
+        STATE['r32_state_event_bytes']=int(STATE.get('r32_state_event_bytes') or 0)+len(wire)
+        STATE['r33_last_event_durability']=durable
+        if ok: STATE['r34_max_applied_revision']=max(int(STATE.get('r34_max_applied_revision') or 0),max_rev)
+        else: STATE['r32_state_last_error']='durable but apply pending: '+str(detail)[:180]
+    return {'ok':True,'durable':durable,'events':len(events),'new':len(new_ids),'applied':applied,'stale':stale,'apply_ok':bool(ok),'apply_detail':str(detail)[:180],'max_revision':max_rev},200
+
+
+def _r33_state_events_view():
+    if not authorized(): return {'ok':False},404
+    wire=request.get_data(cache=False,as_text=False) or b''
+    max_wire=env_int('WORKER_R32_EVENT_MAX_WIRE_KB',8192,32,32768)*1024
+    return _r34_process_state_event_wire(wire,max_wire)
+
+@app.route('/internal/state/event-large',methods=['POST'])
+def internal_r34_state_event_large():
+    if not authorized(): return {'ok':False},404
+    wire=request.get_data(cache=False,as_text=False) or b''
+    max_wire=env_int('WORKER_R34_EVENT_LARGE_MAX_MB',64,8,128)*1024*1024
+    return _r34_process_state_event_wire(wire,max_wire)
 
 # Replace Flask endpoint without registering a duplicate route.
 app.view_functions['internal_r32_state_events']=_r33_state_events_view
 
 
-threading.Thread(target=file_loop,name='vys262-worker-files-r7',daemon=True).start()
+threading.Thread(target=file_loop,name='per-r34-worker-files-1',daemon=True).start()
+threading.Thread(target=file_loop,name='per-r34-worker-files-2',daemon=True).start()
+threading.Thread(target=file_loop,name='per-r34-worker-files-3',daemon=True).start()
 threading.Thread(target=_capsule_mega_loop_r20,name='vys262-worker-capsule-mega-r20',daemon=True).start()
 
 threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
@@ -2919,6 +2992,7 @@ try:
         print(f'[R12 DELTA REPLAY] ok={_r12_replay_ok} {_r12_replay_detail}', flush=True)
         _r32_replay_ok, _r32_replay_detail = _r32_replay_state_events_from_redis()
         print(f'[R32 EVENT REPLAY] ok={_r32_replay_ok} {_r32_replay_detail}', flush=True)
+        print(f'[R34 REVISION] applied={_r34_current_applied_revision(refresh=True)}', flush=True)
 except Exception as _r6_exc:
     print(f'[R6 RESTORE CACHE] redis error={type(_r6_exc).__name__}: {str(_r6_exc)[:180]}', flush=True)
 threading.Thread(target=_restore_refresh_background,name='vys262-worker-mega-warmup',daemon=True).start()
