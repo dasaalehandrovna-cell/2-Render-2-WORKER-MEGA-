@@ -1,4 +1,4 @@
-"""vys-262 R36 internal runtime configuration.
+"""vys-262 R37 internal runtime configuration.
 
 All non-secret operational tunables that used to be Render environment variables
 live here.  Render ENV is intentionally reserved for credentials, remote

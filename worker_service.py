@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R36.
+"""vys-262 Render #2 heavy worker · Пер-R37.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -2473,7 +2473,7 @@ def internal_export_download_r7(job_id):
 # ---------------------------------------------------------------------------
 # R35 HEAVY-only export/document layer + Redis-optional state durability.
 # All expensive selection/serialization/compression/MEGA/Google work happens here.
-R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R36.py'
+R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R37.py'
 STATE.update({'r33_heavy_exports':0,'r33_heavy_export_failures':0,'r33_direct_mega_events':0,
               'r33_direct_mega_event_bytes':0,'r33_last_event_durability':'','r33_last_export':''})
 
@@ -2902,7 +2902,7 @@ def _r33_window_doc(body,jid):
     catalog=gs.get('_window_marker_catalog_v160') if isinstance(gs.get('_window_marker_catalog_v160'),dict) else {}
     tz=gs.get('_window_tz_v160') if isinstance(gs.get('_window_tz_v160'),list) else []
     op=str(body.get('operation') or '')
-    lines=[f'Пер-R36 HEAVY export · {op}',f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}', '']
+    lines=[f'Пер-R37 HEAVY export · {op}',f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}', '']
     if op=='window_markers':
         for marker,row in sorted(catalog.items()):
             rr=row if isinstance(row,dict) else {}; lines.extend([f'{marker} — {rr.get("name") or "без имени"}',f'Последнее изменение: {rr.get("last_named_at") or "—"}','---'])
@@ -2933,7 +2933,7 @@ def _r33_mega_find(pattern,limit=400):
 
 def _r33_journal(body,jid,current=False):
     limit=max(100,min(20000,int(body.get('limit') or 5000))); paths=_r33_mega_find('journal_*.json.gz',min(300,limit))
-    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R36' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R36'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
+    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R37' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R37'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
     snap=body.get('front_runtime_snapshot') if isinstance(body.get('front_runtime_snapshot'),dict) else {}
     if snap: lines.extend(['--- FAST Render #1 snapshot ---',json.dumps(snap,ensure_ascii=False,indent=2,default=str),'--- end FAST snapshot ---',''])
     work=Path(tempfile.mkdtemp(prefix='r33_journal_'))
@@ -2948,12 +2948,12 @@ def _r33_journal(body,jid,current=False):
                         raw=gzip.decompress(f.read_bytes()).decode('utf-8','replace')
                         # Preserve text/JSON as-is; current journal prefers lines mentioning current release.
                         for line in raw.splitlines():
-                            if current and ('Пер-R36' not in line and 'r34' not in line.casefold()): continue
+                            if current and ('Пер-R37' not in line and 'r34' not in line.casefold()): continue
                             lines.append(line)
                             if len(lines)>=limit+4: break
                     except Exception: pass
-        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R36.')
-        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R36.txt' if current else 'Журнал_бота_Пер-R36.txt')
+        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R37.')
+        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R37.txt' if current else 'Журнал_бота_Пер-R37.txt')
     finally: shutil.rmtree(work,ignore_errors=True)
 
 
@@ -2965,7 +2965,7 @@ def _r33_runtime_zip(body,jid):
         z.writestr('heavy_status.json',json.dumps(st,ensure_ascii=False,indent=2,default=str))
         snap=body.get('front_runtime_snapshot') if isinstance(body.get('front_runtime_snapshot'),dict) else {}
         z.writestr('fast_render1_snapshot.json',json.dumps(snap,ensure_ascii=False,indent=2,default=str))
-        z.writestr('r34_manifest.txt',f'Пер-R36 HEAVY runtime export\ncreated={datetime.now(timezone.utc).isoformat(timespec="seconds")}\nindexed={len(paths)}\n')
+        z.writestr('r34_manifest.txt',f'Пер-R37 HEAVY runtime export\ncreated={datetime.now(timezone.utc).isoformat(timespec="seconds")}\nindexed={len(paths)}\n')
         z.writestr('mega_runtime_index.txt','\n'.join(paths)+'\n')
         work=Path(tempfile.mkdtemp(prefix='r33_runtime_'))
         try:
@@ -2977,12 +2977,12 @@ def _r33_runtime_zip(body,jid):
                         try:z.write(f,arcname='runtime/'+f'{idx:03d}_{f.name}')
                         except Exception:pass
         finally: shutil.rmtree(work,ignore_errors=True)
-    return path,'Runtime_Watcher_Пер-R36.zip'
+    return path,'Runtime_Watcher_Пер-R37.zip'
 
 
 def _r33_bot_source(body,jid):
     if not R35_FRONT_SOURCE.is_file(): raise RuntimeError('R36 front source asset missing on HEAVY')
-    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R35_FRONT_SOURCE,path); return path,'Пер-R36.py'
+    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R35_FRONT_SOURCE,path); return path,'Пер-R37.py'
 
 
 def _r34_current_applied_revision(refresh=False):
@@ -3152,7 +3152,7 @@ app.view_functions['internal_r32_state_events']=_r33_state_events_view
 
 
 # ---------------------------------------------------------------------------
-# Пер-R36 durable file transport. Redis is the durable job ledger; FILE_Q is only
+# Пер-R37 durable file transport. Redis is the durable job ledger; FILE_Q is only
 # an execution cache. A worker restart rehydrates unfinished jobs from Redis.
 _R35_JOB_PENDING_KEY='per:r35:heavy:filejobs:pending'
 _R35_JOB_PREFIX='per:r35:heavy:filejob:'
