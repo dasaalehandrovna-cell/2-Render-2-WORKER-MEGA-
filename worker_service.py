@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R30.
+"""vys-262 Render #2 heavy worker · Пер-R32.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -43,8 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-per-r30-heavy'
-TRANSPORT_VERSION = 'vys-262-worker-per-r30-internal-config'
+VERSION = 'vys-262-worker-per-r32-heavy'
+TRANSPORT_VERSION = 'vys-262-worker-per-r32-events'
 
 
 def env_bool(name, default=False):
@@ -59,8 +59,13 @@ def authorized():
     expected, supplied = peer_secret(), str(request.headers.get('X-Peer-Secret','') or '')
     return bool(expected and secrets.compare_digest(expected, supplied))
 def front_base():
-    raw = str(os.getenv('FRONT_SERVICE_URL', os.getenv('PEER_SERVICE_URL','')) or '').strip().rstrip('/')
-    if raw and not raw.startswith(('http://','https://')): raw = 'https://' + raw
+    raw = str(os.getenv('FRONT_PRIVATE_URL','') or '').strip().rstrip('/')
+    private = bool(raw)
+    if not raw:
+        raw = str(os.getenv('FRONT_SERVICE_URL', os.getenv('PEER_SERVICE_URL','')) or '').strip().rstrip('/')
+    if raw and not raw.startswith(('http://','https://')):
+        looks_private = private or raw.endswith('.internal') or '.internal:' in raw or (raw.startswith('render-') and ':' in raw)
+        raw = ('http://' if looks_private else 'https://') + raw
     return raw
 def mega_root(): return '/' + str(os.getenv('MEGA_BACKUP_DIR','TelegramBotBackups2-2') or 'TelegramBotBackups2-2').strip('/')
 def remote_db_dir(): return mega_root().rstrip('/') + '/database'
@@ -970,7 +975,16 @@ def worker_loop():
 
 def _restore_refresh_background():
     global RESTORE_REFRESH_RUNNING
-    try: _download_mega_latest()
+    try:
+        _download_mega_latest()
+        try:
+            if '_r32_replay_state_events_from_mega' in globals():
+                ok32,detail32=_r32_replay_state_events_from_mega()
+                print(f'[R32 MEGA EVENT REPLAY] ok={ok32} {detail32}',flush=True)
+                if ok32 and CACHE_DB.exists():
+                    with DELTA_APPLY_LOCK: _gzip_cache_db_v267()
+        except Exception as exc:
+            print(f'[R32 MEGA EVENT REPLAY ERROR] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
     finally:
         with RESTORE_REFRESH_LOCK: RESTORE_REFRESH_RUNNING = False
 
@@ -998,13 +1012,11 @@ def _reconcile_hash_loop_v268():
             if front_sha and worker_sha and front_sha==worker_sha:
                 with STATE_LOCK: STATE['reconcile_last_ok']=time.time(); STATE['reconcile_last_error']=''
                 print(f'[R13 RECONCILE] hash OK {front_sha[:16]}',flush=True); continue
-            # Rare recovery: only now fetch the ~1 MB full compressed SQLite.
-            ok,detail=sync_state_job({'state_token':str(body.get('state_token') or ''),'reason':'reconcile_hash_mismatch'})
+            # R32: binary SQLite hashes can differ after replaying equivalent row events.
+            # Never pull a full Front database for this; Redis/MEGA event journals are the recovery path.
             with STATE_LOCK:
-                if ok:
-                    STATE['reconcile_last_ok']=time.time(); STATE['reconcile_last_error']=''; STATE['reconcile_full_resyncs']=int(STATE.get('reconcile_full_resyncs') or 0)+1
-                else: STATE['reconcile_last_error']=str(detail)[:220]
-            print(f'[R13 RECONCILE] full={ok} {detail}',flush=True)
+                STATE['reconcile_last_ok']=time.time(); STATE['reconcile_last_error']='R32 logical event stream; binary mismatch ignored'
+            print(f'[R32 RECONCILE] logical event mode; no full fetch front={front_sha[:16]} worker={worker_sha[:16]}',flush=True)
         except Exception as exc:
             with STATE_LOCK: STATE['reconcile_last_error']=f'{type(exc).__name__}: {str(exc)[:220]}'
             print(f'[R13 RECONCILE ERROR] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
@@ -1276,6 +1288,314 @@ def create_google_sheet(body):
         if missing:
             raise RuntimeError(f'Google Sheets notes not confirmed: {missing[:12]}')
     return f'https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={sheet_id}'
+
+
+
+# ---------------------------------------------------------------------------
+# R32 logical state-event stream.
+# FAST sends only committed SQLite row mutations. HEAVY stores each immutable
+# event in Redis, applies it to its local exact restore cache, archives batches to
+# MEGA, and serves the assembled SQLite to FAST on deploy.
+_R32_STATE_PREFIX = str(os.getenv('WORKER_R32_STATE_EVENT_PREFIX','vys262:state_events:r32') or 'vys262:state_events:r32').strip()
+_R32_STATE_LOCK = threading.RLock()
+_R32_MEGA_WAKE = threading.Event()
+_R32_STATE_REPLAY_LOCK = threading.RLock()
+STATE.update({
+    'r32_event_stream': True, 'r32_state_events_received':0, 'r32_state_events_applied':0,
+    'r32_state_events_stale':0, 'r32_state_event_bytes':0, 'r32_state_last_at':0.0,
+    'r32_state_last_error':'', 'r32_mega_segments':0, 'r32_mega_last_ok':0.0,
+    'r32_mega_last_error':'', 'r32_baseline_ready':False,
+})
+
+def _r32_event_key(eid): return f'{_R32_STATE_PREFIX}:event:{eid}'
+def _r32_index_key(): return f'{_R32_STATE_PREFIX}:index'
+def _r32_pending_key(): return f'{_R32_STATE_PREFIX}:mega_pending'
+def _r32_archived_key(): return f'{_R32_STATE_PREFIX}:mega_archived'
+def _r32_migration_key(): return f'{_R32_STATE_PREFIX}:migration_seeded'
+
+def _r32_state_schema(conn):
+    conn.execute('CREATE TABLE IF NOT EXISTS r32_state_revisions (shard_key TEXT PRIMARY KEY, revision INTEGER NOT NULL, event_id TEXT NOT NULL, updated_at REAL NOT NULL)')
+
+def _r32_event_valid(ev):
+    if not isinstance(ev,dict) or int(ev.get('schema') or 0) != 32: return False
+    if not str(ev.get('event_id') or '') or int(ev.get('revision') or 0) <= 0: return False
+    return str(ev.get('kind') or '') in {'set_kv','save_chat','prune_chats','delete_chat','set_meta','set_cold','set_cold_many','delete_cold'}
+
+def _r32_redis_store_events(events):
+    client=_redis_client()
+    if client is None: return False,'REDIS_URL not configured',[]
+    ttl=env_int('WORKER_R32_EVENT_RETENTION_SEC',2592000,604800,7776000)
+    new_ids=[]
+    try:
+        # First phase: SET NX lets retries be idempotent.
+        pipe=client.pipeline(transaction=False)
+        packed=[]
+        for ev in events:
+            eid=str(ev.get('event_id') or '')
+            raw=json.dumps(ev,ensure_ascii=False,separators=(',',':'),default=str)
+            packed.append((eid,raw,float(ev.get('created_at') or time.time())))
+            pipe.set(_r32_event_key(eid),raw,nx=True,ex=ttl)
+        results=pipe.execute()
+        pipe=client.pipeline(transaction=True)
+        for (eid,raw,score),created in zip(packed,results):
+            if created:
+                new_ids.append(eid)
+                pipe.zadd(_r32_index_key(),{eid:score})
+                pipe.rpush(_r32_pending_key(),eid)
+            else:
+                pipe.expire(_r32_event_key(eid),ttl)
+        # Index/pending metadata live longer than event rows but are compact.
+        pipe.expire(_r32_index_key(),ttl)
+        pipe.expire(_r32_pending_key(),ttl)
+        pipe.execute()
+        return True,f'Redis state events stored new={len(new_ids)} total={len(events)}',new_ids
+    except Exception as exc:
+        return False,f'{type(exc).__name__}: {str(exc)[:220]}',[]
+
+def _r32_apply_event_tx(conn,ev):
+    kind=str(ev.get('kind') or ''); key=str(ev.get('key') or '')[:220]
+    rev=int(ev.get('revision') or 0); eid=str(ev.get('event_id') or '')
+    payload=ev.get('payload') if isinstance(ev.get('payload'),dict) else {}
+    row=conn.execute('SELECT revision FROM r32_state_revisions WHERE shard_key=?',(key,)).fetchone()
+    if row and int(row[0] or 0) >= rev:
+        return 'stale'
+    if kind=='set_kv':
+        k=str(payload.get('k') or '')
+        conn.execute('INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v',(k,json.dumps(payload.get('v'),ensure_ascii=False,separators=(',',':'),default=str)))
+    elif kind=='save_chat':
+        cid=str(payload.get('chat_id') or '')
+        conn.execute('INSERT INTO chats(chat_id,v) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET v=excluded.v',(cid,json.dumps(payload.get('v') or {},ensure_ascii=False,separators=(',',':'),default=str)))
+    elif kind=='prune_chats':
+        keep={str(x) for x in (payload.get('keep') or [])}
+        rows=conn.execute('SELECT chat_id FROM chats').fetchall()
+        for r in rows:
+            if str(r[0]) not in keep: conn.execute('DELETE FROM chats WHERE chat_id=?',(str(r[0]),))
+    elif kind=='delete_chat':
+        cid=str(payload.get('chat_id') or ''); conn.execute('DELETE FROM chats WHERE chat_id=?',(cid,)); conn.execute('DELETE FROM cold_fields WHERE chat_id=?',(cid,))
+    elif kind=='set_meta':
+        mk=str(payload.get('kind') or ''); kk=str(payload.get('k') or '')
+        conn.execute('INSERT INTO meta(kind,k,v) VALUES(?,?,?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v',(mk,kk,json.dumps(payload.get('v'),ensure_ascii=False,separators=(',',':'),default=str)))
+    elif kind=='set_cold':
+        cid=str(payload.get('chat_id') or ''); kk=str(payload.get('k') or ''); stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
+        conn.execute('INSERT INTO cold_fields(chat_id,k,v,updated_at) VALUES(?,?,?,?) ON CONFLICT(chat_id,k) DO UPDATE SET v=excluded.v,updated_at=excluded.updated_at',(cid,kk,json.dumps(payload.get('v'),ensure_ascii=False,separators=(',',':'),default=str),stamp))
+    elif kind=='set_cold_many':
+        cid=str(payload.get('chat_id') or ''); stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
+        for kk,vv in (payload.get('items') or {}).items():
+            conn.execute('INSERT INTO cold_fields(chat_id,k,v,updated_at) VALUES(?,?,?,?) ON CONFLICT(chat_id,k) DO UPDATE SET v=excluded.v,updated_at=excluded.updated_at',(cid,str(kk),json.dumps(vv,ensure_ascii=False,separators=(',',':'),default=str),stamp))
+    elif kind=='delete_cold':
+        conn.execute('DELETE FROM cold_fields WHERE chat_id=? AND k=?',(str(payload.get('chat_id') or ''),str(payload.get('k') or '')))
+    else:
+        return 'invalid'
+    conn.execute('INSERT INTO r32_state_revisions(shard_key,revision,event_id,updated_at) VALUES(?,?,?,?) ON CONFLICT(shard_key) DO UPDATE SET revision=excluded.revision,event_id=excluded.event_id,updated_at=excluded.updated_at',(key,rev,eid,time.time()))
+    return 'applied'
+
+def _r32_apply_events(events):
+    if not events: return True,'no events',0,0
+    with _R32_STATE_REPLAY_LOCK, DELTA_APPLY_LOCK:
+        ok,detail,_meta=_ensure_cache_db_v267()
+        if not ok: return False,detail,0,0
+        applied=stale=0
+        conn=sqlite3.connect(str(CACHE_DB),timeout=20)
+        try:
+            conn.execute('PRAGMA journal_mode=WAL'); conn.execute('PRAGMA synchronous=FULL')
+            # Baseline R31 already has these tables; keep this defensive for disaster rebuilds.
+            conn.execute('CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)')
+            conn.execute('CREATE TABLE IF NOT EXISTS chats (chat_id TEXT PRIMARY KEY, v TEXT NOT NULL)')
+            conn.execute('CREATE TABLE IF NOT EXISTS meta (kind TEXT NOT NULL, k TEXT NOT NULL, v TEXT NOT NULL, PRIMARY KEY(kind,k))')
+            conn.execute("CREATE TABLE IF NOT EXISTS cold_fields (chat_id TEXT NOT NULL, k TEXT NOT NULL, v TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(chat_id,k))")
+            _r32_state_schema(conn)
+            conn.execute('BEGIN IMMEDIATE')
+            for ev in sorted(events,key=lambda x:int(x.get('revision') or 0)):
+                status=_r32_apply_event_tx(conn,ev)
+                if status=='applied': applied+=1
+                elif status=='stale': stale+=1
+            conn.commit()
+            try: conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            except Exception: pass
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
+            raise
+        finally: conn.close()
+        with STATE_LOCK:
+            STATE['r32_state_events_applied']=int(STATE.get('r32_state_events_applied') or 0)+applied
+            STATE['r32_state_events_stale']=int(STATE.get('r32_state_events_stale') or 0)+stale
+            STATE['r32_state_last_at']=time.time(); STATE['r32_state_last_error']=''; STATE['r32_baseline_ready']=True
+            STATE['delta_since_checkpoint']=int(STATE.get('delta_since_checkpoint') or 0)+applied
+            STATE['delta_bytes_since_checkpoint']=int(STATE.get('delta_bytes_since_checkpoint') or 0)+sum(len(json.dumps(x,ensure_ascii=False,default=str)) for x in events)
+            try: STATE['last_state_sha256']=_sha256_file_v267(CACHE_DB)
+            except Exception: pass
+        return True,f'applied={applied} stale={stale}',applied,stale
+
+def _r32_replay_state_events_from_redis(limit=50000):
+    client=_redis_client()
+    if client is None: return False,'REDIS_URL not configured'
+    try:
+        ids=client.zrange(_r32_index_key(),-max(1,int(limit)),-1) or []
+        if not ids: return True,'no R32 Redis events'
+        events=[]
+        pipe=client.pipeline(transaction=False)
+        for eid in ids:
+            eid=eid.decode() if isinstance(eid,(bytes,bytearray)) else str(eid); pipe.get(_r32_event_key(eid))
+        raws=pipe.execute()
+        for raw in raws:
+            if not raw: continue
+            try:
+                if isinstance(raw,(bytes,bytearray)): raw=raw.decode('utf-8')
+                ev=json.loads(raw)
+                if _r32_event_valid(ev): events.append(ev)
+            except Exception: pass
+        ok,detail,applied,stale=_r32_apply_events(events)
+        return ok,f'{detail}; replay_rows={len(events)}'
+    except Exception as exc:
+        return False,f'{type(exc).__name__}: {str(exc)[:220]}'
+
+def _r32_events_mega_dir(): return mega_root().rstrip('/') + '/events_r32'
+
+
+def _r32_mega_event_rows(limit=2000):
+    root=_r32_events_mega_dir()
+    try:
+        with MEGA_LOCK:
+            ok,detail=prepare_mega_layout()
+            if not ok: return []
+            if not ensure_mega_dir(root): return []
+            res=run_cmd(['mega-find',root,'--pattern=events_*.json.gz','--type=f'],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+            if res.returncode!=0: return []
+            rows=sorted({x.strip() for x in (res.stdout or '').splitlines() if x.strip().endswith('.json.gz')})
+            return rows[-max(1,int(limit)):]
+    except Exception:
+        return []
+
+def _r32_replay_state_events_from_mega(limit_segments=1500):
+    """Disaster path: rebuild post-checkpoint changes from immutable MEGA pieces.
+
+    Normal deploys replay Redis events and do not pay this network cost.  This path is
+    only needed when Redis/current worker cache is unavailable or explicitly deep-recovered.
+    """
+    rows=_r32_mega_event_rows(limit_segments)
+    if not rows: return True,'no R32 MEGA event segments'
+    events=[]; downloaded=0
+    work=Path(tempfile.mkdtemp(prefix='r32_mega_replay_'))
+    try:
+        with MEGA_LOCK:
+            for remote in rows:
+                dl=work/secrets.token_hex(4); dl.mkdir(parents=True,exist_ok=True)
+                get=run_cmd(['mega-get',remote,str(dl)],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+                if get.returncode!=0: continue
+                files=list(dl.rglob('events_*.json.gz')) or list(dl.rglob('*.json.gz'))
+                if not files: continue
+                try:
+                    obj=json.loads(gzip.decompress(files[0].read_bytes()).decode('utf-8'))
+                    chunk=(obj or {}).get('events') or []
+                    for ev in chunk:
+                        if _r32_event_valid(ev): events.append(ev)
+                    downloaded+=1
+                except Exception: pass
+        if not events: return False,f'MEGA segments downloaded={downloaded} but no valid events'
+        ok,detail,applied,stale=_r32_apply_events(events)
+        return ok,f'{detail}; mega_segments={downloaded}; mega_events={len(events)}'
+    finally:
+        shutil.rmtree(work,ignore_errors=True)
+
+def _r32_upload_pending_segment():
+    client=_redis_client()
+    if client is None: return False,'Redis unavailable'
+    ids=client.lrange(_r32_pending_key(),0,max(0,env_int('WORKER_R32_MEGA_SEGMENT_EVENTS',128,8,1000)-1)) or []
+    ids=[x.decode() if isinstance(x,(bytes,bytearray)) else str(x) for x in ids]
+    if not ids: return True,'no pending R32 events'
+    raws=client.mget([_r32_event_key(x) for x in ids]) or []
+    events=[]; valid_ids=[]
+    for eid,raw in zip(ids,raws):
+        if not raw: continue
+        try:
+            if isinstance(raw,(bytes,bytearray)): raw=raw.decode('utf-8')
+            ev=json.loads(raw)
+            if _r32_event_valid(ev): events.append(ev); valid_ids.append(eid)
+        except Exception: pass
+    if not events:
+        client.ltrim(_r32_pending_key(),len(ids),-1)
+        return True,'dropped missing pending rows'
+    packed=gzip.compress(json.dumps({'schema':32,'created_at':time.time(),'events':events},ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
+    stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+    day=datetime.now(timezone.utc).strftime('%Y%m%d')
+    work=Path(tempfile.mkdtemp(prefix='r32_events_')); local=work/f'events_{stamp}_{valid_ids[0][-8:]}_{valid_ids[-1][-8:]}.json.gz'; local.write_bytes(packed)
+    try:
+        with MEGA_LOCK:
+            ok,detail=prepare_mega_layout()
+            if not ok: return False,detail
+            root=_r32_events_mega_dir()
+            if not ensure_mega_dir(root): return False,'cannot create events_r32'
+            remote_day=root.rstrip('/')+'/'+day
+            if not ensure_mega_dir(remote_day): return False,'cannot create events day dir'
+            put=run_cmd(['mega-put',str(local),remote_day],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+            if put.returncode!=0: return False,'mega-put R32 events failed: '+(put.stderr or put.stdout or '')[:180]
+        pipe=client.pipeline(transaction=True)
+        pipe.ltrim(_r32_pending_key(),len(ids),-1)
+        if valid_ids: pipe.sadd(_r32_archived_key(),*valid_ids)
+        pipe.execute()
+        with STATE_LOCK:
+            STATE['r32_mega_segments']=int(STATE.get('r32_mega_segments') or 0)+1; STATE['r32_mega_last_ok']=time.time(); STATE['r32_mega_last_error']=''
+        return True,f'uploaded events={len(events)} bytes={len(packed)}'
+    finally:
+        shutil.rmtree(work,ignore_errors=True)
+
+def _r32_mega_event_loop():
+    while True:
+        _R32_MEGA_WAKE.wait(timeout=max(5,env_int('WORKER_R32_MEGA_FLUSH_SEC',30,5,600)))
+        _R32_MEGA_WAKE.clear()
+        try:
+            for _ in range(8):
+                ok,detail=_r32_upload_pending_segment()
+                if not ok:
+                    with STATE_LOCK: STATE['r32_mega_last_error']=str(detail)[:220]
+                    break
+                if 'no pending' in detail: break
+        except Exception as exc:
+            with STATE_LOCK: STATE['r32_mega_last_error']=f'{type(exc).__name__}: {str(exc)[:220]}'
+
+@app.route('/internal/state/events',methods=['POST'])
+def internal_r32_state_events():
+    if not authorized(): return {'ok':False},404
+    wire=request.get_data(cache=False,as_text=False) or b''
+    max_wire=env_int('WORKER_R32_EVENT_MAX_WIRE_KB',1024,32,8192)*1024
+    if not wire or len(wire)>max_wire: return {'ok':False,'error':'R32 event batch size invalid'},413
+    try:
+        raw=gzip.decompress(wire) if str(request.headers.get('Content-Encoding') or '').lower()=='gzip' else wire
+        body=json.loads(raw.decode('utf-8')); events=body.get('events') if isinstance(body,dict) else None
+        if not isinstance(events,list) or not events or len(events)>512: raise ValueError('events invalid')
+        events=[x for x in events if _r32_event_valid(x)]
+        if not events: raise ValueError('no valid events')
+    except Exception as exc:
+        return {'ok':False,'error':f'R32 event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
+    rok,rdetail,new_ids=_r32_redis_store_events(events)
+    if not rok:
+        with STATE_LOCK: STATE['r32_state_last_error']=str(rdetail)[:220]
+        return {'ok':False,'error':'R32 Redis durability failed: '+str(rdetail)[:180]},503
+    try:
+        ok,detail,applied,stale=_r32_apply_events(events)
+    except Exception as exc:
+        ok=False; detail=f'{type(exc).__name__}: {str(exc)[:220]}'; applied=stale=0
+    if not ok:
+        with STATE_LOCK: STATE['r32_state_last_error']=str(detail)[:220]
+        # Events are already durable in Redis; a retry/replay can apply them later.
+        return {'ok':False,'durable':True,'error':'R32 cache apply failed: '+str(detail)[:180]},503
+    with STATE_LOCK:
+        STATE['r32_state_events_received']=int(STATE.get('r32_state_events_received') or 0)+len(events)
+        STATE['r32_state_event_bytes']=int(STATE.get('r32_state_event_bytes') or 0)+len(wire)
+    if new_ids: _R32_MEGA_WAKE.set()
+    return {'ok':True,'durable':'redis','events':len(events),'new':len(new_ids),'applied':applied,'stale':stale},200
+
+@app.route('/internal/r32/status',methods=['GET'])
+def internal_r32_status():
+    if not authorized(): return {'ok':False},404
+    client=_redis_client(); pending=0; total=0
+    try:
+        if client is not None:
+            pending=int(client.llen(_r32_pending_key()) or 0); total=int(client.zcard(_r32_index_key()) or 0)
+    except Exception: pass
+    with STATE_LOCK: st={k:v for k,v in STATE.items() if str(k).startswith('r32_')}
+    return {'ok':True,'event_stream':True,'redis_events':total,'mega_pending':pending,'state':st},200
 
 
 @app.route('/', methods=['GET','HEAD'])
@@ -1845,6 +2165,15 @@ def internal_capsule_latest_r20():
 @app.route('/internal/restore/latest', methods=['GET'])
 def internal_restore_latest():
     if not authorized(): return {'ok':False},404
+    # R32: assemble the newest restore image from the latest checkpoint + immutable events.
+    try:
+        _r32_replay_state_events_from_redis()
+        with DELTA_APPLY_LOCK:
+            _ok32,_detail32,_meta32=_ensure_cache_db_v267()
+            if _ok32:
+                _gzip_cache_db_v267()
+    except Exception as _r32_restore_exc:
+        with STATE_LOCK: STATE['r32_state_last_error']=f'restore assemble: {type(_r32_restore_exc).__name__}: {str(_r32_restore_exc)[:180]}'
     cache_max_age=env_int('WORKER_RESTORE_CACHE_MAX_AGE_SEC',120,0,3600)
     if not CACHE_LATEST.exists():
         redis_ok, redis_detail = redis_load_snapshot_to_cache()
@@ -2117,6 +2446,7 @@ threading.Thread(target=file_loop,name='vys262-worker-files-r7',daemon=True).sta
 threading.Thread(target=_capsule_mega_loop_r20,name='vys262-worker-capsule-mega-r20',daemon=True).start()
 
 threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
+threading.Thread(target=_r32_mega_event_loop,name='per-r32-mega-events',daemon=True).start()
 
 threading.Thread(target=worker_loop,name='vys262-worker-jobs',daemon=True).start()
 threading.Thread(target=google_loop,name='vys262-worker-google',daemon=True).start()
@@ -2127,6 +2457,8 @@ try:
     if _r6_redis_ok:
         _r12_replay_ok, _r12_replay_detail = redis_replay_deltas_v267()
         print(f'[R12 DELTA REPLAY] ok={_r12_replay_ok} {_r12_replay_detail}', flush=True)
+        _r32_replay_ok, _r32_replay_detail = _r32_replay_state_events_from_redis()
+        print(f'[R32 EVENT REPLAY] ok={_r32_replay_ok} {_r32_replay_detail}', flush=True)
 except Exception as _r6_exc:
     print(f'[R6 RESTORE CACHE] redis error={type(_r6_exc).__name__}: {str(_r6_exc)[:180]}', flush=True)
 threading.Thread(target=_restore_refresh_background,name='vys262-worker-mega-warmup',daemon=True).start()
