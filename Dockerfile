@@ -12,7 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY worker_service.py runtime_config.py FRONT_SOURCE_PER_R45_SIMPLE.py ./
 
 # One process owns all durable queues; worker_service.py serves HTTP with Waitress threads
 # while heavy jobs run in background threads.
