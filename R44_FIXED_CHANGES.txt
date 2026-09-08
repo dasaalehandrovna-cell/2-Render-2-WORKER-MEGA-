@@ -1,0 +1,6 @@
+HEAVY R44 FIXED
+- Keeps R44 CLEAN route-order and file pull fixes.
+- /internal/export/status/<job_id> and /internal/r44/selfcheck register before HTTP server start.
+- Docker now packages the current validated FAST R44 FIXED merged source.
+- Bot-source export returns current Пер-R44_FIXED.py instead of stale R43 source.
+- worker_service.py has no duplicate top-level function/class names.

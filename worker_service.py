@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R40.
+"""vys-262 Render #2 heavy worker · Пер-R44-clean.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -43,7 +43,7 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-per-r40-heavy'
+VERSION = 'vys-262-worker-per-r44-clean-heavy'
 TRANSPORT_VERSION = 'vys-262-worker-per-r38-events'
 
 
@@ -1800,7 +1800,7 @@ def process_google_job(job):
         print(f'[GOOGLE JOB] {jid} ok=False callback={delivered} {detail}', flush=True)
 
 
-def google_loop():
+def google_loop_legacy_r7():
     while True:
         job = GOOGLE_Q.get()
         try:
@@ -2236,7 +2236,7 @@ except Exception:
     pass
 
 
-def _file_status_put(job_id, **values):
+def _file_status_put_local(job_id, **values):
     now = time.time()
     with FILE_JOB_LOCK:
         for key, row in list(FILE_JOB_STATUS.items()):
@@ -2418,7 +2418,7 @@ def process_file_job(job):
         print(f'[EXPORT JOB] {jid} ok=False {detail}',flush=True)
 
 
-def file_loop():
+def file_loop_legacy_r7():
     while True:
         job=FILE_Q.get()
         try: process_file_job(job)
@@ -2473,7 +2473,7 @@ def internal_export_download_r7(job_id):
 # ---------------------------------------------------------------------------
 # R35 HEAVY-only export/document layer + Redis-optional state durability.
 # All expensive selection/serialization/compression/MEGA/Google work happens here.
-R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R42.py'
+R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R44_FIXED.py'
 STATE.update({'r33_heavy_exports':0,'r33_heavy_export_failures':0,'r33_direct_mega_events':0,
               'r33_direct_mega_event_bytes':0,'r33_last_event_durability':'','r33_last_export':''})
 
@@ -2982,7 +2982,7 @@ def _r33_runtime_zip(body,jid):
 
 def _r33_bot_source(body,jid):
     if not R35_FRONT_SOURCE.is_file(): raise RuntimeError('R36 front source asset missing on HEAVY')
-    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R35_FRONT_SOURCE,path); return path,'Пер-R40.py'
+    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R35_FRONT_SOURCE,path); return path,'Пер-R44_FIXED.py'
 
 
 def _r34_current_applied_revision(refresh=False):
@@ -3158,7 +3158,7 @@ _R35_JOB_PENDING_KEY='per:r35:heavy:filejobs:pending'
 _R35_JOB_PREFIX='per:r35:heavy:filejob:'
 _R35_ENQUEUED=set(); _R35_ENQUEUED_LOCK=threading.RLock()
 _R35_RESULT_Q=queue.Queue(maxsize=64); _R35_RESULT_ENQUEUED=set(); _R35_RESULT_LOCK=threading.RLock()
-_R35_BASE_FILE_STATUS_PUT=_file_status_put
+_R35_BASE_FILE_STATUS_PUT=_file_status_put_local
 
 # R36 local + MEGA fallback spool. Redis remains preferred, but a missing REDIS_URL
 # must never downgrade an accepted HEAVY export to RAM-only durability.
@@ -3903,7 +3903,7 @@ def _r39_file_signature(body):
     return hashlib.sha256(raw.encode('utf-8','replace')).hexdigest()
 
 
-def _r39_close_duplicate_job(jid, canonical_jid):
+def _r39_close_duplicate_job_legacy(jid, canonical_jid):
     try:
         rec=_r35_job_get(jid); backend=str(rec.get('durable_backend') or '')
         rec.update({'status':'closed','ok':True,'duplicate_of':str(canonical_jid),'closed_at':time.time()})
@@ -4395,6 +4395,81 @@ try:
 except Exception:
     pass
 
+# v262
+
+# ---------------- Пер-R43 file bridge self-check/status ----------------
+# Stable read-only status endpoint used by FAST as a pull fallback when the
+# HEAVY->FAST result callback is delayed/lost.  This intentionally sits at the
+# very end so it observes the final R42 durable job/file ledgers.
+@app.route('/internal/export/status/<job_id>', methods=['GET'])
+def internal_export_status_r43(job_id):
+    if not authorized():
+        return {'ok':False},404
+    jid=str(job_id or '').strip()[:80]
+    if not jid:
+        return {'ok':False,'error':'job_id required'},400
+    with FILE_JOB_LOCK:
+        fs=dict(FILE_JOB_STATUS.get(jid) or {})
+    rec=_r35_job_get(jid) or {}
+    row=dict(fs)
+    # Durable ledger wins for semantic state; FILE_JOB_STATUS wins for local path.
+    for key in ('status','ok','filename','url','delivery','error','callback_delivered','canonical_job_id','duplicate_of','durable_backend','recipient_chat_id','target_chat_id'):
+        if key in rec and rec.get(key) not in (None,''):
+            row[key]=rec.get(key)
+    job=rec.get('job') if isinstance(rec.get('job'),dict) else {}
+    body=job.get('payload') if isinstance(job.get('payload'),dict) else {}
+    for key in ('operation','label','chat_name','caption','file_type','recipient_chat_id','target_chat_id'):
+        if key not in row or row.get(key) in (None,''):
+            row[key]=body.get(key)
+    canonical=str(row.get('canonical_job_id') or row.get('duplicate_of') or '')[:80]
+    if canonical and canonical != jid:
+        return {'ok':True,'job_id':jid,'status':'alias','canonical_job_id':canonical,'duplicate_of':canonical,'ready':False},200
+    status=str(row.get('status') or '')
+    path=Path(str(fs.get('path') or rec.get('path') or ''))
+    ready=bool(row.get('ok') is True and status in {'ready','delivering','done','delivered'} and path.is_file())
+    terminal_error=bool(row.get('ok') is False and status in {'failed','closed','done'})
+    payload={
+        'ok':True,'job_id':jid,'status':status or 'unknown','operation_ok':row.get('ok'),
+        'ready':ready,'terminal_error':terminal_error,'filename':str(row.get('filename') or body.get('filename') or ''),
+        'url':str(row.get('url') or ''),'delivery':str(row.get('delivery') or body.get('delivery') or 'chat'),
+        'error':str(row.get('error') or '')[:900],'callback_delivered':bool(row.get('callback_delivered')),
+        'operation':str(row.get('operation') or ''),'label':str(row.get('label') or ''),'chat_name':str(row.get('chat_name') or ''),
+        'caption':str(row.get('caption') or '')[:1000],'recipient_chat_id':row.get('recipient_chat_id'),'target_chat_id':row.get('target_chat_id'),
+        'durable_backend':str(row.get('durable_backend') or ''),
+    }
+    return payload,200
+
+try:
+    print('[R43 FILE BRIDGE] pull-status fallback enabled at /internal/export/status/<job_id>', flush=True)
+except Exception:
+    pass
+
+@app.route('/internal/r44/selfcheck', methods=['GET'])
+def internal_r44_selfcheck():
+    if not authorized():
+        return {'ok':False},404
+    front_asset=R35_FRONT_SOURCE
+    routes={rule.rule for rule in app.url_map.iter_rules()}
+    required={'/internal/export/file','/internal/export/file/<job_id>','/internal/export/status/<job_id>','/internal/status'}
+    missing=sorted(required-routes)
+    return {
+        'ok': not missing and front_asset.is_file(),
+        'version': VERSION,
+        'front_source': front_asset.name,
+        'front_source_exists': front_asset.is_file(),
+        'required_routes_ok': not missing,
+        'missing_routes': missing,
+        'file_queue_size': FILE_Q.qsize(),
+        'result_queue_size': _R35_RESULT_Q.qsize(),
+        'google_queue_size': GOOGLE_Q.qsize(),
+        'duplicate_cleanup': 'r44-clean',
+    },200
+
+try:
+    print('[R44 CLEAN] routes registered before HTTP start; FAST R43 pull bridge active; front source asset checked by /internal/r44/selfcheck', flush=True)
+except Exception:
+    pass
+
 if __name__ == '__main__':
     port=env_int('PORT',10000,1,65535)
     try:
@@ -4411,4 +4486,3 @@ if __name__ == '__main__':
         except Exception as exc2:
             print(f'[R41 HTTP EMERGENCY] {type(exc2).__name__}: {str(exc2)[:220]}',flush=True)
             app.run(host='0.0.0.0',port=port,threaded=True)
-# v262

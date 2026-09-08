@@ -1,0 +1,28 @@
+HEAVY R44-clean
+
+Совместимость: FAST R43.
+
+Исправлено:
+1. /internal/export/status/<job_id> теперь регистрируется ДО запуска Waitress/Werkzeug.
+   В R43 endpoint находился после serve_forever и при обычном запуске не активировался.
+2. Dockerfile теперь копирует FRONT_SOURCE_PER_R43.py.
+   В R43 Dockerfile копировал FRONT_SOURCE_PER_R42.py, хотя worker_service.py искал R43.
+3. Убраны одинаковые top-level имена функций:
+   - старый google_loop -> google_loop_legacy_r7
+   - старый file_loop -> file_loop_legacy_r7
+   - базовый локальный _file_status_put -> _file_status_put_local
+   - старый _r39_close_duplicate_job -> _r39_close_duplicate_job_legacy
+   Финальные рабочие функции больше не зависят от случайного последнего переопределения имени.
+4. Удалены ненужные __pycache__ и FRONT_SOURCE_PER_R42.py из HEAVY-пакета.
+5. Добавлен GET /internal/r44/selfcheck для проверки:
+   - наличия FRONT_SOURCE_PER_R43.py;
+   - обязательных export/status/download маршрутов;
+   - размеров очередей.
+6. VERSION обновлён на vys-262-worker-per-r44-clean-heavy.
+
+Не менялось:
+- формат запросов FAST R43 -> HEAVY;
+- Redis/MEGA durability;
+- Google jobs;
+- бизнес-логика экспорта;
+- callback + pull fallback R43.
