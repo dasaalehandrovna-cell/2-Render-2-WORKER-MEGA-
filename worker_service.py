@@ -2473,7 +2473,7 @@ def internal_export_download_r7(job_id):
 # ---------------------------------------------------------------------------
 # R35 HEAVY-only export/document layer + Redis-optional state durability.
 # All expensive selection/serialization/compression/MEGA/Google work happens here.
-R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R41.py'
+R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R42.py'
 STATE.update({'r33_heavy_exports':0,'r33_heavy_export_failures':0,'r33_direct_mega_events':0,
               'r33_direct_mega_event_bytes':0,'r33_last_event_durability':'','r33_last_export':''})
 
@@ -3448,17 +3448,59 @@ def _r35_result_loop():
             with _R35_RESULT_LOCK: _R35_RESULT_ENQUEUED.discard(jid)
             _R35_RESULT_Q.task_done()
 
+def _r42_release_of_record(rec):
+    try:
+        job=(rec or {}).get('job') if isinstance((rec or {}).get('job'),dict) else {}
+        body=(job or {}).get('payload') if isinstance((job or {}).get('payload'),dict) else {}
+        return str(body.get('front_release') or '')
+    except Exception:
+        return ''
+
+
+def _r42_is_front_owned(rec):
+    return bool((rec or {}).get('front_owned') or str((rec or {}).get('durable_backend') or '')=='front-redis')
+
+
+def _r42_legacy_record(rec):
+    rel=_r42_release_of_record(rec)
+    if not rel:
+        return False
+    # Jobs from previous split releases must never be auto-resurrected after an R42
+    # deploy. FAST owns the current durable outbox and will re-admit any still-live job.
+    return rel != 'Пер-R42'
+
+
 def _r35_recover_loop():
-    # R36: recovery is driven by every durable witness we have. Redis is preferred;
-    # local SQLite covers process restarts and MEGA covers Render container replacement
-    # when REDIS_URL is absent. MEGA is scanned at a deliberately low cadence.
+    """R42 recovery policy.
+
+    FAST Redis outbox is authoritative for front-owned jobs.  HEAVY therefore never
+    auto-runs a stale front-owned local record after a process restart; FAST replays the
+    same job_id.  Legacy R39-R41 MEGA/local rows are ignored so an old full_state/Excel
+    cannot come back to life and trigger an OOM loop after every restart.
+
+    HEAVY-owned R42 jobs (used only when FAST cannot prove durable Redis ownership)
+    retain local/Redis/MEGA recovery.
+    """
     last_mega_scan=0.0
+    # Let FAST reconnect/replay first.  This also prevents a startup stampede.
+    time.sleep(max(2.0,min(20.0,float(os.getenv('R42_RECOVERY_START_DELAY_SEC','6') or '6'))))
     while True:
         try:
             records={}
             for rec in _r36_local_pending(250):
                 jid=str(rec.get('job_id') or (rec.get('job') or {}).get('id') or '')
-                if jid: records[jid]=rec
+                if not jid:
+                    continue
+                if _r42_legacy_record(rec):
+                    # Close only the local witness; never spend startup time deleting MEGA.
+                    old=dict(rec); old.update({'status':'closed','ok':False,'error':'R42 superseded stale job from '+(_r42_release_of_record(rec) or 'legacy'),'updated_at':time.time()})
+                    _r36_local_job_put(jid,old)
+                    continue
+                if _r42_is_front_owned(rec):
+                    # Current front-owned work is replayed by FAST Redis outbox using the
+                    # same job_id.  Do not self-requeue here or it can run twice.
+                    continue
+                records[jid]=rec
             c=_redis_client(); redis_live=False
             if c is not None:
                 try:
@@ -3466,34 +3508,45 @@ def _r35_recover_loop():
                     redis_live=True
                     for jid in ids:
                         rec=_r35_job_get(jid)
-                        if rec and float(rec.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0): records[jid]=rec
+                        if not rec or _r42_legacy_record(rec) or _r42_is_front_owned(rec):
+                            continue
+                        if float(rec.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0):
+                            records[jid]=rec
                 except Exception:
                     redis_live=False
-            if (not redis_live) and time.time()-last_mega_scan>=max(20,env_int('R36_MEGA_RECOVERY_SCAN_SEC',45,20,600)):
+            # MEGA recovery remains only for HEAVY-owned jobs created by THIS release.
+            # Old r36/r39/r40/r41 remote rows are deliberately ignored.
+            if (not redis_live) and time.time()-last_mega_scan>=max(45,env_int('R42_MEGA_RECOVERY_SCAN_SEC',120,45,900)):
                 last_mega_scan=time.time()
-                for rec in _r36_mega_pending_rows(150):
+                for rec in _r36_mega_pending_rows(80):
+                    if _r42_release_of_record(rec) != 'Пер-R42':
+                        continue
+                    if _r42_is_front_owned(rec):
+                        continue
                     jid=str(rec.get('job_id') or (rec.get('job') or {}).get('id') or '')
-                    if not jid: continue
-                    if float(rec.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0): records[jid]=rec
+                    if not jid:
+                        continue
+                    if float(rec.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0):
+                        records[jid]=rec
                     _r36_local_job_put(jid,rec)
             for jid,rec0 in list(records.items()):
                 rec=_r35_job_get(jid) or rec0
                 status=str(rec.get('status') or 'queued'); backend=str(rec.get('durable_backend') or '')
                 job=rec.get('job') if isinstance(rec.get('job'),dict) else None
-                # An admission that never gained a durable backend was never accepted.
-                if not backend and status in {'admitting','admission_failed'}: continue
-                if not job: continue
+                if not backend and status in {'admitting','admission_failed'}:
+                    continue
+                if not job:
+                    continue
                 if status in {'ready','delivering'} and bool(rec.get('ok')) and Path(str(rec.get('path') or '')).is_file():
                     _r35_enqueue_result({'job':job,'ok':True,'extra':{'url':rec.get('url') or '','filename':rec.get('filename') or ''}})
                 elif status=='failed' and rec.get('error'):
                     _r35_enqueue_result({'job':job,'ok':False,'extra':{'error':rec.get('error')}})
                 elif status not in {'delivered','closed'}:
-                    # After a container replacement the generated local file is gone;
-                    # regenerate it from the durable original payload using the same job_id.
                     _r35_enqueue_file(job)
         except Exception as exc:
-            with STATE_LOCK: STATE['file_last_error']=f'R36 recovery {type(exc).__name__}: {str(exc)[:180]}'
-        time.sleep(2.0)
+            with STATE_LOCK:
+                STATE['file_last_error']=f'R42 recovery {type(exc).__name__}: {str(exc)[:180]}'
+        time.sleep(3.0)
 
 # ---------------------------------------------------------------------------
 # R38: production-grade HEAVY admission/recovery for Google jobs and resilient
@@ -3781,22 +3834,37 @@ def google_loop():
 
 
 def _r38_google_recover_loop():
+    """R42 Google recovery follows the same ownership rule as file jobs."""
     last_mega=0.0
+    time.sleep(max(2.0,min(20.0,float(os.getenv('R42_RECOVERY_START_DELAY_SEC','6') or '6'))))
     while True:
         try:
-            records={str(x.get('job_id')):x for x in _r38_google_local_pending(250) if str(x.get('job_id') or '')};c=_redis_client();redis_live=False
+            records={}
+            for x in _r38_google_local_pending(250):
+                jid=str(x.get('job_id') or '')
+                if not jid: continue
+                if _r42_legacy_record(x):
+                    old=dict(x); old.update({'status':'closed','ok':False,'error':'R42 superseded stale Google job from '+(_r42_release_of_record(x) or 'legacy'),'updated_at':time.time()})
+                    _r38_google_local_put(jid,old); continue
+                if _r42_is_front_owned(x):
+                    continue
+                records[jid]=x
+            c=_redis_client();redis_live=False
             if c is not None:
                 try:
                     ids=list(c.smembers(_R38_GOOGLE_PENDING_KEY) or [])[:250];redis_live=True
                     for raw in ids:
                         jid=raw.decode() if isinstance(raw,(bytes,bytearray)) else str(raw);obj=_r38_google_get(jid)
-                        if obj and float(obj.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0):records[jid]=obj
+                        if not obj or _r42_legacy_record(obj) or _r42_is_front_owned(obj): continue
+                        if float(obj.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0):records[jid]=obj
                 except Exception:redis_live=False
-            if (not redis_live) and time.time()-last_mega>=max(20,env_int('R38_GOOGLE_MEGA_SCAN_SEC',45,20,600)):
+            if (not redis_live) and time.time()-last_mega>=max(45,env_int('R42_GOOGLE_MEGA_SCAN_SEC',120,45,900)):
                 last_mega=time.time()
-                for obj in _r38_google_mega_pending(150):
+                for obj in _r38_google_mega_pending(80):
+                    if _r42_release_of_record(obj) != 'Пер-R42' or _r42_is_front_owned(obj): continue
                     jid=str(obj.get('job_id') or '')
-                    if jid and float(obj.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0):records[jid]=obj;_r38_google_local_put(jid,obj)
+                    if jid and float(obj.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0):
+                        records[jid]=obj;_r38_google_local_put(jid,obj)
             for jid,base_rec in list(records.items()):
                 rec=_r38_google_get(jid) or base_rec;status=str(rec.get('status') or 'queued');job=rec.get('job') if isinstance(rec.get('job'),dict) else None
                 if not job:continue
@@ -3810,8 +3878,8 @@ def _r38_google_recover_loop():
                         if str(rec.get('durable_backend') or '')=='mega':_r38_google_mega_delete(jid)
                 elif status not in {'delivered','closed','admission_failed'}:_r38_google_enqueue(job)
         except Exception as exc:
-            with STATE_LOCK:STATE['google_last_error']=f'R38 recovery {type(exc).__name__}: {str(exc)[:180]}'
-        time.sleep(2.0)
+            with STATE_LOCK:STATE['google_last_error']=f'R42 recovery {type(exc).__name__}: {str(exc)[:180]}'
+        time.sleep(3.0)
 
 threading.Thread(target=_r38_google_recover_loop,name='per-r38-google-recovery',daemon=True).start()
 
@@ -3847,6 +3915,31 @@ def _r39_close_duplicate_job(jid, canonical_jid):
     except Exception:pass
 
 
+# R42 global compute capacity.  R39 serialized expensive jobs only against each
+# other, so full_state could still run beside two XLSX/Google exports and exhaust a
+# small Render instance.  R42 allows two ordinary jobs OR one expensive job, never both.
+_R42_COMPUTE_SLOTS=max(1,min(3,env_int('R42_HEAVY_COMPUTE_SLOTS',2,1,3)))
+_R42_COMPUTE_SEM=threading.BoundedSemaphore(_R42_COMPUTE_SLOTS)
+
+def _r42_acquire_slots(count):
+    n=max(1,min(_R42_COMPUTE_SLOTS,int(count or 1)))
+    for _ in range(n):
+        _R42_COMPUTE_SEM.acquire()
+    return n
+
+def _r42_release_slots(count):
+    for _ in range(max(0,int(count or 0))):
+        try:_R42_COMPUTE_SEM.release()
+        except Exception:pass
+
+def _r42_mem_mb():
+    try:
+        for line in Path('/proc/self/status').read_text(errors='ignore').splitlines():
+            if line.startswith('VmRSS:'):
+                return round(float(line.split()[1])/1024.0,1)
+    except Exception:pass
+    return -1.0
+
 def _r39_process_file_job(job):
     jid=str((job or {}).get('id') or ''); body=dict((job or {}).get('payload') or {}); op=str(body.get('operation') or '')
     sig=_r39_file_signature(body); created=float((job or {}).get('created_at') or time.time()); now=time.time()
@@ -3877,11 +3970,19 @@ def _r39_process_file_job(job):
     started=time.time()
     try:
         if op in _R39_EXPENSIVE_OPS:
-            print(f'[R39 FILE START] {jid} op={op} lane=singleflight',flush=True)
+            print(f'[R42 FILE START] {jid} op={op} lane=exclusive rss={_r42_mem_mb()}MB',flush=True)
             with _R39_EXPENSIVE_SEM:
-                return _R39_BASE_PROCESS_FILE_JOB(job)
-        print(f'[R39 FILE START] {jid} op={op} lane=parallel',flush=True)
-        return _R39_BASE_PROCESS_FILE_JOB(job)
+                held=_r42_acquire_slots(_R42_COMPUTE_SLOTS)
+                try:
+                    return _R39_BASE_PROCESS_FILE_JOB(job)
+                finally:
+                    _r42_release_slots(held)
+        print(f'[R42 FILE START] {jid} op={op} lane=shared rss={_r42_mem_mb()}MB',flush=True)
+        held=_r42_acquire_slots(1)
+        try:
+            return _R39_BASE_PROCESS_FILE_JOB(job)
+        finally:
+            _r42_release_slots(held)
     finally:
         try:
             rec=_r35_job_get(jid); st=str(rec.get('status') or '')
@@ -3893,7 +3994,7 @@ def _r39_process_file_job(job):
                     _R39_FILE_SIG.pop(sig,None)
                 else:
                     cur.update({'state':'done','completed_at':time.time(),'status':st}); _R39_FILE_SIG[sig]=cur
-        print(f'[R39 FILE END] {jid} op={op} status={st or "unknown"} elapsed={time.time()-started:.2f}s',flush=True)
+        print(f'[R42 FILE END] {jid} op={op} status={st or "unknown"} elapsed={time.time()-started:.2f}s rss={_r42_mem_mb()}MB',flush=True)
 
 process_file_job=_r39_process_file_job
 
@@ -3964,7 +4065,7 @@ def _r39_full_state(body,jid):
         try:count=int(con.execute('SELECT COUNT(*) FROM chats').fetchone()[0] or 0)
         except Exception:count=len(chat_ids)
         failed=_r35_failed_tasks_snapshot(chat_ids if scope=='tenant' else None)
-        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R41_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids),'chat_count':count,'failed_tasks':len(failed),'checksum':''}
+        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R42_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids),'chat_count':count,'failed_tasks':len(failed),'checksum':''}
         con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','failed_tasks',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(failed,ensure_ascii=False,separators=(',',':'),default=str),))
         con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','manifest',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(manifest,ensure_ascii=False,separators=(',',':')),));con.commit()
     finally:con.close()
@@ -4113,12 +4214,21 @@ def process_google_job_r40(job):
         body=_r40_prepare_google_query(body); job=dict(job); job['payload']=body
     return _R40_BASE_PROCESS_GOOGLE_JOB(job)
 
-process_google_job=process_google_job_r40
-process_google_job_r38=process_google_job_r40
+_R42_BASE_PROCESS_GOOGLE_JOB=process_google_job_r40
+def process_google_job_r42(job):
+    jid=str((job or {}).get('id') or '')
+    held=_r42_acquire_slots(1)
+    try:
+        print(f'[R42 GOOGLE START] {jid} rss={_r42_mem_mb()}MB',flush=True)
+        return _R42_BASE_PROCESS_GOOGLE_JOB(job)
+    finally:
+        _r42_release_slots(held)
+        print(f'[R42 GOOGLE END] {jid} rss={_r42_mem_mb()}MB',flush=True)
+process_google_job=process_google_job_r42
+process_google_job_r38=process_google_job_r42
 
-threading.Thread(target=file_loop,name='per-r36-worker-files-1',daemon=True).start()
-threading.Thread(target=file_loop,name='per-r36-worker-files-2',daemon=True).start()
-threading.Thread(target=file_loop,name='per-r36-worker-files-3',daemon=True).start()
+threading.Thread(target=file_loop,name='per-r42-worker-files-1',daemon=True).start()
+threading.Thread(target=file_loop,name='per-r42-worker-files-2',daemon=True).start()
 threading.Thread(target=_r35_result_loop,name='per-r36-result-1',daemon=True).start()
 threading.Thread(target=_r35_result_loop,name='per-r36-result-2',daemon=True).start()
 threading.Thread(target=_r35_result_loop,name='per-r36-result-3',daemon=True).start()
@@ -4178,6 +4288,8 @@ def _r41_heavy_redis_live():
 def internal_export_file_r41():
     if not authorized(): return {'ok':False},404
     body=request.get_json(silent=True) or {}
+    if _r41_front_durable(body) and str(body.get('front_release') or '') != 'Пер-R42':
+        return {'ok':False,'error':'R42 release barrier: redeploy FAST R42; stale peer job rejected','job_id':str(body.get('job_id') or '')[:80]},409
     if (not _r41_front_durable(body)) or _r41_heavy_redis_live():
         return _R41_BASE_FILE_ADMISSION()
     try: cid=int(body.get('recipient_chat_id') or 0)
@@ -4194,7 +4306,18 @@ def internal_export_file_r41():
         if existing:
             status=str(existing.get('status') or 'queued'); job=existing.get('job') if isinstance(existing.get('job'),dict) else None
             if job and status in {'queued','running','ready','delivering'}:
-                if status in {'queued','running'}:_r35_enqueue_file(job)
+                if status in {'queued','running'}:
+                    _r35_enqueue_file(job)
+                elif bool(existing.get('ok')):
+                    p=Path(str(existing.get('path') or ''))
+                    if p.is_file():
+                        _r35_enqueue_result({'job':job,'ok':True,'extra':{'url':existing.get('url') or '','filename':existing.get('filename') or ''}})
+                    else:
+                        # Process/container restart lost the generated local file. Rebuild
+                        # the SAME job_id from FAST's durable payload.
+                        existing.update({'status':'queued','ok':None,'path':'','callback_delivered':False,'updated_at':time.time()})
+                        _r36_local_job_put(jid,existing); _file_status_put(jid,status='queued',ok=None,path='',callback_delivered=False)
+                        _r35_enqueue_file(job); status='queued'
                 return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'provisional':True,'durable':False,'durable_backend':'front-redis'},202
             if status in {'delivered','done'} and existing.get('ok') is True:
                 return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'provisional':False,'durable':True,'durable_backend':'completed'},200
@@ -4210,16 +4333,30 @@ def internal_export_file_r41():
         _r36_local_job_put(jid,rec)
         _file_status_put(jid,status='queued',ok=None,recipient_chat_id=cid,target_chat_id=body.get('target_chat_id'),durable_backend='front-redis',front_owned=True)
         queued=_r35_enqueue_file(job)
-        print(f'[R41 FILE PROVISIONAL] {jid} op={body.get("operation")} queued={int(bool(queued))} front=redis',flush=True)
+        print(f'[R42 FILE PROVISIONAL] {jid} op={body.get("operation")} queued={int(bool(queued))} front=redis',flush=True)
         return {'ok':True,'status':'queued','job_id':jid,'queue_size':FILE_Q.qsize(),'queued_now':bool(queued),'provisional':True,'durable':False,'durable_backend':'front-redis'},202
 
 
 app.view_functions['internal_export_file_r7']=internal_export_file_r41
 
 
+def _r42_google_redeliver(jid,rec,job):
+    try:
+        status=str((rec or {}).get('status') or '')
+        if status=='ready' and (rec or {}).get('url'):
+            if _notify_front_google_result_r38(job,True,url=str((rec or {}).get('url') or '')):
+                rec=dict(rec);rec.update({'status':'delivered','callback_delivered':True,'delivered_at':time.time()});_r38_google_put(jid,rec,pending=False)
+        elif status=='failed' and (rec or {}).get('error'):
+            if _notify_front_google_result_r38(job,False,error=str((rec or {}).get('error') or '')):
+                rec=dict(rec);rec.update({'status':'closed','callback_delivered':True,'delivered_at':time.time()});_r38_google_put(jid,rec,pending=False)
+    except Exception:
+        pass
+
 def internal_google_sheet_r41():
     if not authorized():return {'ok':False},404
     body=request.get_json(silent=True) or {}
+    if _r41_front_durable(body) and str(body.get('front_release') or '') != 'Пер-R42':
+        return {'ok':False,'error':'R42 release barrier: redeploy FAST R42; stale Google job rejected','job_id':str(body.get('job_id') or '')[:80]},409
     if (not _r41_front_durable(body)) or _r41_heavy_redis_live():
         return _R41_BASE_GOOGLE_ADMISSION()
     try:body['spreadsheet_id']=_sheet_id(body.get('spreadsheet_id'))
@@ -4233,36 +4370,43 @@ def internal_google_sheet_r41():
         if existing:
             status=str(existing.get('status') or 'queued'); job=existing.get('job') if isinstance(existing.get('job'),dict) else None
             if job and status in {'queued','running'}:_r38_google_enqueue(job)
+            if job and status in {'ready','failed'}:
+                threading.Thread(target=_r42_google_redeliver,args=(jid,dict(existing),job),daemon=True,name='r42-google-redeliver-'+jid[:8]).start()
             if status in {'delivered','closed'}:
                 return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'url':str(existing.get('url') or ''),'provisional':False,'durable':True,'durable_backend':'completed'},200
             return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'url':str(existing.get('url') or ''),'provisional':True,'durable':False,'durable_backend':'front-redis'},202
         job={'id':jid,'type':'google_sheet','created_at':time.time(),'payload':body}
         rec={'job_id':jid,'status':'queued','ok':None,'job':job,'recipient_chat_id':cid,'durable_backend':'front-redis','front_owned':True,'updated_at':time.time()}
         _r38_google_local_put(jid,rec); queued=_r38_google_enqueue(job)
-        print(f'[R41 GOOGLE PROVISIONAL] {jid} queued={int(bool(queued))} front=redis',flush=True)
+        print(f'[R42 GOOGLE PROVISIONAL] {jid} queued={int(bool(queued))} front=redis',flush=True)
         return {'ok':True,'status':'queued','job_id':jid,'queue_size':GOOGLE_Q.qsize(),'queued_now':bool(queued),'provisional':True,'durable':False,'durable_backend':'front-redis'},202
 
 
 app.view_functions['internal_google_sheet']=internal_google_sheet_r41
 
 try:
-    print('[R41 TRANSPORT] two-phase front-owned admission enabled; HEAVY Redis missing no longer blocks on synchronous MEGA for FAST-durable jobs',flush=True)
+    print('[R42 TRANSPORT] two-phase front-owned admission enabled; HEAVY Redis missing no longer blocks on synchronous MEGA for FAST-durable jobs',flush=True)
 except Exception:
     pass
 
+
+try:
+    print(f'[R42 RECOVERY] stale R39-R41 auto-replay disabled; front-owned jobs replay only from FAST; compute_slots={_R42_COMPUTE_SLOTS}',flush=True)
+except Exception:
+    pass
 
 if __name__ == '__main__':
     port=env_int('PORT',10000,1,65535)
     try:
         from waitress import serve as _r39_waitress_serve
         threads=env_int('HEAVY_HTTP_THREADS',8,4,32)
-        print(f'[R41 HTTP] waitress host=0.0.0.0 port={port} threads={threads}',flush=True)
+        print(f'[R42 HTTP] waitress host=0.0.0.0 port={port} threads={threads}',flush=True)
         _r39_waitress_serve(app,host='0.0.0.0',port=port,threads=threads,channel_timeout=120,cleanup_interval=15)
     except Exception as exc:
-        print(f'[R41 WAITRESS FALLBACK] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
+        print(f'[R42 WAITRESS FALLBACK] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
         try:
             from werkzeug.serving import make_server as _r39_make_server
-            print(f'[R41 HTTP] werkzeug-threaded fallback host=0.0.0.0 port={port}',flush=True)
+            print(f'[R42 HTTP] werkzeug-threaded fallback host=0.0.0.0 port={port}',flush=True)
             _r39_make_server('0.0.0.0',port,app,threaded=True).serve_forever()
         except Exception as exc2:
             print(f'[R41 HTTP EMERGENCY] {type(exc2).__name__}: {str(exc2)[:220]}',flush=True)
