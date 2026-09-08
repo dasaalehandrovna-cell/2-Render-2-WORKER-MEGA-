@@ -13,6 +13,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# One process owns all durable queues; worker_service.py serves HTTP with Waitress threads
-# while heavy jobs run in background threads.
+# R44 FIX1: copy the actual HEAVY application into /app before CMD.
+COPY worker_service.py runtime_config.py ./
+
 CMD ["python", "worker_service.py"]
