@@ -2473,7 +2473,7 @@ def internal_export_download_r7(job_id):
 # ---------------------------------------------------------------------------
 # R35 HEAVY-only export/document layer + Redis-optional state durability.
 # All expensive selection/serialization/compression/MEGA/Google work happens here.
-R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R40.py'
+R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R41.py'
 STATE.update({'r33_heavy_exports':0,'r33_heavy_export_failures':0,'r33_direct_mega_events':0,
               'r33_direct_mega_event_bytes':0,'r33_last_event_durability':'','r33_last_export':''})
 
@@ -3964,7 +3964,7 @@ def _r39_full_state(body,jid):
         try:count=int(con.execute('SELECT COUNT(*) FROM chats').fetchone()[0] or 0)
         except Exception:count=len(chat_ids)
         failed=_r35_failed_tasks_snapshot(chat_ids if scope=='tenant' else None)
-        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R40_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids),'chat_count':count,'failed_tasks':len(failed),'checksum':''}
+        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R41_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids),'chat_count':count,'failed_tasks':len(failed),'checksum':''}
         con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','failed_tasks',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(failed,ensure_ascii=False,separators=(',',':'),default=str),))
         con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','manifest',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(manifest,ensure_ascii=False,separators=(',',':')),));con.commit()
     finally:con.close()
@@ -4148,20 +4148,123 @@ threading.Thread(target=_checkpoint_loop_v267,name='vys262-worker-checkpoint-r13
 threading.Thread(target=_event_reconcile_loop_v268,name='vys262-worker-events-r13',daemon=True).start()
 threading.Thread(target=_reconcile_hash_loop_v268,name='vys262-worker-reconcile-r13',daemon=True).start()
 
+
+
+# ---------------------------------------------------------------------------
+# Пер-R41: non-blocking two-phase admission when HEAVY has no Redis.
+# If FAST proves that its peer outbox is durable in Redis, HEAVY may queue the
+# idempotent job immediately and return a provisional ACK.  FAST keeps replaying
+# the same job_id until the real callback, so an HEAVY restart cannot lose work.
+# When FAST has no durable remote outbox, the old synchronous Redis/MEGA admission
+# remains the safety fallback.
+_R41_BASE_FILE_ADMISSION = app.view_functions.get('internal_export_file_r7')
+_R41_BASE_GOOGLE_ADMISSION = app.view_functions.get('internal_google_sheet')
+_R41_PROVISIONAL_FILE_LOCK = threading.RLock()
+_R41_PROVISIONAL_GOOGLE_LOCK = threading.RLock()
+
+
+def _r41_front_durable(body):
+    return bool(isinstance(body,dict) and body.get('front_outbox_durable') and str(body.get('front_outbox_backend') or '')=='redis')
+
+
+def _r41_heavy_redis_live():
+    try:
+        c=_redis_client()
+        return c is not None and bool(c.ping())
+    except Exception:
+        return False
+
+
+def internal_export_file_r41():
+    if not authorized(): return {'ok':False},404
+    body=request.get_json(silent=True) or {}
+    if (not _r41_front_durable(body)) or _r41_heavy_redis_live():
+        return _R41_BASE_FILE_ADMISSION()
+    try: cid=int(body.get('recipient_chat_id') or 0)
+    except Exception: cid=0
+    if not cid:return {'ok':False,'error':'recipient_chat_id required'},400
+    rows=body.get('rows') or []
+    if not isinstance(rows,list) or len(rows)>100000:return {'ok':False,'error':'invalid/too many rows'},400
+    jid=str(body.get('job_id') or secrets.token_hex(12)).strip()[:80]; body['job_id']=jid
+    with _R41_PROVISIONAL_FILE_LOCK:
+        existing=_r35_job_get(jid) or {}
+        canonical=str(existing.get('canonical_job_id') or existing.get('duplicate_of') or '')[:80]
+        if canonical:
+            return {'ok':True,'status':'alias','job_id':jid,'canonical_job_id':canonical,'duplicate_of':canonical,'provisional':True,'durable':False,'durable_backend':'front-redis'},202
+        if existing:
+            status=str(existing.get('status') or 'queued'); job=existing.get('job') if isinstance(existing.get('job'),dict) else None
+            if job and status in {'queued','running','ready','delivering'}:
+                if status in {'queued','running'}:_r35_enqueue_file(job)
+                return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'provisional':True,'durable':False,'durable_backend':'front-redis'},202
+            if status in {'delivered','done'} and existing.get('ok') is True:
+                return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'provisional':False,'durable':True,'durable_backend':'completed'},200
+            if status in {'failed','closed'} and existing.get('ok') is False:
+                return {'ok':False,'duplicate':True,'status':status,'job_id':jid,'error':str(existing.get('error') or 'HEAVY job failed')[:500],'provisional':False,'durable':True,'durable_backend':'completed'},200
+        canonical=_r40_find_file_canonical(body,jid)
+        if canonical:
+            rec={'job_id':jid,'status':'alias','ok':True,'duplicate_of':canonical,'canonical_job_id':canonical,'durable_backend':'front-redis','job':{'id':jid,'type':'file_export','created_at':time.time(),'payload':body},'updated_at':time.time()}
+            _r36_local_job_put(jid,rec); _file_status_put(jid,status='alias',ok=True,duplicate_of=canonical,canonical_job_id=canonical,durable_backend='front-redis')
+            return {'ok':True,'duplicate':True,'status':'alias','job_id':jid,'canonical_job_id':canonical,'duplicate_of':canonical,'provisional':True,'durable':False,'durable_backend':'front-redis'},202
+        job={'id':jid,'type':'file_export','created_at':time.time(),'payload':body}
+        rec={'job_id':jid,'status':'queued','ok':None,'job':job,'recipient_chat_id':cid,'target_chat_id':body.get('target_chat_id'),'durable_backend':'front-redis','front_owned':True,'updated_at':time.time()}
+        _r36_local_job_put(jid,rec)
+        _file_status_put(jid,status='queued',ok=None,recipient_chat_id=cid,target_chat_id=body.get('target_chat_id'),durable_backend='front-redis',front_owned=True)
+        queued=_r35_enqueue_file(job)
+        print(f'[R41 FILE PROVISIONAL] {jid} op={body.get("operation")} queued={int(bool(queued))} front=redis',flush=True)
+        return {'ok':True,'status':'queued','job_id':jid,'queue_size':FILE_Q.qsize(),'queued_now':bool(queued),'provisional':True,'durable':False,'durable_backend':'front-redis'},202
+
+
+app.view_functions['internal_export_file_r7']=internal_export_file_r41
+
+
+def internal_google_sheet_r41():
+    if not authorized():return {'ok':False},404
+    body=request.get_json(silent=True) or {}
+    if (not _r41_front_durable(body)) or _r41_heavy_redis_live():
+        return _R41_BASE_GOOGLE_ADMISSION()
+    try:body['spreadsheet_id']=_sheet_id(body.get('spreadsheet_id'))
+    except Exception as exc:return {'ok':False,'error':str(exc)[:600]},400
+    try:cid=int(body.get('recipient_chat_id') or 0)
+    except Exception:cid=0
+    if not cid:return {'ok':False,'error':'recipient_chat_id required'},400
+    jid=str(body.get('job_id') or secrets.token_hex(12)).strip()[:80]; body['job_id']=jid
+    with _R41_PROVISIONAL_GOOGLE_LOCK:
+        existing=_r38_google_get(jid) or {}
+        if existing:
+            status=str(existing.get('status') or 'queued'); job=existing.get('job') if isinstance(existing.get('job'),dict) else None
+            if job and status in {'queued','running'}:_r38_google_enqueue(job)
+            if status in {'delivered','closed'}:
+                return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'url':str(existing.get('url') or ''),'provisional':False,'durable':True,'durable_backend':'completed'},200
+            return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'url':str(existing.get('url') or ''),'provisional':True,'durable':False,'durable_backend':'front-redis'},202
+        job={'id':jid,'type':'google_sheet','created_at':time.time(),'payload':body}
+        rec={'job_id':jid,'status':'queued','ok':None,'job':job,'recipient_chat_id':cid,'durable_backend':'front-redis','front_owned':True,'updated_at':time.time()}
+        _r38_google_local_put(jid,rec); queued=_r38_google_enqueue(job)
+        print(f'[R41 GOOGLE PROVISIONAL] {jid} queued={int(bool(queued))} front=redis',flush=True)
+        return {'ok':True,'status':'queued','job_id':jid,'queue_size':GOOGLE_Q.qsize(),'queued_now':bool(queued),'provisional':True,'durable':False,'durable_backend':'front-redis'},202
+
+
+app.view_functions['internal_google_sheet']=internal_google_sheet_r41
+
+try:
+    print('[R41 TRANSPORT] two-phase front-owned admission enabled; HEAVY Redis missing no longer blocks on synchronous MEGA for FAST-durable jobs',flush=True)
+except Exception:
+    pass
+
+
 if __name__ == '__main__':
     port=env_int('PORT',10000,1,65535)
     try:
         from waitress import serve as _r39_waitress_serve
         threads=env_int('HEAVY_HTTP_THREADS',8,4,32)
-        print(f'[R40 HTTP] waitress host=0.0.0.0 port={port} threads={threads}',flush=True)
+        print(f'[R41 HTTP] waitress host=0.0.0.0 port={port} threads={threads}',flush=True)
         _r39_waitress_serve(app,host='0.0.0.0',port=port,threads=threads,channel_timeout=120,cleanup_interval=15)
     except Exception as exc:
-        print(f'[R40 WAITRESS FALLBACK] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
+        print(f'[R41 WAITRESS FALLBACK] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
         try:
             from werkzeug.serving import make_server as _r39_make_server
-            print(f'[R40 HTTP] werkzeug-threaded fallback host=0.0.0.0 port={port}',flush=True)
+            print(f'[R41 HTTP] werkzeug-threaded fallback host=0.0.0.0 port={port}',flush=True)
             _r39_make_server('0.0.0.0',port,app,threaded=True).serve_forever()
         except Exception as exc2:
-            print(f'[R40 HTTP EMERGENCY] {type(exc2).__name__}: {str(exc2)[:220]}',flush=True)
+            print(f'[R41 HTTP EMERGENCY] {type(exc2).__name__}: {str(exc2)[:220]}',flush=True)
             app.run(host='0.0.0.0',port=port,threaded=True)
 # v262
