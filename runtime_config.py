@@ -1,4 +1,4 @@
-"""vys-262 R37 internal runtime configuration.
+"""vys-262 R38 internal runtime configuration.
 
 All non-secret operational tunables that used to be Render environment variables
 live here.  Render ENV is intentionally reserved for credentials, remote
@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r36-unified-bot"
+CONFIG_VERSION = "vys-262-r38-unified-bot"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {
@@ -144,6 +144,12 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
     "WORKER_FULL_CHECKPOINT_MAX_DELTA_MB": "16",
     "WORKER_MEGA_CHECKPOINT_SEC": "86400",
     "WORKER_RECONCILE_SEC": "21600",
+
+    # R38 Google/Drive resilience and durable Google recovery
+    "R38_GOOGLE_RETRY_WINDOW_SEC": "600",
+    "R38_GOOGLE_CALLBACK_WINDOW_SEC": "60",
+    "R38_GOOGLE_MEGA_SCAN_SEC": "45",
+    "R38_GOOGLE_MEGA_TIMEOUT": "180",
 
     # MEGA command timeouts
     "MEGA_TIMEOUT": "180",

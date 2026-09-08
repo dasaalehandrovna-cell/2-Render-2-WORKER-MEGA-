@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R37.
+"""vys-262 Render #2 heavy worker · Пер-R40.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -43,8 +43,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-per-r36-heavy'
-TRANSPORT_VERSION = 'vys-262-worker-per-r35-events'
+VERSION = 'vys-262-worker-per-r40-heavy'
+TRANSPORT_VERSION = 'vys-262-worker-per-r38-events'
 
 
 def env_bool(name, default=False):
@@ -1093,7 +1093,7 @@ def _google_token():
         info = _google_info(); header={'alg':'RS256','typ':'JWT'}; claims={'iss':info['client_email'],'scope':'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive','aud':info.get('token_uri') or 'https://oauth2.googleapis.com/token','iat':int(now),'exp':int(now)+3600}
         signing = (_b64url(json.dumps(header,separators=(',',':')).encode()) + '.' + _b64url(json.dumps(claims,separators=(',',':')).encode())).encode('ascii')
         assertion = signing.decode('ascii') + '.' + _b64url(_google_sign(signing, info['private_key']))
-        r = requests.post(info.get('token_uri') or 'https://oauth2.googleapis.com/token', data={'grant_type':'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion':assertion}, timeout=30)
+        r = _r38_google_http('post', info.get('token_uri') or 'https://oauth2.googleapis.com/token', data={'grant_type':'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion':assertion}, timeout=30)
         if r.status_code >= 300: raise RuntimeError(f'Google OAuth {r.status_code}: {r.text[:400]}')
         payload = r.json(); token = str(payload.get('access_token') or '')
         if not token: raise RuntimeError('Google OAuth returned no access_token')
@@ -1190,7 +1190,7 @@ def create_google_sheet(body):
     spreadsheet_id = _sheet_id(body.get('spreadsheet_id'))
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     info = _google_info()
-    meta = requests.get(
+    meta = _r38_google_http('get',
         f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}',
         headers=headers,
         params={'fields': 'spreadsheetId,properties.title,sheets.properties(sheetId,title,gridProperties)'},
@@ -1223,7 +1223,7 @@ def create_google_sheet(body):
             'startColumnIndex': 0, 'endColumnIndex': clear_cols,
         }, 'fields': 'userEnteredValue,note,userEnteredFormat'}}
     else:
-        add = requests.post(
+        add = _r38_google_http('post',
             f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate',
             headers=headers,
             json={'requests': [{'addSheet': {'properties': {'title': title, 'gridProperties': {
@@ -1264,7 +1264,7 @@ def create_google_sheet(body):
         {'autoResizeDimensions': {'dimensions': {'sheetId': sheet_id, 'dimension': 'COLUMNS',
                                                  'startIndex': 0, 'endIndex': max_cols}}},
     ])
-    upd = requests.post(
+    upd = _r38_google_http('post',
         f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate',
         headers=headers, json={'requests': reqs}, timeout=90,
     )
@@ -1274,7 +1274,7 @@ def create_google_sheet(body):
     expected = {(r, c): n.strip() for (r, c), n in notes.items() if n.strip()}
     if expected:
         escaped = title.replace("'", "''")
-        verify = requests.get(
+        verify = _r38_google_http('get',
             f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}', headers=headers,
             params={'includeGridData': 'true', 'ranges': f"'{escaped}'!A1:ZZ{max(1, len(rows))}",
                     'fields': 'sheets(data(rowData(values(note))))'}, timeout=60,
@@ -1858,7 +1858,7 @@ def internal_google_test():
         token = _google_token()
         info = _google_info()
         headers = {'Authorization':f'Bearer {token}'}
-        meta = requests.get(f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}', headers=headers, params={'fields':'spreadsheetId,properties.title'}, timeout=30)
+        meta = _r38_google_http('get', f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}', headers=headers, params={'fields':'spreadsheetId,properties.title'}, timeout=30)
         if meta.status_code >= 300:
             if meta.status_code in (401,403):
                 raise RuntimeError(f'Нет доступа к таблице. Расшарьте её {info.get("client_email")} как Редактору. Google: {meta.text[:300]}')
@@ -2357,7 +2357,7 @@ def _drive_upload_file(path: Path, filename: str, folder_id: str=''):
         metadata['parents']=[folder]
     mime=mimetypes.guess_type(filename)[0] or 'application/octet-stream'
     with open(path,'rb') as fh:
-        r=requests.post('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink', headers=headers,
+        r=_r38_google_http('post','https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink', headers=headers,
             files={'metadata':('metadata',json.dumps(metadata),'application/json; charset=UTF-8'),'file':(filename,fh,mime)}, timeout=120)
     if r.status_code >= 300: raise RuntimeError(f'Google Drive upload {r.status_code}: {r.text[:500]}')
     payload=r.json() or {}; fid=str(payload.get('id') or '')
@@ -2473,7 +2473,7 @@ def internal_export_download_r7(job_id):
 # ---------------------------------------------------------------------------
 # R35 HEAVY-only export/document layer + Redis-optional state durability.
 # All expensive selection/serialization/compression/MEGA/Google work happens here.
-R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R37.py'
+R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R40.py'
 STATE.update({'r33_heavy_exports':0,'r33_heavy_export_failures':0,'r33_direct_mega_events':0,
               'r33_direct_mega_event_bytes':0,'r33_last_event_durability':'','r33_last_export':''})
 
@@ -2902,7 +2902,7 @@ def _r33_window_doc(body,jid):
     catalog=gs.get('_window_marker_catalog_v160') if isinstance(gs.get('_window_marker_catalog_v160'),dict) else {}
     tz=gs.get('_window_tz_v160') if isinstance(gs.get('_window_tz_v160'),list) else []
     op=str(body.get('operation') or '')
-    lines=[f'Пер-R37 HEAVY export · {op}',f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}', '']
+    lines=[f'Пер-R40 HEAVY export · {op}',f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}', '']
     if op=='window_markers':
         for marker,row in sorted(catalog.items()):
             rr=row if isinstance(row,dict) else {}; lines.extend([f'{marker} — {rr.get("name") or "без имени"}',f'Последнее изменение: {rr.get("last_named_at") or "—"}','---'])
@@ -2933,7 +2933,7 @@ def _r33_mega_find(pattern,limit=400):
 
 def _r33_journal(body,jid,current=False):
     limit=max(100,min(20000,int(body.get('limit') or 5000))); paths=_r33_mega_find('journal_*.json.gz',min(300,limit))
-    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R37' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R37'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
+    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R40' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R40'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
     snap=body.get('front_runtime_snapshot') if isinstance(body.get('front_runtime_snapshot'),dict) else {}
     if snap: lines.extend(['--- FAST Render #1 snapshot ---',json.dumps(snap,ensure_ascii=False,indent=2,default=str),'--- end FAST snapshot ---',''])
     work=Path(tempfile.mkdtemp(prefix='r33_journal_'))
@@ -2948,12 +2948,12 @@ def _r33_journal(body,jid,current=False):
                         raw=gzip.decompress(f.read_bytes()).decode('utf-8','replace')
                         # Preserve text/JSON as-is; current journal prefers lines mentioning current release.
                         for line in raw.splitlines():
-                            if current and ('Пер-R37' not in line and 'r34' not in line.casefold()): continue
+                            if current and ('Пер-R40' not in line and 'r34' not in line.casefold()): continue
                             lines.append(line)
                             if len(lines)>=limit+4: break
                     except Exception: pass
-        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R37.')
-        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R37.txt' if current else 'Журнал_бота_Пер-R37.txt')
+        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R40.')
+        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R40.txt' if current else 'Журнал_бота_Пер-R40.txt')
     finally: shutil.rmtree(work,ignore_errors=True)
 
 
@@ -2965,7 +2965,7 @@ def _r33_runtime_zip(body,jid):
         z.writestr('heavy_status.json',json.dumps(st,ensure_ascii=False,indent=2,default=str))
         snap=body.get('front_runtime_snapshot') if isinstance(body.get('front_runtime_snapshot'),dict) else {}
         z.writestr('fast_render1_snapshot.json',json.dumps(snap,ensure_ascii=False,indent=2,default=str))
-        z.writestr('r34_manifest.txt',f'Пер-R37 HEAVY runtime export\ncreated={datetime.now(timezone.utc).isoformat(timespec="seconds")}\nindexed={len(paths)}\n')
+        z.writestr('r34_manifest.txt',f'Пер-R40 HEAVY runtime export\ncreated={datetime.now(timezone.utc).isoformat(timespec="seconds")}\nindexed={len(paths)}\n')
         z.writestr('mega_runtime_index.txt','\n'.join(paths)+'\n')
         work=Path(tempfile.mkdtemp(prefix='r33_runtime_'))
         try:
@@ -2977,12 +2977,12 @@ def _r33_runtime_zip(body,jid):
                         try:z.write(f,arcname='runtime/'+f'{idx:03d}_{f.name}')
                         except Exception:pass
         finally: shutil.rmtree(work,ignore_errors=True)
-    return path,'Runtime_Watcher_Пер-R37.zip'
+    return path,'Runtime_Watcher_Пер-R40.zip'
 
 
 def _r33_bot_source(body,jid):
     if not R35_FRONT_SOURCE.is_file(): raise RuntimeError('R36 front source asset missing on HEAVY')
-    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R35_FRONT_SOURCE,path); return path,'Пер-R37.py'
+    path=FILE_DIR/f'{jid}.py'; shutil.copy2(R35_FRONT_SOURCE,path); return path,'Пер-R40.py'
 
 
 def _r34_current_applied_revision(refresh=False):
@@ -3018,7 +3018,7 @@ def _r34_wait_revision(required, timeout=None):
 
 
 def _r34_state_dependent_operation(op):
-    return str(op or '') in {'period_export_query','exact_export_query','tabl_lsx','chat_json','full_state','sqlite','google_period_query','google_exact_query','google_tabl_query'}
+    return str(op or '') in {'period_export_query','exact_export_query','tabl_lsx','chat_json','full_state','sqlite','window_markers','window_tz','window_tz_archive','google_period_query','google_exact_query','google_tabl_query'}
 
 def _r33_prepare_file(body,jid):
     op=str(body.get('operation') or '')
@@ -3070,13 +3070,13 @@ def _r33_process_file_job(job):
         job2=dict(job); job2['payload']=body2; job2['payload']['filename']=filename; job2['payload']['caption']=str(body2.get('caption') or '')
         delivered=_notify_front_export_result(job2,True,url=url,filename=filename); _file_status_put(jid,callback_delivered=bool(delivered))
         if delivery in {'drive','google'}: path.unlink(missing_ok=True)
-        print(f'[R36 HEAVY EXPORT] {jid} op={body2.get("operation")} ok=True delivery={delivery} callback={delivered}',flush=True)
+        print(f'[R39 HEAVY EXPORT] {jid} op={body2.get("operation")} ok=True delivery={delivery} callback={delivered}',flush=True)
     except Exception as exc:
         detail=f'{type(exc).__name__}: {str(exc)[:700]}'
         with STATE_LOCK:
             STATE['file_failures']=int(STATE.get('file_failures') or 0)+1; STATE['file_last_error']=detail[:240]; STATE['r33_heavy_export_failures']=int(STATE.get('r33_heavy_export_failures') or 0)+1
         _file_status_put(jid,status='done',ok=False,error=detail); _notify_front_export_result(job,False,error=detail)
-        print(f'[R36 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
+        print(f'[R39 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
 
 # file_loop resolves this global at execution time.
 process_file_job=_r33_process_file_job
@@ -3152,7 +3152,7 @@ app.view_functions['internal_r32_state_events']=_r33_state_events_view
 
 
 # ---------------------------------------------------------------------------
-# Пер-R37 durable file transport. Redis is the durable job ledger; FILE_Q is only
+# Пер-R40 durable file transport. Redis is the durable job ledger; FILE_Q is only
 # an execution cache. A worker restart rehydrates unfinished jobs from Redis.
 _R35_JOB_PENDING_KEY='per:r35:heavy:filejobs:pending'
 _R35_JOB_PREFIX='per:r35:heavy:filejob:'
@@ -3403,14 +3403,14 @@ def _r35_process_file_job(job):
         rec=_r35_job_get(jid); rec.update({'status':'ready','ok':True,'job':job2,'path':str(path),'filename':filename,'url':url,'delivery':delivery}); _r35_job_put(jid,rec,pending=True)
         _file_status_put(jid,status='ready',ok=True,path=str(path),filename=filename,url=url,delivery=delivery)
         if not _r35_enqueue_result({'job':job2,'ok':True,'extra':{'url':url,'filename':filename}}): raise RuntimeError('R36 result queue full')
-        print(f'[R36 HEAVY EXPORT] {jid} op={body2.get("operation")} ready delivery={delivery}',flush=True)
+        print(f'[R39 HEAVY EXPORT] {jid} op={body2.get("operation")} ready delivery={delivery}',flush=True)
     except Exception as exc:
         detail=f'{type(exc).__name__}: {str(exc)[:700]}'
         with STATE_LOCK: STATE['file_failures']=int(STATE.get('file_failures') or 0)+1; STATE['file_last_error']=detail[:240]
         rec=_r35_job_get(jid); rec.update({'status':'failed','ok':False,'job':job,'error':detail}); _r35_job_put(jid,rec,pending=True)
         _file_status_put(jid,status='failed',ok=False,error=detail,recipient_chat_id=body.get('recipient_chat_id'),target_chat_id=body.get('target_chat_id'))
         _r35_enqueue_result({'job':job,'ok':False,'extra':{'error':detail}})
-        print(f'[R36 HEAVY EXPORT] {jid} failed {detail}',flush=True)
+        print(f'[R39 HEAVY EXPORT] {jid} failed {detail}',flush=True)
 
 process_file_job=_r35_process_file_job
 
@@ -3495,6 +3495,627 @@ def _r35_recover_loop():
             with STATE_LOCK: STATE['file_last_error']=f'R36 recovery {type(exc).__name__}: {str(exc)[:180]}'
         time.sleep(2.0)
 
+# ---------------------------------------------------------------------------
+# R38: production-grade HEAVY admission/recovery for Google jobs and resilient
+# Google/Drive HTTP. User jobs survive Render restarts just like file exports.
+_R38_GOOGLE_DB = CACHE_DIR / 'r38_google_jobs.sqlite3'
+_R38_GOOGLE_DB_LOCK = threading.RLock()
+_R38_GOOGLE_ADMISSION_LOCK = threading.RLock()
+_R38_GOOGLE_PENDING_KEY = 'per:r38:heavy:google:pending'
+_R38_GOOGLE_PREFIX = 'per:r38:heavy:google:'
+_R38_GOOGLE_MEGA_DIR = mega_root().rstrip('/') + '/r38_google_jobs_pending'
+_R38_GOOGLE_ENQUEUED = set()
+_R38_GOOGLE_ENQUEUED_LOCK = threading.RLock()
+_R38_GOOGLE_MEGA_SCAN = {'at':0.0,'error':''}
+
+
+def _r38_google_http(method,url,**kwargs):
+    """Retry only transient Google/Drive failures, honoring Retry-After."""
+    max_wait=max(30,min(1800,env_int('R38_GOOGLE_RETRY_WINDOW_SEC',600,30,1800)))
+    deadline=time.time()+max_wait; attempt=0; delay=1.0; last_exc=None; last_resp=None
+    while True:
+        attempt+=1
+        try:
+            # Multipart retries must rewind file objects.
+            try:
+                for spec in (kwargs.get('files') or {}).values():
+                    if isinstance(spec,(tuple,list)) and len(spec)>=2 and hasattr(spec[1],'seek'): spec[1].seek(0)
+            except Exception: pass
+            resp=requests.request(str(method or 'get').upper(),url,**kwargs); last_resp=resp
+            status=int(resp.status_code or 0); text=''
+            try:text=str(resp.text or '')[:1800].casefold()
+            except Exception:pass
+            quota403=(status==403 and any(x in text for x in ('ratelimitexceeded','userratelimitexceeded','resource_exhausted','quota exceeded','rate limit')))
+            transient=status in {408,425,429,500,502,503,504} or quota403
+            if not transient:return resp
+            retry_after=0.0
+            try:retry_after=float(str(resp.headers.get('Retry-After','') or '0').strip() or 0)
+            except Exception:retry_after=0.0
+            wait=max(delay,retry_after,1.0)
+            if time.time()+wait>=deadline:return resp
+            print(f'[R38 GOOGLE RETRY] {method} status={status} attempt={attempt} wait={wait:.1f}s',flush=True)
+            time.sleep(min(120.0,wait)); delay=min(60.0,delay*1.8)
+        except Exception as exc:
+            last_exc=exc; wait=max(1.0,delay)
+            if time.time()+wait>=deadline:raise
+            print(f'[R38 GOOGLE RETRY] {method} {type(exc).__name__} attempt={attempt} wait={wait:.1f}s',flush=True)
+            time.sleep(min(60.0,wait)); delay=min(60.0,delay*1.8)
+    if last_resp is not None:return last_resp
+    if last_exc is not None:raise last_exc
+    raise RuntimeError('Google request failed without response')
+
+
+def _r38_google_db_init():
+    with _R38_GOOGLE_DB_LOCK:
+        con=sqlite3.connect(str(_R38_GOOGLE_DB),timeout=5,check_same_thread=False)
+        try:
+            con.execute('PRAGMA journal_mode=WAL'); con.execute('PRAGMA synchronous=FULL'); con.execute('PRAGMA busy_timeout=5000')
+            con.execute('CREATE TABLE IF NOT EXISTS jobs(job_id TEXT PRIMARY KEY,row_json TEXT NOT NULL,status TEXT NOT NULL,updated_at REAL NOT NULL)')
+            con.execute('CREATE INDEX IF NOT EXISTS idx_r38_google_status ON jobs(status,updated_at)'); con.commit()
+        finally:con.close()
+
+
+def _r38_google_local_put(jid,row):
+    try:
+        _r38_google_db_init(); obj=dict(row or {}); obj['job_id']=str(jid); obj['updated_at']=time.time(); raw=json.dumps(obj,ensure_ascii=False,separators=(',',':'),default=str)
+        with _R38_GOOGLE_DB_LOCK:
+            con=sqlite3.connect(str(_R38_GOOGLE_DB),timeout=5,check_same_thread=False)
+            try:
+                con.execute('PRAGMA busy_timeout=5000'); con.execute('INSERT INTO jobs(job_id,row_json,status,updated_at) VALUES(?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET row_json=excluded.row_json,status=excluded.status,updated_at=excluded.updated_at',(str(jid),raw,str(obj.get('status') or 'queued'),float(obj['updated_at']))); con.commit()
+            finally:con.close()
+        return True
+    except Exception:return False
+
+
+def _r38_google_local_get(jid):
+    try:
+        _r38_google_db_init()
+        with _R38_GOOGLE_DB_LOCK:
+            con=sqlite3.connect(str(_R38_GOOGLE_DB),timeout=3,check_same_thread=False)
+            try:con.execute('PRAGMA busy_timeout=3000'); row=con.execute('SELECT row_json FROM jobs WHERE job_id=?',(str(jid),)).fetchone()
+            finally:con.close()
+        obj=json.loads(row[0]) if row else {}; return obj if isinstance(obj,dict) else {}
+    except Exception:return {}
+
+
+def _r38_google_local_pending(limit=200):
+    out=[]
+    try:
+        _r38_google_db_init()
+        with _R38_GOOGLE_DB_LOCK:
+            con=sqlite3.connect(str(_R38_GOOGLE_DB),timeout=3,check_same_thread=False)
+            try:con.execute('PRAGMA busy_timeout=3000'); rows=con.execute("SELECT row_json FROM jobs WHERE status NOT IN ('delivered','closed') ORDER BY updated_at ASC LIMIT ?",(max(1,min(500,int(limit))),)).fetchall()
+            finally:con.close()
+        for row in rows:
+            try:
+                obj=json.loads(row[0]);
+                if isinstance(obj,dict):out.append(obj)
+            except Exception:pass
+    except Exception:pass
+    return out
+
+
+def _r38_google_key(jid):return _R38_GOOGLE_PREFIX+str(jid or '')[:80]
+
+
+def _r38_google_get(jid):
+    best=_r38_google_local_get(jid); c=_redis_client()
+    if c is not None:
+        try:
+            raw=c.get(_r38_google_key(jid))
+            if raw:
+                obj=json.loads(raw.decode('utf-8') if isinstance(raw,(bytes,bytearray)) else raw)
+                if isinstance(obj,dict) and float(obj.get('updated_at') or 0)>=float(best.get('updated_at') or 0):best=obj
+        except Exception:pass
+    return best if isinstance(best,dict) else {}
+
+
+def _r38_google_put(jid,row,pending=True):
+    obj=dict(row or {}); obj['job_id']=str(jid); obj['updated_at']=time.time(); local_ok=_r38_google_local_put(jid,obj); c=_redis_client(); redis_ok=False
+    if c is not None:
+        try:
+            pipe=c.pipeline(transaction=False); pipe.set(_r38_google_key(jid),json.dumps(obj,ensure_ascii=False,separators=(',',':'),default=str),ex=604800)
+            if pending:pipe.sadd(_R38_GOOGLE_PENDING_KEY,str(jid))
+            else:pipe.srem(_R38_GOOGLE_PENDING_KEY,str(jid))
+            pipe.expire(_R38_GOOGLE_PENDING_KEY,604800); pipe.execute(); redis_ok=True
+        except Exception:pass
+    try:
+        with GOOGLE_JOB_LOCK:
+            mem=dict(GOOGLE_JOB_STATUS.get(str(jid)) or {}); mem.update({k:v for k,v in obj.items() if k not in {'job'}}); GOOGLE_JOB_STATUS[str(jid)]=mem
+    except Exception:pass
+    return bool(redis_ok),bool(local_ok)
+
+
+def _r38_google_mega_path(jid):return _R38_GOOGLE_MEGA_DIR.rstrip('/')+'/job_'+re.sub(r'[^A-Za-z0-9_.-]+','_',str(jid or ''))[:90]+'.json'
+
+
+def _r38_google_mega_put(jid,row):
+    local=None
+    try:
+        with MEGA_LOCK:
+            ok,detail=mega_login()
+            if not ok:return False,detail
+            if not ensure_mega_dir(mega_root()) or not ensure_mega_dir(_R38_GOOGLE_MEGA_DIR):return False,'cannot create R38 Google MEGA dir'
+            work=Path(tempfile.mkdtemp(prefix='r38_google_spool_')); local=work/Path(_r38_google_mega_path(jid)).name
+            obj=dict(row or {}); obj['job_id']=str(jid); obj['r38_spooled_at']=time.time(); local.write_text(json.dumps(obj,ensure_ascii=False,separators=(',',':'),default=str),encoding='utf-8')
+            remote=_r38_google_mega_path(jid)
+            try:run_cmd(['mega-rm',remote],timeout=30)
+            except Exception:pass
+            put=run_cmd(['mega-put',str(local),_R38_GOOGLE_MEGA_DIR],timeout=env_int('R38_GOOGLE_MEGA_TIMEOUT',180,30,600))
+            if put.returncode!=0:return False,(put.stderr or put.stdout or 'mega-put failed')[:220]
+            if not mega_exists(remote):return False,'MEGA Google job verify failed'
+            return True,'MEGA durable Google job stored'
+    except Exception as exc:return False,f'{type(exc).__name__}: {str(exc)[:220]}'
+    finally:
+        try:
+            if local is not None:shutil.rmtree(local.parent,ignore_errors=True)
+        except Exception:pass
+
+
+def _r38_google_mega_delete(jid):
+    try:
+        with MEGA_LOCK:
+            if not mega_login()[0]:return False
+            p=run_cmd(['mega-rm',_r38_google_mega_path(jid)],timeout=45); return p.returncode==0 or not mega_exists(_r38_google_mega_path(jid))
+    except Exception:return False
+
+
+def _r38_google_mega_pending(limit=100):
+    out=[]; work=None
+    try:
+        with MEGA_LOCK:
+            ok,detail=mega_login()
+            if not ok:_R38_GOOGLE_MEGA_SCAN.update(at=time.time(),error=detail);return out
+            if not ensure_mega_dir(_R38_GOOGLE_MEGA_DIR):return out
+            res=run_cmd(['mega-find',_R38_GOOGLE_MEGA_DIR,'--pattern=job_*.json','--type=f'],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+            if res.returncode!=0:return out
+            paths=[x.strip() for x in (res.stdout or '').splitlines() if x.strip()][:max(1,int(limit))]; work=Path(tempfile.mkdtemp(prefix='r38_google_recover_'))
+            for i,remote in enumerate(paths):
+                d=work/f'{i:03d}'; d.mkdir(parents=True,exist_ok=True); g=run_cmd(['mega-get',remote,str(d)],timeout=env_int('R38_GOOGLE_MEGA_TIMEOUT',180,30,600))
+                if g.returncode!=0:continue
+                files=list(d.glob('*.json'))
+                if files:
+                    try:
+                        obj=json.loads(files[0].read_text(encoding='utf-8'))
+                        if isinstance(obj,dict) and obj.get('job_id'):out.append(obj)
+                    except Exception:pass
+        _R38_GOOGLE_MEGA_SCAN.update(at=time.time(),error='');return out
+    except Exception as exc:_R38_GOOGLE_MEGA_SCAN.update(at=time.time(),error=f'{type(exc).__name__}: {str(exc)[:180]}');return out
+    finally:
+        try:
+            if work is not None:shutil.rmtree(work,ignore_errors=True)
+        except Exception:pass
+
+
+def _r38_google_enqueue(job):
+    jid=str((job or {}).get('id') or '')
+    if not jid:return False
+    with _R38_GOOGLE_ENQUEUED_LOCK:
+        if jid in _R38_GOOGLE_ENQUEUED:return True
+        try:GOOGLE_Q.put_nowait(job);_R38_GOOGLE_ENQUEUED.add(jid);return True
+        except queue.Full:return False
+
+
+def internal_google_sheet_r38():
+    if not authorized():return {'ok':False},404
+    body=request.get_json(silent=True) or {}
+    try:body['spreadsheet_id']=_sheet_id(body.get('spreadsheet_id'))
+    except Exception as exc:return {'ok':False,'error':str(exc)[:600]},400
+    try:cid=int(body.get('recipient_chat_id') or 0)
+    except Exception:cid=0
+    if not cid:return {'ok':False,'error':'recipient_chat_id required'},400
+    jid=str(body.get('job_id') or secrets.token_hex(12)).strip()[:80];body['job_id']=jid
+    with _R38_GOOGLE_ADMISSION_LOCK:
+        existing=_r38_google_get(jid)
+        if existing and str(existing.get('durable_backend') or ''):
+            status=str(existing.get('status') or 'queued'); job=existing.get('job') if isinstance(existing.get('job'),dict) else None
+            if job and status in {'queued','running'}:_r38_google_enqueue(job)
+            return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'url':str(existing.get('url') or ''),'durable':True,'durable_backend':str(existing.get('durable_backend') or '')},200 if status in {'delivered','closed'} else 202
+        job={'id':jid,'type':'google_sheet','created_at':time.time(),'payload':body};rec={'job_id':jid,'status':'admitting','ok':None,'job':job,'recipient_chat_id':cid,'durable_backend':''}
+        _r38_google_local_put(jid,rec);redis_ok,_local_ok=_r38_google_put(jid,rec,pending=True);backend='redis' if redis_ok else '';detail=''
+        if not backend:
+            mrec=dict(rec);mrec.update({'status':'queued','durable_backend':'mega','durable_at':time.time()});mok,detail=_r38_google_mega_put(jid,mrec)
+            if mok:backend='mega'
+        if not backend:
+            rec.update({'status':'admission_failed','ok':False,'error':'durable Google spool unavailable: '+str(detail or 'Redis and MEGA unavailable')[:400]});_r38_google_local_put(jid,rec)
+            return {'ok':False,'error':rec['error'],'job_id':jid,'durable':False},503
+        rec.update({'status':'queued','ok':None,'durable_backend':backend,'durable_at':time.time()});_r38_google_put(jid,rec,pending=True);queued=_r38_google_enqueue(job)
+        return {'ok':True,'status':'queued','job_id':jid,'queue_size':GOOGLE_Q.qsize(),'queued_now':bool(queued),'durable':True,'durable_backend':backend},202
+
+try:app.view_functions['internal_google_sheet']=internal_google_sheet_r38
+except Exception:pass
+
+
+def _notify_front_google_result_r38(job,ok,url='',error=''):
+    base,secret=front_base(),peer_secret()
+    if not base or not secret:return False
+    payload={'job_id':str(job.get('id') or ''),'ok':bool(ok),'url':str(url or ''),'error':str(error or '')[:900],'title':str((job.get('payload') or {}).get('title') or 'Google Excel')[:220],'recipient_chat_id':(job.get('payload') or {}).get('recipient_chat_id'),'target_chat_id':(job.get('payload') or {}).get('target_chat_id'),'tenant_id':(job.get('payload') or {}).get('tenant_id'),'notify_result':bool((job.get('payload') or {}).get('notify_result',True))}
+    deadline=time.time()+max(10,min(180,env_int('R38_GOOGLE_CALLBACK_WINDOW_SEC',60,10,180)));delay=1.0
+    while time.time()<deadline:
+        try:
+            r=requests.post(base+'/internal/split/google-result',json=payload,headers={'X-Peer-Secret':secret,'User-Agent':'per-r38-worker-google-result'},timeout=15)
+            data={}
+            try:data=r.json() if r.content else {}
+            except Exception:data={}
+            if r.status_code==200 and (bool(data.get('delivered')) or bool(data.get('duplicate'))):return True
+            if 400<=r.status_code<500 and r.status_code not in {408,409,425,429}:return False
+        except Exception:pass
+        time.sleep(delay);delay=min(10.0,delay*1.6)
+    return False
+
+_notify_front_google_result=_notify_front_google_result_r38
+
+
+def process_google_job_r38(job):
+    jid=str(job.get('id') or '');body=dict(job.get('payload') or {});rec=_r38_google_get(jid);rec.update({'job':job,'status':'running','ok':None,'started_at':time.time()});_r38_google_put(jid,rec,pending=True)
+    try:
+        url=create_google_sheet(body);rec=_r38_google_get(jid);rec.update({'job':job,'status':'ready','ok':True,'url':url,'error':'','finished_at':time.time()});_r38_google_put(jid,rec,pending=True)
+        with STATE_LOCK:STATE['google_jobs']=int(STATE.get('google_jobs') or 0)+1;STATE['google_last_ok']=time.time();STATE['google_last_error']=''
+        delivered=_notify_front_google_result_r38(job,True,url=url)
+        if delivered:
+            rec.update({'status':'delivered','callback_delivered':True,'delivered_at':time.time()});_r38_google_put(jid,rec,pending=False)
+            if str(rec.get('durable_backend') or '')=='mega':_r38_google_mega_delete(jid)
+        else:
+            rec.update({'status':'ready','callback_delivered':False});_r38_google_put(jid,rec,pending=True)
+        print(f'[R38 GOOGLE JOB] {jid} ok=True callback={delivered}',flush=True)
+    except Exception as exc:
+        detail=f'{type(exc).__name__}: {str(exc)[:600]}';rec=_r38_google_get(jid);rec.update({'job':job,'status':'failed','ok':False,'error':detail,'finished_at':time.time()});_r38_google_put(jid,rec,pending=True)
+        with STATE_LOCK:STATE['google_failures']=int(STATE.get('google_failures') or 0)+1;STATE['google_last_error']=detail[:240]
+        delivered=_notify_front_google_result_r38(job,False,error=detail)
+        if delivered:
+            rec.update({'status':'closed','callback_delivered':True,'delivered_at':time.time()});_r38_google_put(jid,rec,pending=False)
+            if str(rec.get('durable_backend') or '')=='mega':_r38_google_mega_delete(jid)
+        print(f'[R38 GOOGLE JOB] {jid} ok=False callback={delivered} {detail}',flush=True)
+
+process_google_job=process_google_job_r38
+
+
+def google_loop():
+    while True:
+        job=GOOGLE_Q.get();jid=str((job or {}).get('id') or '')
+        try:process_google_job_r38(job)
+        except Exception as exc:print(f'[R38 GOOGLE LOOP ERROR] {type(exc).__name__}: {str(exc)[:300]}',flush=True)
+        finally:
+            with _R38_GOOGLE_ENQUEUED_LOCK:_R38_GOOGLE_ENQUEUED.discard(jid)
+            GOOGLE_Q.task_done()
+
+
+def _r38_google_recover_loop():
+    last_mega=0.0
+    while True:
+        try:
+            records={str(x.get('job_id')):x for x in _r38_google_local_pending(250) if str(x.get('job_id') or '')};c=_redis_client();redis_live=False
+            if c is not None:
+                try:
+                    ids=list(c.smembers(_R38_GOOGLE_PENDING_KEY) or [])[:250];redis_live=True
+                    for raw in ids:
+                        jid=raw.decode() if isinstance(raw,(bytes,bytearray)) else str(raw);obj=_r38_google_get(jid)
+                        if obj and float(obj.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0):records[jid]=obj
+                except Exception:redis_live=False
+            if (not redis_live) and time.time()-last_mega>=max(20,env_int('R38_GOOGLE_MEGA_SCAN_SEC',45,20,600)):
+                last_mega=time.time()
+                for obj in _r38_google_mega_pending(150):
+                    jid=str(obj.get('job_id') or '')
+                    if jid and float(obj.get('updated_at') or 0)>=float((records.get(jid) or {}).get('updated_at') or 0):records[jid]=obj;_r38_google_local_put(jid,obj)
+            for jid,base_rec in list(records.items()):
+                rec=_r38_google_get(jid) or base_rec;status=str(rec.get('status') or 'queued');job=rec.get('job') if isinstance(rec.get('job'),dict) else None
+                if not job:continue
+                if status=='ready' and rec.get('url'):
+                    if _notify_front_google_result_r38(job,True,url=str(rec.get('url') or '')):
+                        rec.update({'status':'delivered','callback_delivered':True,'delivered_at':time.time()});_r38_google_put(jid,rec,pending=False)
+                        if str(rec.get('durable_backend') or '')=='mega':_r38_google_mega_delete(jid)
+                elif status=='failed' and rec.get('error'):
+                    if _notify_front_google_result_r38(job,False,error=str(rec.get('error') or '')):
+                        rec.update({'status':'closed','callback_delivered':True,'delivered_at':time.time()});_r38_google_put(jid,rec,pending=False)
+                        if str(rec.get('durable_backend') or '')=='mega':_r38_google_mega_delete(jid)
+                elif status not in {'delivered','closed','admission_failed'}:_r38_google_enqueue(job)
+        except Exception as exc:
+            with STATE_LOCK:STATE['google_last_error']=f'R38 recovery {type(exc).__name__}: {str(exc)[:180]}'
+        time.sleep(2.0)
+
+threading.Thread(target=_r38_google_recover_loop,name='per-r38-google-recovery',daemon=True).start()
+
+
+# ---------------- Пер-R40 stability / speed patch ----------------
+# 1) semantic single-flight prevents stale duplicate full-state jobs from running together;
+# 2) memory-heavy exports are serialized;
+# 3) full-state redaction/checksum streams rows instead of fetchall() into RAM.
+_R39_FILE_SIG_LOCK = threading.RLock()
+_R39_FILE_SIG = {}
+_R39_EXPENSIVE_SEM = threading.Semaphore(max(1, env_int('R39_EXPENSIVE_FILE_CONCURRENCY',1,1,2)))
+_R39_EXPENSIVE_OPS = {'full_state','sqlite','runtime_zip','journal','journal_current'}
+_R39_BASE_PROCESS_FILE_JOB = process_file_job
+
+
+def _r39_file_signature(body):
+    b=body if isinstance(body,dict) else {}
+    keys=('operation','recipient_chat_id','target_chat_id','scope','tenant_id','tenant_chat_ids','mode','day_key','start_key','start_rid','end_key','end_rid','source_file_type','file_type','delivery','limit','start_dt','end_dt')
+    core={k:b.get(k) for k in keys if k in b}
+    raw=json.dumps(core,ensure_ascii=False,sort_keys=True,separators=(',',':'),default=str)
+    return hashlib.sha256(raw.encode('utf-8','replace')).hexdigest()
+
+
+def _r39_close_duplicate_job(jid, canonical_jid):
+    try:
+        rec=_r35_job_get(jid); backend=str(rec.get('durable_backend') or '')
+        rec.update({'status':'closed','ok':True,'duplicate_of':str(canonical_jid),'closed_at':time.time()})
+        _r35_job_put(jid,rec,pending=False)
+        _file_status_put(jid,status='closed',ok=True,duplicate_of=str(canonical_jid))
+        if backend=='mega':
+            try:_r36_mega_job_delete(jid)
+            except Exception:pass
+    except Exception:pass
+
+
+def _r39_process_file_job(job):
+    jid=str((job or {}).get('id') or ''); body=dict((job or {}).get('payload') or {}); op=str(body.get('operation') or '')
+    sig=_r39_file_signature(body); created=float((job or {}).get('created_at') or time.time()); now=time.time()
+    # Before any work starts, choose the same deterministic canonical id as FAST from
+    # every locally recovered durable record with the same semantic signature.
+    try:
+        same=[]
+        for rec in _r36_local_pending(500):
+            if str((rec or {}).get('status') or '') in {'failed','admission_failed'}: continue
+            j=(rec or {}).get('job') if isinstance((rec or {}).get('job'),dict) else None
+            if not j: continue
+            if _r39_file_signature((j or {}).get('payload') or {})==sig:
+                cj=str((j or {}).get('id') or (rec or {}).get('job_id') or '')
+                if cj: same.append(cj)
+        canonical=min(same) if same else jid
+    except Exception:
+        canonical=jid
+    with _R39_FILE_SIG_LOCK:
+        old=dict(_R39_FILE_SIG.get(sig) or {})
+        old_jid=str(old.get('job_id') or '')
+        old_state=str(old.get('state') or '')
+        if old_jid and old_state=='running': canonical=old_jid
+        if canonical and canonical!=jid:
+            _r39_close_duplicate_job(jid,canonical)
+            print(f'[R39 FILE DEDUPE] drop={jid} canonical={canonical} op={op}',flush=True)
+            return
+        _R39_FILE_SIG[sig]={'job_id':jid,'state':'running','started_at':now,'created_at':created}
+    started=time.time()
+    try:
+        if op in _R39_EXPENSIVE_OPS:
+            print(f'[R39 FILE START] {jid} op={op} lane=singleflight',flush=True)
+            with _R39_EXPENSIVE_SEM:
+                return _R39_BASE_PROCESS_FILE_JOB(job)
+        print(f'[R39 FILE START] {jid} op={op} lane=parallel',flush=True)
+        return _R39_BASE_PROCESS_FILE_JOB(job)
+    finally:
+        try:
+            rec=_r35_job_get(jid); st=str(rec.get('status') or '')
+        except Exception: st=''
+        with _R39_FILE_SIG_LOCK:
+            cur=_R39_FILE_SIG.get(sig) or {}
+            if str(cur.get('job_id') or '')==jid:
+                if st in {'failed','admission_failed'}:
+                    _R39_FILE_SIG.pop(sig,None)
+                else:
+                    cur.update({'state':'done','completed_at':time.time(),'status':st}); _R39_FILE_SIG[sig]=cur
+        print(f'[R39 FILE END] {jid} op={op} status={st or "unknown"} elapsed={time.time()-started:.2f}s',flush=True)
+
+process_file_job=_r39_process_file_job
+
+
+def _r39_db_checksum(path):
+    con=sqlite3.connect(str(path)); h=hashlib.sha256()
+    try:
+        for table in ('kv','chats','meta','cold_fields'):
+            cols=[x[1] for x in con.execute(f'PRAGMA table_info({table})').fetchall()]
+            if not cols: continue
+            order=','.join(cols[:2]); cur=con.execute(f'SELECT * FROM {table} ORDER BY {order}')
+            while True:
+                batch=cur.fetchmany(128)
+                if not batch: break
+                for row in batch:
+                    if table=='meta' and len(row)>=2 and str(row[0])=='v153_export' and str(row[1])=='manifest': continue
+                    h.update(table.encode()); h.update(b'\\0')
+                    for v in row: h.update(str(v).encode('utf-8','replace')); h.update(b'\\0')
+        return h.hexdigest()
+    finally: con.close()
+
+_r33_db_checksum=_r39_db_checksum
+
+
+def _r39_sanitize_table_streaming(con,table,keycols,batch_size=64):
+    cols=','.join(tuple(keycols)+('v',)); where=' AND '.join(f'{k}=?' for k in keycols)
+    sql=f'UPDATE {table} SET v=? WHERE {where}'; order=','.join(keycols); offset=0
+    while True:
+        rows=con.execute(f'SELECT {cols} FROM {table} ORDER BY {order} LIMIT ? OFFSET ?',(int(batch_size),int(offset))).fetchall()
+        if not rows: break
+        updates=[]
+        for row in rows:
+            keys=row[:-1]; val=row[-1]
+            try:safe=json.dumps(_r33_sanitize(json.loads(val)),ensure_ascii=False,separators=(',',':'),default=str)
+            except Exception:safe=str(val)
+            updates.append((safe,*keys))
+        if updates: con.executemany(sql,updates)
+        offset += len(rows)
+        del rows,updates
+
+
+def _r39_full_state(body,jid):
+    started=time.time(); src=_r33_cache_ready(); folder=FILE_DIR/f'{jid}_full'; folder.mkdir(parents=True,exist_ok=True); raw=folder/'state.sqlite3'
+    srccon=sqlite3.connect(str(src),timeout=30); dst=sqlite3.connect(str(raw))
+    try:srccon.backup(dst,pages=512,sleep=0.002)
+    finally:dst.close();srccon.close()
+    con=sqlite3.connect(str(raw),timeout=30)
+    try:
+        scope=str(body.get('scope') or 'global'); chat_ids={int(x) for x in (body.get('tenant_chat_ids') or []) if str(x).lstrip('-').isdigit()}
+        if scope=='tenant':
+            if chat_ids:
+                qs=','.join('?' for _ in chat_ids); vals=tuple(str(x) for x in chat_ids)
+                con.execute(f'DELETE FROM chats WHERE chat_id NOT IN ({qs})',vals);con.execute(f'DELETE FROM cold_fields WHERE chat_id NOT IN ({qs})',vals)
+            else:
+                con.execute('DELETE FROM chats');con.execute('DELETE FROM cold_fields')
+            rr=con.execute("SELECT v FROM kv WHERE k='root'").fetchone()
+            if rr:
+                filtered=_r35_filter_root_for_tenant(_r33_json_load(rr[0],{}),str(body.get('tenant_id') or ''),chat_ids)
+                con.execute("UPDATE kv SET v=? WHERE k='root'",(json.dumps(filtered,ensure_ascii=False,separators=(',',':'),default=str),))
+        else:
+            # Match v262 semantics, but do not load whole tables into Python RAM.
+            for table,keycols in (('kv',('k',)),('chats',('chat_id',)),('meta',('kind','k')),('cold_fields',('chat_id','k'))):
+                try:_r39_sanitize_table_streaming(con,table,keycols)
+                except sqlite3.OperationalError:pass
+            try:chat_ids={int(x[0]) for x in con.execute('SELECT chat_id FROM chats') if str(x[0]).lstrip('-').isdigit()}
+            except Exception:chat_ids=set()
+        con.execute("CREATE TABLE IF NOT EXISTS meta (kind TEXT NOT NULL,k TEXT NOT NULL,v TEXT NOT NULL,PRIMARY KEY(kind,k))")
+        try:count=int(con.execute('SELECT COUNT(*) FROM chats').fetchone()[0] or 0)
+        except Exception:count=len(chat_ids)
+        failed=_r35_failed_tasks_snapshot(chat_ids if scope=='tenant' else None)
+        manifest={'kind':'telegram_bot_full_state_v153','schema_version':1,'bot_version':'bot_v153_PER_R40_HEAVY','created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'scope':scope,'tenant_id':str(body.get('tenant_id') or ''),'chat_ids':sorted(chat_ids),'chat_count':count,'failed_tasks':len(failed),'checksum':''}
+        con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','failed_tasks',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(failed,ensure_ascii=False,separators=(',',':'),default=str),))
+        con.execute("INSERT INTO meta(kind,k,v) VALUES('v153_export','manifest',?) ON CONFLICT(kind,k) DO UPDATE SET v=excluded.v",(json.dumps(manifest,ensure_ascii=False,separators=(',',':')),));con.commit()
+    finally:con.close()
+    checksum=_r39_db_checksum(raw);con=sqlite3.connect(str(raw))
+    try:
+        m=json.loads(con.execute("SELECT v FROM meta WHERE kind='v153_export' AND k='manifest'").fetchone()[0]);m['checksum']=checksum
+        con.execute("UPDATE meta SET v=? WHERE kind='v153_export' AND k='manifest'",(json.dumps(m,ensure_ascii=False,separators=(',',':')),));con.commit()
+    finally:con.close()
+    gz=FILE_DIR/f'{jid}.sqlite3.gz'
+    with open(raw,'rb') as fin,gzip.open(gz,'wb',compresslevel=max(1,min(6,env_int('R39_FULL_STATE_GZIP_LEVEL',3,1,6)))) as fout:shutil.copyfileobj(fin,fout,1024*1024)
+    shutil.rmtree(folder,ignore_errors=True)
+    print(f'[R39 FULL STATE] {jid} scope={scope} chats={count} elapsed={time.time()-started:.2f}s size={gz.stat().st_size if gz.exists() else 0}',flush=True)
+    return gz,'latest_bot_state.sqlite3.gz'
+
+
+_r33_full_state=_r39_full_state
+
+# ---------------- Пер-R40 unified protocol patch ----------------
+# Admission-time semantic aliasing makes duplicate_of explicit to FAST.  If a race still
+# reaches the execution queue, HEAVY sends a lightweight alias callback instead of
+# silently closing a job_id that FAST could be waiting on.
+_R40_BASE_INTERNAL_EXPORT_FILE = internal_export_file_r35
+_R40_BASE_PROCESS_GOOGLE_JOB = process_google_job_r38
+
+
+def _r40_find_file_canonical(body,jid):
+    try: sig=_r39_file_signature(body or {})
+    except Exception: return ''
+    candidates=[]
+    try:
+        for rec in _r36_local_pending(800):
+            if not isinstance(rec,dict): continue
+            st=str(rec.get('status') or '')
+            if st not in {'queued','running','ready','delivering'}: continue
+            backend=str(rec.get('durable_backend') or '')
+            if not backend: continue
+            job=rec.get('job') if isinstance(rec.get('job'),dict) else None
+            if not job: continue
+            cj=str(job.get('id') or rec.get('job_id') or '')[:80]
+            if not cj or cj==str(jid): continue
+            if _r39_file_signature(job.get('payload') or {})==sig: candidates.append((cj,rec))
+    except Exception: pass
+    if not candidates: return ''
+    return min(candidates,key=lambda x:x[0])[0]
+
+
+def internal_export_file_r40():
+    if not authorized(): return {'ok':False},404
+    body=request.get_json(silent=True) or {}
+    jid=str(body.get('job_id') or secrets.token_hex(12)).strip()[:80]; body['job_id']=jid
+    # One admission lock covers alias lookup + base admission, so two simultaneous
+    # identical POSTs cannot both pass the semantic check on this process.
+    with _R36_ADMISSION_LOCK:
+        existing=_r35_job_get(jid)
+        if existing:
+            # Idempotent retry of an alias must stay an alias.  Never fall through
+            # to the legacy admission path, which does not know the R40 alias state
+            # and could accidentally enqueue a second heavy job for the same request.
+            est=str(existing.get('status') or '')
+            canonical=str(existing.get('canonical_job_id') or existing.get('duplicate_of') or '')[:80]
+            if est == 'alias' and canonical:
+                backend=str(existing.get('durable_backend') or 'local')
+                return {'ok':True,'duplicate':True,'status':'alias','job_id':jid,'canonical_job_id':canonical,'duplicate_of':canonical,'durable':True,'durable_backend':backend},202
+        else:
+            canonical=_r40_find_file_canonical(body,jid)
+            if canonical:
+                crec=_r35_job_get(canonical) or {}; backend=str(crec.get('durable_backend') or 'local')
+                rec={'job_id':jid,'status':'alias','ok':True,'duplicate_of':canonical,'canonical_job_id':canonical,'durable_backend':backend,'job':{'id':jid,'type':'file_export','created_at':time.time(),'payload':body},'updated_at':time.time()}
+                _r36_local_job_put(jid,rec); _r35_job_put(jid,rec,pending=False)
+                _file_status_put(jid,status='alias',ok=True,duplicate_of=canonical,canonical_job_id=canonical,durable_backend=backend)
+                print(f'[R40 FILE ALIAS ADMISSION] alias={jid} canonical={canonical} op={body.get("operation")}',flush=True)
+                return {'ok':True,'duplicate':True,'status':'alias','job_id':jid,'canonical_job_id':canonical,'duplicate_of':canonical,'durable':True,'durable_backend':backend},202
+        return _R40_BASE_INTERNAL_EXPORT_FILE()
+
+app.view_functions['internal_export_file_r7']=internal_export_file_r40
+
+
+def _r40_notify_front_alias(jid,canonical,body):
+    base,secret=front_base(),peer_secret()
+    if not base or not secret:return False
+    payload={'job_id':str(jid),'ok':True,'alias_only':True,'canonical_job_id':str(canonical),'duplicate_of':str(canonical),'recipient_chat_id':body.get('recipient_chat_id'),'target_chat_id':body.get('target_chat_id'),'operation':body.get('operation'),'label':body.get('label'),'chat_name':body.get('chat_name')}
+    deadline=time.time()+90; delay=1.0
+    while time.time()<deadline:
+        try:
+            r=requests.post(base+'/internal/split/export-result',json=payload,headers={'X-Peer-Secret':secret,'User-Agent':'per-r40-worker-alias'},timeout=12)
+            if 200<=r.status_code<300:return True
+            if 400<=r.status_code<500 and r.status_code not in {408,409,425,429}:return False
+        except Exception:pass
+        time.sleep(delay);delay=min(10.0,delay*1.6)
+    return False
+
+
+def _r39_close_duplicate_job(jid, canonical_jid):
+    try:
+        rec=_r35_job_get(jid); backend=str(rec.get('durable_backend') or ''); job=rec.get('job') if isinstance(rec.get('job'),dict) else {}; body=job.get('payload') if isinstance(job.get('payload'),dict) else {}
+        rec.update({'status':'closed','ok':True,'duplicate_of':str(canonical_jid),'canonical_job_id':str(canonical_jid),'closed_at':time.time()})
+        _r35_job_put(jid,rec,pending=False); _file_status_put(jid,status='closed',ok=True,duplicate_of=str(canonical_jid),canonical_job_id=str(canonical_jid))
+        threading.Thread(target=_r40_notify_front_alias,args=(str(jid),str(canonical_jid),dict(body)),daemon=True,name='per-r40-alias-'+str(jid)[:8]).start()
+        if backend=='mega':
+            try:_r36_mega_job_delete(jid)
+            except Exception:pass
+    except Exception:pass
+
+
+def _r40_category_rows_without_description(rows):
+    out=[]; annotations={}
+    totals={'остаток с прошлого раза','сумма по статьям','расход','приход','остаток на руках','на руках:','гомонковые','остаток в обороте','расход еды на человека в сутки'}
+    for r_idx,raw in enumerate(rows or [],start=1):
+        row=list(raw or []); desc=str(row[1] if len(row)>1 else '').strip(); is_header=str(row[0] if row else '').strip().casefold() in {'дата','date'} and desc.casefold() in {'описание','description'}
+        if len(row)>1:
+            if not is_header and desc and not str(row[0] if row else '').strip() and desc.casefold() in totals: row[0]=desc
+            row.pop(1)
+        if desc and not is_header and desc.casefold() not in totals:
+            for original_c in range(3,len(raw or [])):
+                try:
+                    v=(raw or [])[original_c]
+                    if v not in ('',None,0,0.0): annotations[f'{r_idx},{original_c}']=desc
+                except Exception:pass
+        out.append(row)
+    return out,annotations
+
+
+def _r40_prepare_google_query(body):
+    op=str(body.get('operation') or '')
+    if op not in {'google_exact_query','google_period_query','google_tabl_query'}: return body
+    required=int(body.get('required_revision') or 0)
+    if required:
+        ok,cur=_r34_wait_revision(required)
+        if not ok: raise RuntimeError(f'HEAVY Google state revision behind required={required} applied={cur}')
+    b=dict(body)
+    if op=='google_tabl_query':
+        rows=_r33_tabl_rows(b)
+    else:
+        q=dict(b); q['operation']='exact_export_query' if op=='google_exact_query' else 'period_export_query'; q['source_file_type']='xlsxstat'; q['file_type']='xlsx'
+        store,currency,selected,opening,start,end=_r33_select_finance(q)
+        rows=_r35_category_export_rows(store,selected,opening,start,end,q)
+    if str(b.get('layout') or '')=='category_compact':
+        rows,notes=_r40_category_rows_without_description(rows); b['annotations']=notes if bool(b.get('include_annotations',True)) else {}
+    b['rows']=rows; b['operation']='google_sheet_rows'
+    return b
+
+
+def process_google_job_r40(job):
+    body=dict((job or {}).get('payload') or {})
+    if str(body.get('operation') or '') in {'google_exact_query','google_period_query','google_tabl_query'}:
+        body=_r40_prepare_google_query(body); job=dict(job); job['payload']=body
+    return _R40_BASE_PROCESS_GOOGLE_JOB(job)
+
+process_google_job=process_google_job_r40
+process_google_job_r38=process_google_job_r40
+
 threading.Thread(target=file_loop,name='per-r36-worker-files-1',daemon=True).start()
 threading.Thread(target=file_loop,name='per-r36-worker-files-2',daemon=True).start()
 threading.Thread(target=file_loop,name='per-r36-worker-files-3',daemon=True).start()
@@ -3528,5 +4149,19 @@ threading.Thread(target=_event_reconcile_loop_v268,name='vys262-worker-events-r1
 threading.Thread(target=_reconcile_hash_loop_v268,name='vys262-worker-reconcile-r13',daemon=True).start()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0',port=env_int('PORT',10000,1,65535),threaded=True)
+    port=env_int('PORT',10000,1,65535)
+    try:
+        from waitress import serve as _r39_waitress_serve
+        threads=env_int('HEAVY_HTTP_THREADS',8,4,32)
+        print(f'[R40 HTTP] waitress host=0.0.0.0 port={port} threads={threads}',flush=True)
+        _r39_waitress_serve(app,host='0.0.0.0',port=port,threads=threads,channel_timeout=120,cleanup_interval=15)
+    except Exception as exc:
+        print(f'[R40 WAITRESS FALLBACK] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
+        try:
+            from werkzeug.serving import make_server as _r39_make_server
+            print(f'[R40 HTTP] werkzeug-threaded fallback host=0.0.0.0 port={port}',flush=True)
+            _r39_make_server('0.0.0.0',port,app,threaded=True).serve_forever()
+        except Exception as exc2:
+            print(f'[R40 HTTP EMERGENCY] {type(exc2).__name__}: {str(exc2)[:220]}',flush=True)
+            app.run(host='0.0.0.0',port=port,threaded=True)
 # v262
