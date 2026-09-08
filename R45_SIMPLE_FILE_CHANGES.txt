@@ -1,0 +1,6 @@
+R45 SIMPLE FILE HOTFIX
+
+- HEAVY file/status/download API kept intentionally simple and compatible with FAST R45.
+- FRONT_SOURCE updated to exact FAST R45 merged source.
+- Dockerfile updated to ship FRONT_SOURCE_PER_R45_SIMPLE.py.
+- Existing callback remains, but FAST R45 no longer depends on it for delivery.

@@ -2473,7 +2473,7 @@ def internal_export_download_r7(job_id):
 # ---------------------------------------------------------------------------
 # R35 HEAVY-only export/document layer + Redis-optional state durability.
 # All expensive selection/serialization/compression/MEGA/Google work happens here.
-R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R44_FIXED.py'
+R35_FRONT_SOURCE = Path(__file__).resolve().parent / 'FRONT_SOURCE_PER_R45_SIMPLE.py'
 STATE.update({'r33_heavy_exports':0,'r33_heavy_export_failures':0,'r33_direct_mega_events':0,
               'r33_direct_mega_event_bytes':0,'r33_last_event_durability':'','r33_last_export':''})
 
@@ -4440,7 +4440,7 @@ def internal_export_status_r43(job_id):
     return payload,200
 
 try:
-    print('[R43 FILE BRIDGE] pull-status fallback enabled at /internal/export/status/<job_id>', flush=True)
+    print('[R45 FILE BRIDGE] status/download ready for FAST direct pull at /internal/export/status/<job_id>', flush=True)
 except Exception:
     pass
 
@@ -4466,7 +4466,7 @@ def internal_r44_selfcheck():
     },200
 
 try:
-    print('[R44 CLEAN] routes registered before HTTP start; FAST R43 pull bridge active; front source asset checked by /internal/r44/selfcheck', flush=True)
+    print('[R45 SIMPLE FILE] routes registered before HTTP start; FAST direct-pull bridge active; front source asset checked by /internal/r44/selfcheck', flush=True)
 except Exception:
     pass
 
