@@ -2250,7 +2250,7 @@ except Exception:
     pass
 
 
-def _file_status_put(job_id, **values):
+def _file_status_put_memory(job_id, **values):
     now = time.time()
     with FILE_JOB_LOCK:
         for key, row in list(FILE_JOB_STATUS.items()):
@@ -2407,7 +2407,7 @@ def _notify_front_export_result(job, ok, **extra):
         time.sleep(delay); delay=min(max(2.0,env_int('WORKER_R36_RESULT_RETRY_SEC',6,1,30)),delay*1.5)
     return False
 
-def process_file_job(job):
+def _process_file_job_core(job):
     jid=str(job.get('id') or ''); body=dict(job.get('payload') or {})
     _file_status_put(jid,status='running')
     try:
@@ -3183,7 +3183,6 @@ _R35_JOB_PENDING_KEY='per:r35:heavy:filejobs:pending'
 _R35_JOB_PREFIX='per:r35:heavy:filejob:'
 _R35_ENQUEUED=set(); _R35_ENQUEUED_LOCK=threading.RLock()
 _R35_RESULT_Q=queue.Queue(maxsize=64); _R35_RESULT_ENQUEUED=set(); _R35_RESULT_LOCK=threading.RLock()
-_R35_BASE_FILE_STATUS_PUT=_file_status_put
 
 # R36 local + MEGA fallback spool. Redis remains preferred, but a missing REDIS_URL
 # must never downgrade an accepted HEAVY export to RAM-only durability.
@@ -3340,7 +3339,7 @@ def _r35_job_put(jid,row,pending=True):
     except Exception:return False
 
 def _file_status_put(job_id,**fields):
-    _R35_BASE_FILE_STATUS_PUT(job_id,**fields)
+    _file_status_put_memory(job_id,**fields)
     try:
         old=_r35_job_get(job_id); old.update(fields); pending=str(fields.get('status') or old.get('status') or '') not in {'delivered','closed'}
         _r35_job_put(job_id,old,pending=pending)
@@ -3362,7 +3361,7 @@ def _r35_enqueue_result(task):
         try: _R35_RESULT_Q.put_nowait(task); _R35_RESULT_ENQUEUED.add(jid); return True
         except queue.Full:return False
 
-def internal_export_file_r35():
+def _internal_export_file_durable():
     if not authorized(): return {'ok':False},404
     body=request.get_json(silent=True) or {}
     try: cid=int(body.get('recipient_chat_id') or 0)
@@ -3406,7 +3405,7 @@ def internal_export_file_r35():
         # pick this job up when capacity returns.
         return {'ok':True,'status':'queued','job_id':jid,'queue_size':FILE_Q.qsize(),'queued_now':bool(queued),'durable':True,'durable_backend':backend},202
 
-try: app.view_functions['internal_export_file_r7']=internal_export_file_r35
+try: app.view_functions['internal_export_file_r7']=_internal_export_file_durable
 except Exception: pass
 
 def _r35_process_file_job(job):
@@ -3824,7 +3823,7 @@ def _notify_front_google_result_r38(job,ok,url='',error=''):
 _notify_front_google_result=_notify_front_google_result_r38
 
 
-def process_google_job_r38(job):
+def _process_google_job_core(job):
     jid=str(job.get('id') or '');body=dict(job.get('payload') or {});rec=_r38_google_get(jid);rec.update({'job':job,'status':'running','ok':None,'started_at':time.time()});_r38_google_put(jid,rec,pending=True)
     try:
         url=create_google_sheet(body);rec=_r38_google_get(jid);rec.update({'job':job,'status':'ready','ok':True,'url':url,'error':'','finished_at':time.time()});_r38_google_put(jid,rec,pending=True)
@@ -3918,7 +3917,6 @@ _R39_FILE_SIG_LOCK = threading.RLock()
 _R39_FILE_SIG = {}
 _R39_EXPENSIVE_SEM = threading.Semaphore(max(1, env_int('R39_EXPENSIVE_FILE_CONCURRENCY',1,1,2)))
 _R39_EXPENSIVE_OPS = {'full_state','sqlite','runtime_zip','journal','journal_current'}
-_R39_BASE_PROCESS_FILE_JOB = process_file_job
 
 
 def _r39_file_signature(body):
@@ -4000,13 +3998,13 @@ def _r39_process_file_job(job):
             with _R39_EXPENSIVE_SEM:
                 held=_r42_acquire_slots(_R42_COMPUTE_SLOTS)
                 try:
-                    return _R39_BASE_PROCESS_FILE_JOB(job)
+                    return _process_file_job_core(job)
                 finally:
                     _r42_release_slots(held)
         print(f'[R45 FILE START] {jid} op={op} lane=shared rss={_r42_mem_mb()}MB',flush=True)
         held=_r42_acquire_slots(1)
         try:
-            return _R39_BASE_PROCESS_FILE_JOB(job)
+            return _process_file_job_core(job)
         finally:
             _r42_release_slots(held)
     finally:
@@ -4113,8 +4111,6 @@ _r33_full_state=_r39_full_state
 # Admission-time semantic aliasing makes duplicate_of explicit to FAST.  If a race still
 # reaches the execution queue, HEAVY sends a lightweight alias callback instead of
 # silently closing a job_id that FAST could be waiting on.
-_R40_BASE_INTERNAL_EXPORT_FILE = internal_export_file_r35
-_R40_BASE_PROCESS_GOOGLE_JOB = process_google_job_r38
 
 
 def _r40_find_file_canonical(body,jid):
@@ -4164,7 +4160,7 @@ def internal_export_file_r40():
                 _file_status_put(jid,status='alias',ok=True,duplicate_of=canonical,canonical_job_id=canonical,durable_backend=backend)
                 print(f'[R40 FILE ALIAS ADMISSION] alias={jid} canonical={canonical} op={body.get("operation")}',flush=True)
                 return {'ok':True,'duplicate':True,'status':'alias','job_id':jid,'canonical_job_id':canonical,'duplicate_of':canonical,'durable':True,'durable_backend':backend},202
-        return _R40_BASE_INTERNAL_EXPORT_FILE()
+        return _internal_export_file_durable()
 
 app.view_functions['internal_export_file_r7']=internal_export_file_r40
 
@@ -4238,15 +4234,14 @@ def process_google_job_r40(job):
     body=dict((job or {}).get('payload') or {})
     if str(body.get('operation') or '') in {'google_exact_query','google_period_query','google_tabl_query'}:
         body=_r40_prepare_google_query(body); job=dict(job); job['payload']=body
-    return _R40_BASE_PROCESS_GOOGLE_JOB(job)
+    return _process_google_job_core(job)
 
-_R42_BASE_PROCESS_GOOGLE_JOB=process_google_job_r40
 def process_google_job_r42(job):
     jid=str((job or {}).get('id') or '')
     held=_r42_acquire_slots(1)
     try:
         print(f'[R45 GOOGLE START] {jid} rss={_r42_mem_mb()}MB',flush=True)
-        return _R42_BASE_PROCESS_GOOGLE_JOB(job)
+        return process_google_job_r40(job)
     finally:
         _r42_release_slots(held)
         print(f'[R45 GOOGLE END] {jid} rss={_r42_mem_mb()}MB',flush=True)
@@ -4296,8 +4291,6 @@ else:
 # the same job_id until the real callback, so an HEAVY restart cannot lose work.
 # When FAST has no durable remote outbox, the old synchronous Redis/MEGA admission
 # remains the safety fallback.
-_R41_BASE_FILE_ADMISSION = app.view_functions.get('internal_export_file_r7')
-_R41_BASE_GOOGLE_ADMISSION = app.view_functions.get('internal_google_sheet')
 _R41_PROVISIONAL_FILE_LOCK = threading.RLock()
 _R41_PROVISIONAL_GOOGLE_LOCK = threading.RLock()
 
@@ -4320,7 +4313,7 @@ def internal_export_file_r41():
     if _r41_front_durable(body) and str(body.get('front_release') or '') != 'Пер-R43':
         return {'ok':False,'error':'R42 release barrier: redeploy FAST R42; stale peer job rejected','job_id':str(body.get('job_id') or '')[:80]},409
     if (not _r41_front_durable(body)) or _r41_heavy_redis_live():
-        return _R41_BASE_FILE_ADMISSION()
+        return internal_export_file_r40()
     try: cid=int(body.get('recipient_chat_id') or 0)
     except Exception: cid=0
     if not cid:return {'ok':False,'error':'recipient_chat_id required'},400
@@ -4387,7 +4380,7 @@ def internal_google_sheet_r41():
     if _r41_front_durable(body) and str(body.get('front_release') or '') != 'Пер-R43':
         return {'ok':False,'error':'R42 release barrier: redeploy FAST R42; stale Google job rejected','job_id':str(body.get('job_id') or '')[:80]},409
     if (not _r41_front_durable(body)) or _r41_heavy_redis_live():
-        return _R41_BASE_GOOGLE_ADMISSION()
+        return internal_google_sheet_r38()
     try:body['spreadsheet_id']=_sheet_id(body.get('spreadsheet_id'))
     except Exception as exc:return {'ok':False,'error':str(exc)[:600]},400
     try:cid=int(body.get('recipient_chat_id') or 0)
@@ -4507,9 +4500,6 @@ def _r43_refresh_front_snapshot(job_id=''):
             try:r.close()
             except Exception:pass
 
-_R43_PREV_PROCESS_FILE_JOB = process_file_job
-_R43_PREV_PROCESS_GOOGLE_JOB = process_google_job_r38
-
 def process_file_job_r43(job):
     jid=str((job or {}).get('id') or '')
     body=dict((job or {}).get('payload') or {})
@@ -4521,7 +4511,7 @@ def process_file_job_r43(job):
                 body['required_revision']=0
                 body['r43_snapshot_direct']=True
                 job=dict(job); job['payload']=body
-            return _R43_PREV_PROCESS_FILE_JOB(job)
+            return _r39_process_file_job(job)
         finally:
             try:
                 import gc as _r45_gc
@@ -4541,7 +4531,7 @@ def process_google_job_r43(job):
                 body['required_revision']=0
                 body['r43_snapshot_direct']=True
                 job=dict(job); job['payload']=body
-            return _R43_PREV_PROCESS_GOOGLE_JOB(job)
+            return process_google_job_r42(job)
         finally:
             try:
                 import gc as _r45_gc
@@ -4552,22 +4542,20 @@ process_google_job=process_google_job_r43
 process_google_job_r38=process_google_job_r43
 
 # R43 file admission accepts only current FAST jobs for the direct protocol.
-_R43_BASE_FILE_ADMISSION = app.view_functions.get('internal_export_file_r7')
 def internal_export_file_r43():
     if not authorized(): return {'ok':False},404
     body=request.get_json(silent=True) or {}
     if str(body.get('front_release') or '')!='Пер-R43':
         return {'ok':False,'error':'R43 release barrier: deploy FAST R43','job_id':str(body.get('job_id') or '')[:80]},409
-    return _R43_BASE_FILE_ADMISSION()
+    return internal_export_file_r41()
 app.view_functions['internal_export_file_r7']=internal_export_file_r43
 
-_R43_BASE_GOOGLE_ADMISSION = app.view_functions.get('internal_google_sheet')
 def internal_google_sheet_r43():
     if not authorized(): return {'ok':False},404
     body=request.get_json(silent=True) or {}
     if str(body.get('front_release') or '')!='Пер-R43':
         return {'ok':False,'error':'R43 release barrier: deploy FAST R43','job_id':str(body.get('job_id') or '')[:80]},409
-    return _R43_BASE_GOOGLE_ADMISSION()
+    return internal_google_sheet_r41()
 app.view_functions['internal_google_sheet']=internal_google_sheet_r43
 
 print('[R45 DIRECT] FAST is sole data authority; HEAVY pulls fresh SQLite before every data job; Redis/MEGA job-state daemons are not required',flush=True)

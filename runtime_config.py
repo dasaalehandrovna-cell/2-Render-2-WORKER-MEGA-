@@ -1,4 +1,4 @@
-"""vys-262 R45 stable internal runtime configuration.
+"""vys-262 R47 FINALIZED internal runtime configuration.
 
 All non-secret operational tunables that used to be Render environment variables
 live here.  Render ENV is intentionally reserved for credentials, remote
@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r45-stable-direct"
+CONFIG_VERSION = "vys-262-r47-finalized-heavy"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {
@@ -96,7 +96,7 @@ FRONT_INTERNAL_ENV: Dict[str, str] = {
 # Render #2 / HEAVY.
 WORKER_INTERNAL_ENV: Dict[str, str] = {
     "R43_DIRECT_HEAVY": "1",
-    "HEAVY_HTTP_THREADS": "6",
+    "HEAVY_HTTP_THREADS": "4",
     "PORT": "10000",
     "PEER_PING_ENABLED": "1",
     "PEER_PING_INTERVAL_SEC": "120",
@@ -113,7 +113,7 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
     "WORKER_REDIS_CAPSULE_MAX_MB": "8",
     "WORKER_EVENT_RETENTION_SEC": "604800",
     "WORKER_EVENT_MAX_WIRE_KB": "512",
-    "WORKER_EVENT_REDIS_QUEUE_MAX": "2048",
+    "WORKER_EVENT_REDIS_QUEUE_MAX": "1024",
     "WORKER_EVENT_REDIS_RETRY_MS": "250",
     "WORKER_EVENT_REDIS_RECONCILE_SEC": "5",
     "WORKER_R32_EVENT_RETENTION_SEC": "2592000",
