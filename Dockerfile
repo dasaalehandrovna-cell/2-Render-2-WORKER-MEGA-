@@ -16,4 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # R45: copy the complete HEAVY application into /app before CMD.
 COPY worker_service.py runtime_config.py ./
 
+# R48: compile is not enough; execute module import after dependencies are installed.
+# This catches use-before-definition / bad final-owner aliases during Docker build.
+RUN python -m py_compile worker_service.py runtime_config.py \
+ && python -c "import worker_service as w; assert w.process_file_job.__name__ == 'process_file_job_r43'; assert w.process_google_job.__name__ == 'process_google_job_r43'; assert not w._R48_WORKERS_STARTED; print('R48 HEAVY startup smoke PASS')"
+
 CMD ["python", "worker_service.py"]

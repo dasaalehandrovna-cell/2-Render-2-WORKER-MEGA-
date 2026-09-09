@@ -22,6 +22,7 @@
 ```bash
 python -m compileall -q .
 python FINALIZATION_GATE.py
+# HEAVY: затем обязательный startup/import smoke в окружении requirements.txt
 ```
 
 После упаковки:
@@ -29,6 +30,8 @@ python FINALIZATION_GATE.py
 ```bash
 unzip -t <package>.zip
 ```
+
+HEAVY build acceptance: Dockerfile должен выполнить реальный `import worker_service` и проверить финальных file/Google owners до Deploy.
 
 Production acceptance после deploy: READY без OOM/cgroup max growth, callback ACK/UI без многосекундного wrapper stack, durable outbox сохраняет job при временной недоступности HEAVY.
 

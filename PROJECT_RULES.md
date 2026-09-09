@@ -1,4 +1,4 @@
-# PROJECT_RULES — выс-262 / R47 FINALIZED
+# PROJECT_RULES — выс-262 / R48 FINAL HEAVY
 
 ## Неподвижное правило релиза
 
@@ -17,7 +17,9 @@
 7. HEAVY: export/archive/Google/MEGA/full-state/SQLite-heavy work. Telegram UI не переносится на HEAVY.
 8. `job_id` неизменяем. Повторная доставка того же job — idempotent/deduplicated; неоднозначная ошибка Telegram не разрешает слепую повторную отправку готового результата.
 9. `POST /internal/state/events` остаётся подтверждаемым транспортом состояния; отказ/перезапуск HEAVY не должен блокировать Telegram hot path.
-10. Перед упаковкой обязательны compile, FINALIZATION_GATE, manifest hash check и ZIP CRC test.
+10. Перед упаковкой обязательны compile, FINALIZATION_GATE, startup-import smoke и ZIP CRC test.
+11. Для HEAVY `compileall` недостаточно: Docker build обязан реально выполнить `import worker_service` после `pip install` и проверить финальных владельцев `process_file_job_r43` / `process_google_job_r43`.
+12. Worker threads HEAVY запускаются только после определения финальных R43 owners; запрещён запуск очередей во время импорта модуля.
 
 ## RAM / threads budget FAST
 

@@ -44,8 +44,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-per-r45-stable-heavy'
-TRANSPORT_VERSION = 'vys-262-worker-per-r43-direct-snapshot+r44-diag'
+VERSION = 'vys-262-worker-r48-final-startupfix-heavy'
+TRANSPORT_VERSION = 'vys-262-worker-r48-final-direct-snapshot+r44-diag'
 
 
 def env_bool(name, default=False):
@@ -1781,41 +1781,6 @@ def _notify_front_google_result(job, ok, url='', error=''):
     return False
 
 
-def process_google_job(job):
-    jid = str(job.get('id') or '')
-    body = dict(job.get('payload') or {})
-    _google_status_put(jid, status='running')
-    try:
-        url = create_google_sheet(body)
-        with STATE_LOCK:
-            STATE['google_jobs'] += 1
-            STATE['google_last_ok'] = time.time()
-            STATE['google_last_error'] = ''
-        _google_status_put(jid, status='done', ok=True, url=url)
-        delivered = _notify_front_google_result(job, True, url=url)
-        _google_status_put(jid, callback_delivered=bool(delivered))
-        print(f'[GOOGLE JOB] {jid} ok=True callback={delivered}', flush=True)
-    except Exception as exc:
-        detail = f'{type(exc).__name__}: {str(exc)[:600]}'
-        with STATE_LOCK:
-            STATE['google_failures'] += 1
-            STATE['google_last_error'] = detail[:240]
-        _google_status_put(jid, status='done', ok=False, error=detail)
-        delivered = _notify_front_google_result(job, False, error=detail)
-        _google_status_put(jid, callback_delivered=bool(delivered))
-        print(f'[GOOGLE JOB] {jid} ok=False callback={delivered} {detail}', flush=True)
-
-
-def google_loop():
-    while True:
-        job = GOOGLE_Q.get()
-        try:
-            process_google_job(job)
-        except Exception as exc:
-            print(f'[GOOGLE LOOP ERROR] {type(exc).__name__}: {str(exc)[:300]}', flush=True)
-        finally:
-            GOOGLE_Q.task_done()
-
 
 @app.route('/internal/google/sheet', methods=['POST'])
 def internal_google_sheet():
@@ -2430,14 +2395,6 @@ def _process_file_job_core(job):
         _file_status_put(jid,status='done',ok=False,error=detail)
         _notify_front_export_result(job,False,error=detail)
         print(f'[EXPORT JOB] {jid} ok=False {detail}',flush=True)
-
-
-def file_loop():
-    while True:
-        job=FILE_Q.get()
-        try: process_file_job(job)
-        except Exception as exc: print(f'[EXPORT LOOP ERROR] {type(exc).__name__}: {str(exc)[:300]}',flush=True)
-        finally: FILE_Q.task_done()
 
 
 @app.route('/internal/google/info',methods=['GET'])
@@ -3092,7 +3049,6 @@ def _r33_process_file_job(job):
         print(f'[R45 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
 
 # file_loop resolves this global at execution time.
-process_file_job=_r33_process_file_job
 
 
 def _r33_archive_events_direct(events):
@@ -3436,7 +3392,6 @@ def _r35_process_file_job(job):
         _r35_enqueue_result({'job':job,'ok':False,'extra':{'error':detail}})
         print(f'[R45 HEAVY EXPORT] {jid} failed {detail}',flush=True)
 
-process_file_job=_r35_process_file_job
 
 def file_loop():
     while True:
@@ -3844,18 +3799,6 @@ def _process_google_job_core(job):
             if str(rec.get('durable_backend') or '')=='mega':_r38_google_mega_delete(jid)
         print(f'[R45 GOOGLE JOB] {jid} ok=False callback={delivered} {detail}',flush=True)
 
-process_google_job=process_google_job_r38
-
-
-def google_loop():
-    while True:
-        job=GOOGLE_Q.get();jid=str((job or {}).get('id') or '')
-        try:process_google_job_r38(job)
-        except Exception as exc:print(f'[R38 GOOGLE LOOP ERROR] {type(exc).__name__}: {str(exc)[:300]}',flush=True)
-        finally:
-            with _R38_GOOGLE_ENQUEUED_LOCK:_R38_GOOGLE_ENQUEUED.discard(jid)
-            GOOGLE_Q.task_done()
-
 
 def _r38_google_recover_loop():
     """R42 Google recovery follows the same ownership rule as file jobs."""
@@ -3904,9 +3847,6 @@ def _r38_google_recover_loop():
         except Exception as exc:
             with STATE_LOCK:STATE['google_last_error']=f'R42 recovery {type(exc).__name__}: {str(exc)[:180]}'
         time.sleep(3.0)
-
-if not _R43_DIRECT_HEAVY:
-    threading.Thread(target=_r38_google_recover_loop,name='per-r38-google-recovery',daemon=True).start()
 
 
 # ---------------- Пер-R43 stability / speed patch ----------------
@@ -4020,7 +3960,6 @@ def _r39_process_file_job(job):
                     cur.update({'state':'done','completed_at':time.time(),'status':st}); _R39_FILE_SIG[sig]=cur
         print(f'[R45 FILE END] {jid} op={op} status={st or "unknown"} elapsed={time.time()-started:.2f}s rss={_r42_mem_mb()}MB',flush=True)
 
-process_file_job=_r39_process_file_job
 
 
 def _r39_db_checksum(path):
@@ -4245,42 +4184,8 @@ def process_google_job_r42(job):
     finally:
         _r42_release_slots(held)
         print(f'[R45 GOOGLE END] {jid} rss={_r42_mem_mb()}MB',flush=True)
-process_google_job=process_google_job_r42
-process_google_job_r38=process_google_job_r42
 
-if _R43_DIRECT_HEAVY:
-    # R43 direct worker: one compute lane, two tiny callback lanes, one Google lane.
-    # No Redis/MEGA restore/reconcile/checkpoint/replay daemons are started. Every
-    # data-dependent job pulls one authoritative SQLite snapshot from FAST first.
-    threading.Thread(target=file_loop,name='per-r43-worker-files-1',daemon=True).start()
-    threading.Thread(target=_r35_result_loop,name='per-r43-result-1',daemon=True).start()
-    threading.Thread(target=_r35_result_loop,name='per-r43-result-2',daemon=True).start()
-    threading.Thread(target=google_loop,name='per-r43-worker-google',daemon=True).start()
-    threading.Thread(target=peer_loop,name='per-r43-worker-peer',daemon=True).start()
-    print('[R45 LEAN] direct FAST snapshot mode; old restore/event/checkpoint/recovery daemons disabled',flush=True)
-else:
-    threading.Thread(target=file_loop,name='per-r43-worker-files-1',daemon=True).start()
-    threading.Thread(target=file_loop,name='per-r43-worker-files-2',daemon=True).start()
-    threading.Thread(target=_r35_result_loop,name='per-r43-result-1',daemon=True).start()
-    threading.Thread(target=_r35_result_loop,name='per-r43-result-2',daemon=True).start()
-    threading.Thread(target=_r35_result_loop,name='per-r43-result-3',daemon=True).start()
-    threading.Thread(target=_r35_result_loop,name='per-r43-result-4',daemon=True).start()
-    threading.Thread(target=_capsule_mega_loop_r20,name='vys262-worker-capsule-mega-r20',daemon=True).start()
-    threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
-    threading.Thread(target=_r32_mega_event_loop,name='per-r32-mega-events',daemon=True).start()
-    threading.Thread(target=worker_loop,name='vys262-worker-jobs',daemon=True).start()
-    threading.Thread(target=google_loop,name='vys262-worker-google',daemon=True).start()
-    threading.Thread(target=peer_loop,name='vys262-worker-peer',daemon=True).start()
-    try:
-        _r6_redis_ok, _r6_redis_detail = redis_load_snapshot_to_cache()
-        print(f'[R6 RESTORE CACHE] redis ok={_r6_redis_ok} {_r6_redis_detail}', flush=True)
-    except Exception as _r6_exc:
-        print(f'[R6 RESTORE CACHE] redis error={type(_r6_exc).__name__}: {str(_r6_exc)[:180]}', flush=True)
-    threading.Thread(target=_r35_recover_loop,name='per-r36-job-recovery',daemon=True).start()
-    threading.Thread(target=_restore_refresh_background,name='vys262-worker-mega-warmup',daemon=True).start()
-    threading.Thread(target=_checkpoint_loop_v267,name='vys262-worker-checkpoint-r13',daemon=True).start()
-    threading.Thread(target=_event_reconcile_loop_v268,name='vys262-worker-events-r13',daemon=True).start()
-    threading.Thread(target=_reconcile_hash_loop_v268,name='vys262-worker-reconcile-r13',daemon=True).start()
+# R48: worker threads start only after final R43 owners are defined.
 
 
 
@@ -4539,7 +4444,61 @@ def process_google_job_r43(job):
             except Exception:pass
 
 process_google_job=process_google_job_r43
-process_google_job_r38=process_google_job_r43
+
+def google_loop():
+    """Single Google queue consumer; final owner is already bound before startup."""
+    while True:
+        job=GOOGLE_Q.get(); jid=str((job or {}).get('id') or '')
+        try:
+            process_google_job(job)
+        except Exception as exc:
+            print(f'[R48 GOOGLE LOOP ERROR] {type(exc).__name__}: {str(exc)[:300]}',flush=True)
+        finally:
+            with _R38_GOOGLE_ENQUEUED_LOCK:
+                _R38_GOOGLE_ENQUEUED.discard(jid)
+            GOOGLE_Q.task_done()
+
+_R48_WORKERS_STARTED=False
+_R48_WORKERS_START_LOCK=threading.Lock()
+
+def _start_final_workers():
+    """Start queues only after final R43 file/Google owners exist."""
+    global _R48_WORKERS_STARTED
+    with _R48_WORKERS_START_LOCK:
+        if _R48_WORKERS_STARTED:
+            return
+        _R48_WORKERS_STARTED=True
+    if _R43_DIRECT_HEAVY:
+        threading.Thread(target=file_loop,name='per-r48-worker-files-1',daemon=True).start()
+        threading.Thread(target=_r35_result_loop,name='per-r48-result-1',daemon=True).start()
+        threading.Thread(target=_r35_result_loop,name='per-r48-result-2',daemon=True).start()
+        threading.Thread(target=google_loop,name='per-r48-worker-google',daemon=True).start()
+        threading.Thread(target=peer_loop,name='per-r48-worker-peer',daemon=True).start()
+        print('[R48 HEAVY] final R43 owners active; direct FAST snapshot mode',flush=True)
+        return
+
+    # Legacy non-direct mode is kept only for explicit emergency configuration.
+    threading.Thread(target=file_loop,name='per-r48-worker-files-1',daemon=True).start()
+    threading.Thread(target=file_loop,name='per-r48-worker-files-2',daemon=True).start()
+    for idx in range(1,5):
+        threading.Thread(target=_r35_result_loop,name=f'per-r48-result-{idx}',daemon=True).start()
+    threading.Thread(target=_capsule_mega_loop_r20,name='vys262-worker-capsule-mega-r20',daemon=True).start()
+    threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
+    threading.Thread(target=_r32_mega_event_loop,name='per-r32-mega-events',daemon=True).start()
+    threading.Thread(target=worker_loop,name='vys262-worker-jobs',daemon=True).start()
+    threading.Thread(target=google_loop,name='per-r48-worker-google',daemon=True).start()
+    threading.Thread(target=peer_loop,name='per-r48-worker-peer',daemon=True).start()
+    try:
+        _r6_redis_ok, _r6_redis_detail = redis_load_snapshot_to_cache()
+        print(f'[R6 RESTORE CACHE] redis ok={_r6_redis_ok} {_r6_redis_detail}', flush=True)
+    except Exception as _r6_exc:
+        print(f'[R6 RESTORE CACHE] redis error={type(_r6_exc).__name__}: {str(_r6_exc)[:180]}', flush=True)
+    threading.Thread(target=_r35_recover_loop,name='per-r36-job-recovery',daemon=True).start()
+    threading.Thread(target=_r38_google_recover_loop,name='per-r38-google-recovery',daemon=True).start()
+    threading.Thread(target=_restore_refresh_background,name='vys262-worker-mega-warmup',daemon=True).start()
+    threading.Thread(target=_checkpoint_loop_v267,name='vys262-worker-checkpoint-r13',daemon=True).start()
+    threading.Thread(target=_event_reconcile_loop_v268,name='vys262-worker-events-r13',daemon=True).start()
+    threading.Thread(target=_reconcile_hash_loop_v268,name='vys262-worker-reconcile-r13',daemon=True).start()
 
 # R43 file admission accepts only current FAST jobs for the direct protocol.
 def internal_export_file_r43():
@@ -4757,6 +4716,7 @@ print('[R45 TEST] diagnostic API ready: status/echo/reverse/snapshot/mega-list/m
 print('[R45 STABLE] direct FAST authority; conditional snapshots; cheap SQLite validation; no eager bootstrap',flush=True)
 
 if __name__ == '__main__':
+    _start_final_workers()
     port=env_int('PORT',10000,1,65535)
     try:
         from waitress import serve as _r39_waitress_serve

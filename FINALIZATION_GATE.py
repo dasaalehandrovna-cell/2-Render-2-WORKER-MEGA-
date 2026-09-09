@@ -104,10 +104,55 @@ if ROLE=='fast':
 
 elif ROLE=='heavy':
     s=text('worker_service.py')
+    tree=ast.parse(s)
     ok('heavy_no_prev_orig_base',not re.search(r'\b[A-Za-z0-9_]*_(?:PREV|ORIG|BASE)_[A-Za-z0-9_]*\b',s),'worker_service predecessor capture remains')
     ok('heavy_no_globals_rebind','globals()[' not in s,'worker_service should not monkey-patch globals')
     ok('heavy_final_file_owner',count(r'(?m)^process_file_job\s*=\s*process_file_job_r43\s*$',s)==1,'final R43 file owner')
     ok('heavy_final_google_owner',count(r'(?m)^process_google_job\s*=\s*process_google_job_r43\s*$',s)==1,'final R43 Google owner')
+    ok('heavy_one_file_owner_assignment',count(r'(?m)^process_file_job\s*=',s)==1,'public file owner must be assigned exactly once')
+    ok('heavy_one_google_owner_assignment',count(r'(?m)^process_google_job\s*=',s)==1,'public Google owner must be assigned exactly once')
+    ok('heavy_one_file_loop',count(r'(?m)^def file_loop\(',s)==1,'expected one file_loop')
+    ok('heavy_one_google_loop',count(r'(?m)^def google_loop\(',s)==1,'expected one google_loop')
+    ok('heavy_no_r38_google_alias','process_google_job_r38' not in s,'obsolete Google owner alias remains')
+
+    # Catch the exact class of Render crash that compileall cannot detect: a
+    # module-level public owner assignment referencing a function defined later.
+    seen=set(dir(__builtins__))
+    owner_order_bad=[]
+    for st in tree.body:
+        if isinstance(st,ast.Assign):
+            for target in st.targets:
+                if isinstance(target,ast.Name) and target.id in {'process_file_job','process_google_job'}:
+                    if isinstance(st.value,ast.Name) and st.value.id not in seen:
+                        owner_order_bad.append(f'{target.id}={st.value.id}@{st.lineno}')
+        if isinstance(st,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
+            seen.add(st.name)
+        elif isinstance(st,(ast.Import,ast.ImportFrom)):
+            for a in st.names: seen.add(a.asname or a.name.split('.')[0])
+        elif isinstance(st,ast.Assign):
+            for target in st.targets:
+                if isinstance(target,ast.Name): seen.add(target.id)
+    ok('heavy_owner_definition_order',not owner_order_bad,','.join(owner_order_bad))
+
+    # Worker threads must not start while the module is still defining final
+    # owners. They are started only by _start_final_workers() from __main__.
+    top_thread_starts=[]
+    def has_thread_start(node):
+        for n in ast.walk(node):
+            if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef,ast.Lambda)) and n is not node:
+                continue
+            if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and n.func.attr=='start':
+                base=n.func.value
+                if isinstance(base,ast.Call) and isinstance(base.func,ast.Attribute) and isinstance(base.func.value,ast.Name) and base.func.value.id=='threading' and base.func.attr=='Thread':
+                    return True
+        return False
+    for st in tree.body:
+        if isinstance(st,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): continue
+        if has_thread_start(st): top_thread_starts.append(getattr(st,'lineno',0))
+    ok('heavy_no_module_import_worker_start',not top_thread_starts,str(top_thread_starts))
+    ok('heavy_final_starter','def _start_final_workers(' in s and "if __name__ == '__main__':\n    _start_final_workers()" in s,'final workers must start from executable entrypoint')
+    docker=text('Dockerfile')
+    ok('heavy_docker_startup_smoke','R48 HEAVY startup smoke PASS' in docker and 'import worker_service as w' in docker,'Docker build must execute startup import smoke')
     ok('heavy_state_events_route','/internal/state/events' in s,'state events endpoint missing')
     ns={}; exec(text('runtime_config.py'),ns); env=ns.get('WORKER_INTERNAL_ENV') or {}
     try: threads=int(env.get('HEAVY_HTTP_THREADS',999))

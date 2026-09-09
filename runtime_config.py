@@ -1,4 +1,4 @@
-"""vys-262 R47 FINALIZED internal runtime configuration.
+"""vys-262 R48 FINAL HEAVY internal runtime configuration.
 
 All non-secret operational tunables that used to be Render environment variables
 live here.  Render ENV is intentionally reserved for credentials, remote
@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r47-finalized-heavy"
+CONFIG_VERSION = "vys-262-r48-final-startupfix-heavy"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {
