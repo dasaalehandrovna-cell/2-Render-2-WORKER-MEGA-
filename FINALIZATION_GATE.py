@@ -152,7 +152,7 @@ elif ROLE=='heavy':
     ok('heavy_no_module_import_worker_start',not top_thread_starts,str(top_thread_starts))
     ok('heavy_final_starter','def _start_final_workers(' in s and "if __name__ == '__main__':\n    _start_final_workers()" in s,'final workers must start from executable entrypoint')
     docker=text('Dockerfile')
-    ok('heavy_docker_startup_smoke','R48 HEAVY startup smoke PASS' in docker and 'import worker_service as w' in docker,'Docker build must execute startup import smoke')
+    ok('heavy_docker_startup_smoke','R49 HEAVY startup smoke PASS' in docker and 'import worker_service as w' in docker,'Docker build must execute startup import smoke')
     ok('heavy_state_events_route','/internal/state/events' in s,'state events endpoint missing')
     ns={}; exec(text('runtime_config.py'),ns); env=ns.get('WORKER_INTERNAL_ENV') or {}
     try: threads=int(env.get('HEAVY_HTTP_THREADS',999))
@@ -161,6 +161,15 @@ elif ROLE=='heavy':
     try: q=int(env.get('WORKER_EVENT_REDIS_QUEUE_MAX',999999))
     except Exception: q=999999
     ok('heavy_event_queue',q<=1024,f'WORKER_EVENT_REDIS_QUEUE_MAX={q}')
+    ok('r49_mega_autocreate_explicit',
+       'MEGA_AUTOCREATE_LAYOUT' in s and 'MEGA ROOT RECREATED' in s and 'mega_root_recreated' in s and 'mega_layout_created_dirs' in s,
+       'MEGA layout recreation must be explicit/observable')
+    ok('r49_mega_autocreate_config',
+       str(env.get('MEGA_AUTOCREATE_LAYOUT','')) == '1',
+       f"MEGA_AUTOCREATE_LAYOUT={env.get('MEGA_AUTOCREATE_LAYOUT')}")
+    ok('r49_worker_redis_snapshot_key',
+       'vys262:bot_state:latest_gz' in s and 'redis_load_snapshot_to_cache' in s,
+       'HEAVY emergency cache must understand the same Redis snapshot key')
 else:
     errors.append('cannot detect role')
 

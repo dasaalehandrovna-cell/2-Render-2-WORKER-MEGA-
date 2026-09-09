@@ -87,6 +87,7 @@ STATE = {
     'job_last_id':'', 'job_last_type':'', 'job_last_reason':'', 'job_last_started':0.0, 'job_last_done':0.0, 'job_last_error':'',
     'sync_count':0, 'sync_failures':0, 'last_snapshot_sha256':'', 'last_snapshot_size':0, 'last_snapshot_at':0.0, 'last_full_fetch_started':0.0, 'full_fetch_suppressed':0,
     'last_mega_upload_at':0.0, 'last_restore_download_at':0.0, 'mega_layout_ok':False, 'mega_warmup_ok':False,
+    'mega_root_recreated':False, 'mega_layout_created_dirs':[],
     'google_jobs':0, 'google_failures':0, 'google_last_ok':0.0, 'google_last_error':'',
     'cache_revision':0.0,
     'last_state_token':'', 'active_state_token':'', 'dirty_state_token':'', 'deduped_sync_requests':0,
@@ -428,12 +429,37 @@ def ensure_mega_dir(path):
 
 
 def prepare_mega_layout():
+    """R49: make MEGA layout recreation explicit and observable.
+
+    Redis/HEAVY cache are allowed to restore the bot without MEGA.  When a later
+    disaster-checkpoint needs MEGA and its root was manually removed, HEAVY may
+    recreate it only when MEGA_AUTOCREATE_LAYOUT=1 (default).
+    """
     ok, detail = mega_login()
     if not ok: return False, detail
-    for p in (mega_root(), remote_db_dir(), remote_history_dir()):
-        if not ensure_mega_dir(p): return False, f'cannot create MEGA dir {p}'
-    with STATE_LOCK: STATE['mega_layout_ok'] = True
-    return True, 'MEGA layout ready'
+    paths = (mega_root(), remote_db_dir(), remote_history_dir())
+    missing = [p for p in paths if not mega_exists(p)]
+    if missing and not env_bool('MEGA_AUTOCREATE_LAYOUT', True):
+        with STATE_LOCK:
+            STATE['mega_layout_ok'] = False
+            STATE['mega_root_recreated'] = False
+            STATE['mega_layout_created_dirs'] = []
+        return False, 'MEGA layout missing; autocreate disabled: ' + ', '.join(missing)
+    created = []
+    for p in paths:
+        if mega_exists(p):
+            continue
+        if not ensure_mega_dir(p):
+            return False, f'cannot create MEGA dir {p}'
+        created.append(p)
+    root_recreated = mega_root() in created
+    with STATE_LOCK:
+        STATE['mega_layout_ok'] = True
+        STATE['mega_root_recreated'] = bool(root_recreated)
+        STATE['mega_layout_created_dirs'] = list(created)
+    if root_recreated:
+        print('[R49] MEGA ROOT RECREATED ' + mega_root(), flush=True)
+    return True, ('MEGA layout ready' if not created else 'MEGA layout ready; created=' + ','.join(created))
 
 
 def mega_legacy_roots():

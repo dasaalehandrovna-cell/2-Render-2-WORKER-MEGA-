@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r48-final-startupfix-heavy"
+CONFIG_VERSION = "vys-262-r49-performance-restore-final"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {
@@ -90,6 +90,7 @@ FRONT_INTERNAL_ENV: Dict[str, str] = {
     "TG_DURABLE_ENABLED": "0",
     "MEGA_TIMEOUT": "120",
     "MEGA_LOGIN_TIMEOUT": "120",
+    "MEGA_AUTOCREATE_LAYOUT": "1",
     "SPLIT_GOOGLE_REMOTE_ENABLED": "1",
 }
 
@@ -156,6 +157,7 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
     # MEGA command timeouts
     "MEGA_TIMEOUT": "180",
     "MEGA_LOGIN_TIMEOUT": "120",
+    "MEGA_AUTOCREATE_LAYOUT": "1",
 }
 
 

@@ -1,40 +1,5 @@
-# PATCH_PROTOCOL — PATCH → FINALIZE → TEST → PACKAGE
+# PATCH PROTOCOL HEAVY — R49
 
-## 1. PATCH
+PATCH активного owner → удалить старый alias/wrapper → compile → startup import smoke → FINALIZATION_GATE → ZIP CRC → повторный gate из ZIP.
 
-- Менять только канонический owner функции/маршрута.
-- Для FAST/HEAVY сначала определить сторону ответственности.
-- Не добавлять `PREV/ORIG/BASE` monkey-patch, временный `bot.method = ...` или `globals()[public_name] = ...`.
-- Сохранять wire-contract FAST↔HEAVY и `job_id`.
-
-## 2. FINALIZE
-
-- Удалить заменённые wrappers, captures и compatibility-call-through.
-- Проверить один вход Telegram, один callback extension dispatcher, один Telegram output transport, один MEGA runner и один durable outbox dispatcher.
-- Проверить, что обычный `on_any_message` не обёрнут runtime-wrapper'ами.
-- Ограничить workers/buffers, если новый код создаёт фоновые очереди.
-- Обновить manifest hashes и release metadata.
-
-## 3. TEST
-
-Запускать из корня ZIP до упаковки:
-
-```bash
-python -m compileall -q .
-python FINALIZATION_GATE.py
-# HEAVY: затем обязательный startup/import smoke в окружении requirements.txt
-```
-
-После упаковки:
-
-```bash
-unzip -t <package>.zip
-```
-
-HEAVY build acceptance: Dockerfile должен выполнить реальный `import worker_service` и проверить финальных file/Google owners до Deploy.
-
-Production acceptance после deploy: READY без OOM/cgroup max growth, callback ACK/UI без многосекундного wrapper stack, durable outbox сохраняет job при временной недоступности HEAVY.
-
-## 4. PACKAGE
-
-Упаковывать только после PASS gate. ZIP должен открываться с файлами сервиса прямо в корне, без лишнего внешнего каталога. После PACKAGE код в этом артефакте не изменяется.
+Нельзя добавлять PREV/ORIG/BASE или module-level use-before-definition.
