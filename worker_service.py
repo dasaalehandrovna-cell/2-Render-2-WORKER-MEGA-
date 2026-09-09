@@ -40,12 +40,12 @@ from openpyxl import Workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from runtime_config import install_internal_runtime_config, CONFIG_VERSION as INTERNAL_CONFIG_VERSION
+from runtime_config import install_internal_runtime_config, CONFIG_VERSION as INTERNAL_CONFIG_VERSION, redis_runtime_state, set_redis_runtime_enabled
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r48-final-startupfix-heavy'
-TRANSPORT_VERSION = 'vys-262-worker-r48-final-direct-snapshot+r44-diag'
+VERSION = 'vys-262-worker-r50-legacy-seed-canonical'
+TRANSPORT_VERSION = 'vys-262-worker-r50-direct-snapshot+mega-seed+r44-diag'
 
 
 def env_bool(name, default=False):
@@ -291,7 +291,7 @@ def _event_reconcile_loop_v268():
             with STATE_LOCK: STATE['event_last_error']=f'{type(exc).__name__}: {str(exc)[:180]}'
 
 def _redis_client():
-    global _REDIS_CLIENT
+    global _REDIS_CLIENT, _R44_TEST_REDIS_CLIENT
     if _redis is None:
         return None
     url = str(os.getenv('REDIS_URL','') or '').strip()
@@ -926,7 +926,20 @@ def _download_mega_latest():
                     STATE['last_restore_download_at'] = time.time()
                 if not accept and cache_exists:
                     return CACHE_LATEST, f'MEGA snapshot older than restore cache; kept cache rev={current_revision}'
-                return CACHE_LATEST, 'MEGA latest OK' if idx == 0 else f'MEGA legacy restore cache OK: {remote}'
+                if idx > 0:
+                    # R50 migration invariant: if HEAVY had to bootstrap from a legacy
+                    # root, immediately seed the configured canonical root. Otherwise
+                    # a freshly restarted FAST could see an empty new root forever.
+                    seed_ok, seed_detail = mega_promote_snapshot(CACHE_LATEST)
+                    with STATE_LOCK:
+                        STATE['r50_legacy_seed_ok'] = bool(seed_ok)
+                        STATE['r50_legacy_seed_detail'] = str(seed_detail)[:220]
+                        STATE['r50_legacy_seed_at'] = time.time() if seed_ok else 0.0
+                        if seed_ok:
+                            STATE['last_mega_upload_at'] = time.time()
+                    print(f'[R50 MEGA SEED] source={remote} ok={seed_ok} {seed_detail}', flush=True)
+                    return CACHE_LATEST, f'MEGA legacy restore cache OK: {remote}; canonical_seed={seed_ok} {seed_detail}'
+                return CACHE_LATEST, 'MEGA latest OK'
             finally:
                 shutil.rmtree(work, ignore_errors=True)
         return None, last_detail
@@ -1916,6 +1929,17 @@ def internal_snapshot_upload():
             redis_store_snapshot(CACHE_LATEST, meta, clear_deltas=True)
         except Exception:
             pass
+        promote_sync = str(request.headers.get('X-Snapshot-Promote-Mode') or 'async').strip().lower() == 'sync'
+        if promote_sync:
+            mega_ok, mega_detail = mega_promote_snapshot(incoming)
+            incoming.unlink(missing_ok=True)
+            if not mega_ok:
+                return {'ok':False,'cached':True,'mega_promoted':False,'error':str(mega_detail)[:500],
+                        'revision':float(meta.get('revision') or 0.0)},502
+            return {'ok':True,'cached':True,'queued':False,'mega_promoted':True,'mega_detail':str(mega_detail)[:300],
+                    'size':len(raw),'sha256':str(meta.get('sha256_gz') or ''),
+                    'revision':float(meta.get('revision') or 0.0)},200
+
         job = {
             'id': secrets.token_hex(8), 'type': 'promote_uploaded',
             'reason': str(request.headers.get('X-Snapshot-Reason') or 'front_direct_upload')[:180],
@@ -3078,21 +3102,40 @@ def _r33_process_file_job(job):
 
 
 def _r33_archive_events_direct(events):
-    if not events: return True,'no events',0
+    """Durably archive one immutable state-event batch to MEGA.
+
+    Filename is deterministic, so a retry after a lost HTTP response does not
+    create duplicate remote objects. This is the Redis-free durability path.
+    """
+    if not events:
+        return True,'no events',0
     packed=gzip.compress(json.dumps({'schema':32,'created_at':time.time(),'events':events},ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
-    stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f'); day=datetime.now(timezone.utc).strftime('%Y%m%d'); work=Path(tempfile.mkdtemp(prefix='r33_event_direct_')); local=work/f'events_{stamp}_direct.json.gz'; local.write_bytes(packed)
+    revisions=[int((x or {}).get('revision') or 0) for x in events]
+    min_rev=min(revisions or [0]); max_rev=max(revisions or [0])
+    ids='|'.join(str((x or {}).get('event_id') or '') for x in events)
+    digest=hashlib.sha256((ids+'|'+str(min_rev)+'|'+str(max_rev)).encode('utf-8')).hexdigest()[:16]
+    event_ts=max([float((x or {}).get('created_at') or 0.0) for x in events] or [time.time()]) or time.time()
+    day=datetime.fromtimestamp(event_ts,timezone.utc).strftime('%Y%m%d')
+    name=f'events_{min_rev:012d}_{max_rev:012d}_{digest}.json.gz'
+    work=Path(tempfile.mkdtemp(prefix='r49_event_direct_')); local=work/name; local.write_bytes(packed)
     try:
         with MEGA_LOCK:
             ok,detail=prepare_mega_layout()
             if not ok:return False,detail,0
-            root=_r32_events_mega_dir(); remote_day=root.rstrip('/')+'/'+day
-            if not ensure_mega_dir(root) or not ensure_mega_dir(remote_day): return False,'cannot create R34 event MEGA dir',0
+            root=_r32_events_mega_dir(); remote_day=root.rstrip('/')+'/'+day; remote=remote_day.rstrip('/')+'/'+name
+            if not ensure_mega_dir(root) or not ensure_mega_dir(remote_day): return False,'cannot create R49 event MEGA dir',0
+            if mega_exists(remote):
+                return True,f'MEGA event batch already durable events={len(events)}',len(packed)
             put=run_cmd(['mega-put',str(local),remote_day],timeout=env_int('MEGA_TIMEOUT',180,30,900))
             if put.returncode!=0:return False,'mega-put direct events failed: '+(put.stderr or put.stdout or '')[:180],0
+            if not mega_exists(remote): return False,'MEGA event batch verify failed',0
         with STATE_LOCK:
-            STATE['r33_direct_mega_events']=int(STATE.get('r33_direct_mega_events') or 0)+len(events); STATE['r33_direct_mega_event_bytes']=int(STATE.get('r33_direct_mega_event_bytes') or 0)+len(packed); STATE['r33_last_event_durability']='mega-direct'
-        return True,f'MEGA direct events={len(events)} bytes={len(packed)}',len(packed)
-    finally: shutil.rmtree(work,ignore_errors=True)
+            STATE['r33_direct_mega_events']=int(STATE.get('r33_direct_mega_events') or 0)+len(events)
+            STATE['r33_direct_mega_event_bytes']=int(STATE.get('r33_direct_mega_event_bytes') or 0)+len(packed)
+            STATE['r33_last_event_durability']='mega-direct'
+        return True,f'MEGA direct events={len(events)} bytes={len(packed)} rev={min_rev}-{max_rev}',len(packed)
+    finally:
+        shutil.rmtree(work,ignore_errors=True)
 
 
 def _r34_process_state_event_wire(wire,max_wire):
@@ -3104,12 +3147,16 @@ def _r34_process_state_event_wire(wire,max_wire):
         events=[x for x in events if _r32_event_valid(x)]
         if not events: raise ValueError('no valid events')
     except Exception as exc: return {'ok':False,'error':f'R34 event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
-    # R43 direct mode: state events are only a warm local mirror / rolling-deploy
-    # convenience. FAST is the source of truth and each actual report pulls a fresh
-    # SQLite snapshot, so never block an event POST on Redis/MEGA. This removes the
-    # old synchronous mega-put storm that could kill HEAVY every few minutes.
+    # R49 Redis-free contract: every acknowledged state batch must already be
+    # durable in MEGA. The upload runs on HEAVY, while FAST callbacks only enqueue
+    # descriptors to their background sender.
     if _R43_DIRECT_HEAVY:
-        durable='local-mirror'; new_ids=[]
+        new_ids=[]
+        mok,mdetail,_bytes=_r33_archive_events_direct(events)
+        if not mok:
+            with STATE_LOCK: STATE['r32_state_last_error']=str(mdetail)[:220]
+            return {'ok':False,'error':'R49 MEGA event durability unavailable: '+str(mdetail)[:180]},503
+        durable='mega-direct'
     else:
         durable=''; new_ids=[]; rok,rdetail,new_ids=_r32_redis_store_events(events)
         if rok:
@@ -4661,6 +4708,89 @@ def _r44_mega_immediate(path):
     if path==root:parent=''
     return {'path':path,'parent':parent,'entries':entries,'elapsed':round(time.monotonic()-start,3),'mega_root':root}
 
+@app.route('/internal/restore/failed-tasks', methods=['POST'])
+def internal_restore_failed_tasks():
+    """Recreate v153 failed-task objects in MEGA. Runtime MEGA ownership stays on HEAVY."""
+    if not authorized():
+        return {'ok':False},404
+    body = request.get_json(silent=True) or {}
+    tasks = body.get('tasks') or []
+    if not isinstance(tasks, list) or not tasks or len(tasks) > 50:
+        return {'ok':False,'error':'tasks must contain 1..50 rows'},400
+    work = Path(tempfile.mkdtemp(prefix='r49_failed_restore_'))
+    restored = 0
+    try:
+        with MEGA_LOCK:
+            ok, detail = prepare_mega_layout()
+            if not ok:
+                return {'ok':False,'error':detail},503
+            task_root = mega_root().rstrip('/') + '/' + str(os.getenv('MEGA_TASK_BACKUP_DIR','tasks') or 'tasks').strip('/')
+            remote_dir = task_root.rstrip('/') + '/failed'
+            if not ensure_mega_dir(task_root) or not ensure_mega_dir(remote_dir):
+                return {'ok':False,'error':'cannot prepare MEGA failed-task directory'},503
+            for idx, task in enumerate(tasks):
+                if not isinstance(task, dict):
+                    return {'ok':False,'error':f'task[{idx}] is not an object','restored':restored},400
+                key = str(task.get('_restore_key_v153') or task.get('task_id') or task.get('update_id') or task.get('job_id') or '').strip()
+                if not key:
+                    return {'ok':False,'error':f'task[{idx}] has no key','restored':restored},400
+                safe_key = re.sub(r'[^A-Za-z0-9._-]+','_',key).strip('._-')[:96]
+                if not safe_key:
+                    safe_key = hashlib.sha256(key.encode('utf-8',errors='ignore')).hexdigest()[:24]
+                clean = dict(task); clean.pop('_restore_key_v153',None)
+                name = f'task_{safe_key}.json'
+                local = work / name
+                local.write_text(json.dumps(clean,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+                remote = remote_dir.rstrip('/') + '/' + name
+                if mega_exists(remote):
+                    rm = run_cmd(['mega-rm',remote],timeout=45)
+                    if rm.returncode != 0 and mega_exists(remote):
+                        return {'ok':False,'error':'cannot replace existing failed-task '+name,'restored':restored},502
+                put = run_cmd(['mega-put',str(local),remote_dir],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+                if put.returncode != 0 or not mega_exists(remote):
+                    return {'ok':False,'error':'mega-put failed-task '+name+': '+(put.stderr or put.stdout or '')[:160],'restored':restored},502
+                restored += 1
+        return {'ok':True,'restored':restored,'backend':'heavy-mega'},200
+    finally:
+        shutil.rmtree(work,ignore_errors=True)
+
+
+@app.route('/internal/runtime/redis', methods=['GET','POST'])
+def internal_runtime_redis():
+    """Owner-controlled runtime Redis switch. Packaged default is OFF after every restart."""
+    if not authorized():
+        return {'ok':False},404
+    global _REDIS_CLIENT
+    if request.method == 'POST':
+        body = request.get_json(silent=True) or {}
+        requested = bool(body.get('enabled'))
+        state = set_redis_runtime_enabled(requested)
+        # Drop clients after every transition so no cached connection can bypass OFF.
+        with _REDIS_LOCK:
+            old = _REDIS_CLIENT
+            _REDIS_CLIENT = None
+        try:
+            if old is not None:
+                old.close()
+        except Exception:
+            pass
+        try:
+            with _R44_TEST_REDIS_LOCK:
+                test_old = _R44_TEST_REDIS_CLIENT
+                _R44_TEST_REDIS_CLIENT = None
+            if test_old is not None:
+                try: test_old.close()
+                except Exception: pass
+        except Exception:
+            pass
+        with STATE_LOCK:
+            STATE['redis_cache_ok'] = False
+            STATE['redis_last_error'] = '' if state.get('enabled') else 'runtime Redis disabled by owner'
+    else:
+        state = redis_runtime_state()
+    return {'ok':True,'role':'heavy','redis':state},200
+
+
 @app.route('/internal/r44/test/status',methods=['GET'])
 def r44_test_status():
     if not authorized():return {'ok':False},404
@@ -4669,7 +4799,7 @@ def r44_test_status():
     if mega_cfg:
         try:mega_ok,mega_detail=mega_login()
         except Exception as exc:mega_detail=f'{type(exc).__name__}: {str(exc)[:160]}'
-    payload={'ok':True,'role':'heavy','version':VERSION,'transport':TRANSPORT_VERSION,'direct_mode':bool(_R43_DIRECT_HEAVY),'front_configured':bool(front_base()),'front_url_host':re.sub(r'^https?://','',front_base()).split('/')[0] if front_base() else '', 'mega_configured':mega_cfg,'mega_ok':bool(mega_ok),'mega_detail':str(mega_detail)[:220],'mega_root':mega_root(),'redis_configured':bool(os.getenv('REDIS_URL')),'redis_ok':rclient is not None,'redis_error':_R44_TEST_REDIS_ERROR,'file_queue':FILE_Q.qsize(),'google_queue':GOOGLE_Q.qsize(),'snapshot_state':dict(_R43_SNAPSHOT_STATE)}
+    payload={'ok':True,'role':'heavy','version':VERSION,'transport':TRANSPORT_VERSION,'direct_mode':bool(_R43_DIRECT_HEAVY),'front_configured':bool(front_base()),'front_url_host':re.sub(r'^https?://','',front_base()).split('/')[0] if front_base() else '', 'mega_configured':mega_cfg,'mega_ok':bool(mega_ok),'mega_detail':str(mega_detail)[:220],'mega_root':mega_root(),'redis_configured':bool(redis_runtime_state().get('configured')),'redis_runtime_enabled':bool(redis_runtime_state().get('enabled')),'redis_ok':rclient is not None,'redis_error':_R44_TEST_REDIS_ERROR,'file_queue':FILE_Q.qsize(),'google_queue':GOOGLE_Q.qsize(),'snapshot_state':dict(_R43_SNAPSHOT_STATE)}
     return _r44_test_wrap(payload,200)
 
 @app.route('/internal/r44/test/echo',methods=['POST'])

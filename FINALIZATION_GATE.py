@@ -161,6 +161,19 @@ elif ROLE=='heavy':
     try: q=int(env.get('WORKER_EVENT_REDIS_QUEUE_MAX',999999))
     except Exception: q=999999
     ok('heavy_event_queue',q<=1024,f'WORKER_EVENT_REDIS_QUEUE_MAX={q}')
+    ok('r49_redis_packaged_default_off',
+       '"REDIS_RUNTIME_DEFAULT": "0"' in text('runtime_config.py') and '/internal/runtime/redis' in s,
+       'HEAVY Redis runtime switch/default OFF missing')
+    ok('r49_state_events_mega_durable_without_redis',
+       'def _r33_archive_events_direct' in s and "durable='mega-direct'" in s and
+       "R49 MEGA event durability unavailable" in s,
+       'HEAVY must durably archive state events to MEGA before ACK when Redis is OFF')
+    ok('r49_snapshot_sync_promote',
+       "X-Snapshot-Promote-Mode" in s and 'mega_promote_snapshot(incoming)' in s and "'mega_promoted':True" in s,
+       'exact snapshot sync promotion contract missing')
+    ok('r49_failed_tasks_heavy_mega_owner',
+       '/internal/restore/failed-tasks' in s and 'def internal_restore_failed_tasks' in s,
+       'failed-task MEGA restoration endpoint missing')
     ok('r49_mega_autocreate_explicit',
        'MEGA_AUTOCREATE_LAYOUT' in s and 'MEGA ROOT RECREATED' in s and 'mega_root_recreated' in s and 'mega_layout_created_dirs' in s,
        'MEGA layout recreation must be explicit/observable')

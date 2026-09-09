@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-CONFIG_VERSION = "vys-262-r49-performance-restore-final"
+CONFIG_VERSION = "vys-262-r50-mega-bootstrap-rootfix"
 
 # Render #1 / FAST.  These values were the R13 recommended deployment values.
 FRONT_INTERNAL_ENV: Dict[str, str] = {
@@ -45,6 +45,7 @@ FRONT_INTERNAL_ENV: Dict[str, str] = {
     "QUICK_EXPENSE_REMINDER_MINUTES": "60",
 
     # Shared Redis layout (names/limits are implementation details, not secrets)
+    "REDIS_RUNTIME_DEFAULT": "0",
     "WORKER_REDIS_SNAPSHOT_KEY": "vys262:bot_state:latest_gz",
     "WORKER_REDIS_SNAPSHOT_MAX_MB": "16",
     "WORKER_REDIS_EVENT_PREFIX": "vys262:tg_events:v1",
@@ -78,7 +79,8 @@ FRONT_INTERNAL_ENV: Dict[str, str] = {
     "SPLIT_PREBOOT_CAPTURE_WAIT_SEC": "4.0",
     "SPLIT_BOOT_WORKER_ATTEMPTS": "3",
     "SPLIT_BOOT_WORKER_TIMEOUT": "12",
-    "SPLIT_RESTORE_RETRY_SEC": "20",
+    "SPLIT_RESTORE_RETRY_SEC": "5",
+    "SPLIT_RESTORE_BOOT_ATTEMPTS": "3",
     "SPLIT_FORCE_BOOT_RESTORE": "0",
     "SPLIT_ALLOW_EMPTY_BOOT": "0",
     "SPLIT_EMERGENCY_MEGA": "1",
@@ -103,6 +105,7 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
     "PEER_PING_INTERVAL_SEC": "120",
 
     # Redis keys / retention
+    "REDIS_RUNTIME_DEFAULT": "0",
     "WORKER_REDIS_SNAPSHOT_KEY": "vys262:bot_state:latest_gz",
     "WORKER_REDIS_SNAPSHOT_MAX_MB": "16",
     "WORKER_REDIS_DELTA_KEY": "vys262:bot_state:latest_gz:deltas_v1",
@@ -161,12 +164,51 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
 }
 
 
+
+# R49 root-fix: keep the externally supplied Redis URL private while runtime Redis
+# is OFF by default.  The owner can enable it explicitly from Info without a
+# restart; a restart always returns to the packaged OFF default.
+_REDIS_EXTERNAL_URL = str(os.environ.get("REDIS_URL", "") or "").strip()
+_REDIS_RUNTIME_ENABLED = False
+_REDIS_RUNTIME_INITIALIZED = False
+
+def _apply_redis_runtime_state(enabled: bool) -> None:
+    global _REDIS_RUNTIME_ENABLED
+    requested = bool(enabled)
+    _REDIS_RUNTIME_ENABLED = bool(requested and _REDIS_EXTERNAL_URL)
+    os.environ["REDIS_URL"] = _REDIS_EXTERNAL_URL if _REDIS_RUNTIME_ENABLED else ""
+    os.environ["REDIS_RUNTIME_ENABLED"] = "1" if _REDIS_RUNTIME_ENABLED else "0"
+
+def redis_runtime_state() -> Dict[str, object]:
+    return {
+        "configured": bool(_REDIS_EXTERNAL_URL),
+        "enabled": bool(_REDIS_RUNTIME_ENABLED and _REDIS_EXTERNAL_URL),
+        "default_enabled": False,
+    }
+
+def set_redis_runtime_enabled(enabled: bool) -> Dict[str, object]:
+    _apply_redis_runtime_state(bool(enabled))
+    state = redis_runtime_state()
+    if bool(enabled) and not state["configured"]:
+        state["error"] = "REDIS_URL is not configured in Render"
+    return state
+
+def _init_redis_runtime_default() -> None:
+    global _REDIS_RUNTIME_INITIALIZED
+    if not _REDIS_RUNTIME_INITIALIZED:
+        default_enabled = str(os.environ.get("REDIS_RUNTIME_DEFAULT", "0") or "0").strip().lower() in {"1", "true", "yes", "on", "да"}
+        _apply_redis_runtime_state(default_enabled)
+        _REDIS_RUNTIME_INITIALIZED = True
+    else:
+        _apply_redis_runtime_state(_REDIS_RUNTIME_ENABLED)
+
 def install_internal_runtime_config(role: str) -> Dict[str, str]:
     """Install packaged tunables before the rest of the service reads os.environ."""
     role = str(role or "").strip().lower()
     values = FRONT_INTERNAL_ENV if role == "front" else WORKER_INTERNAL_ENV if role == "worker" else {}
     for key, value in values.items():
         os.environ[str(key)] = str(value)
+    _init_redis_runtime_default()
     os.environ["VYS262_INTERNAL_CONFIG_VERSION"] = CONFIG_VERSION
     return dict(values)
 
