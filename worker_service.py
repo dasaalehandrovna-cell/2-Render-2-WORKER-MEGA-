@@ -1,6 +1,6 @@
 # v262
 #!/usr/bin/env python3
-"""vys-262 Render #2 heavy worker · Пер-R44 DIAG over R43 DIRECT transport.
+"""vys-262 Render #2 heavy worker · Пер-R45 STABLE direct transport.
 
 Responsibilities:
 - mutual peer health ping with Render #1;
@@ -44,7 +44,7 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-per-r44-diag-heavy'
+VERSION = 'vys-262-worker-per-r45-stable-heavy'
 TRANSPORT_VERSION = 'vys-262-worker-per-r43-direct-snapshot+r44-diag'
 
 
@@ -3083,13 +3083,13 @@ def _r33_process_file_job(job):
         job2=dict(job); job2['payload']=body2; job2['payload']['filename']=filename; job2['payload']['caption']=str(body2.get('caption') or '')
         delivered=_notify_front_export_result(job2,True,url=url,filename=filename); _file_status_put(jid,callback_delivered=bool(delivered))
         if delivery in {'drive','google'}: path.unlink(missing_ok=True)
-        print(f'[R39 HEAVY EXPORT] {jid} op={body2.get("operation")} ok=True delivery={delivery} callback={delivered}',flush=True)
+        print(f'[R45 HEAVY EXPORT] {jid} op={body2.get("operation")} ok=True delivery={delivery} callback={delivered}',flush=True)
     except Exception as exc:
         detail=f'{type(exc).__name__}: {str(exc)[:700]}'
         with STATE_LOCK:
             STATE['file_failures']=int(STATE.get('file_failures') or 0)+1; STATE['file_last_error']=detail[:240]; STATE['r33_heavy_export_failures']=int(STATE.get('r33_heavy_export_failures') or 0)+1
         _file_status_put(jid,status='done',ok=False,error=detail); _notify_front_export_result(job,False,error=detail)
-        print(f'[R39 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
+        print(f'[R45 HEAVY EXPORT] {jid} ok=False {detail}',flush=True)
 
 # file_loop resolves this global at execution time.
 process_file_job=_r33_process_file_job
@@ -3428,14 +3428,14 @@ def _r35_process_file_job(job):
         rec=_r35_job_get(jid); rec.update({'status':'ready','ok':True,'job':job2,'path':str(path),'filename':filename,'url':url,'delivery':delivery}); _r35_job_put(jid,rec,pending=True)
         _file_status_put(jid,status='ready',ok=True,path=str(path),filename=filename,url=url,delivery=delivery)
         if not _r35_enqueue_result({'job':job2,'ok':True,'extra':{'url':url,'filename':filename}}): raise RuntimeError('R36 result queue full')
-        print(f'[R39 HEAVY EXPORT] {jid} op={body2.get("operation")} ready delivery={delivery}',flush=True)
+        print(f'[R45 HEAVY EXPORT] {jid} op={body2.get("operation")} ready delivery={delivery}',flush=True)
     except Exception as exc:
         detail=f'{type(exc).__name__}: {str(exc)[:700]}'
         with STATE_LOCK: STATE['file_failures']=int(STATE.get('file_failures') or 0)+1; STATE['file_last_error']=detail[:240]
         rec=_r35_job_get(jid); rec.update({'status':'failed','ok':False,'job':job,'error':detail}); _r35_job_put(jid,rec,pending=True)
         _file_status_put(jid,status='failed',ok=False,error=detail,recipient_chat_id=body.get('recipient_chat_id'),target_chat_id=body.get('target_chat_id'))
         _r35_enqueue_result({'job':job,'ok':False,'extra':{'error':detail}})
-        print(f'[R39 HEAVY EXPORT] {jid} failed {detail}',flush=True)
+        print(f'[R45 HEAVY EXPORT] {jid} failed {detail}',flush=True)
 
 process_file_job=_r35_process_file_job
 
@@ -3835,7 +3835,7 @@ def process_google_job_r38(job):
             if str(rec.get('durable_backend') or '')=='mega':_r38_google_mega_delete(jid)
         else:
             rec.update({'status':'ready','callback_delivered':False});_r38_google_put(jid,rec,pending=True)
-        print(f'[R38 GOOGLE JOB] {jid} ok=True callback={delivered}',flush=True)
+        print(f'[R45 GOOGLE JOB] {jid} ok=True callback={delivered}',flush=True)
     except Exception as exc:
         detail=f'{type(exc).__name__}: {str(exc)[:600]}';rec=_r38_google_get(jid);rec.update({'job':job,'status':'failed','ok':False,'error':detail,'finished_at':time.time()});_r38_google_put(jid,rec,pending=True)
         with STATE_LOCK:STATE['google_failures']=int(STATE.get('google_failures') or 0)+1;STATE['google_last_error']=detail[:240]
@@ -3843,7 +3843,7 @@ def process_google_job_r38(job):
         if delivered:
             rec.update({'status':'closed','callback_delivered':True,'delivered_at':time.time()});_r38_google_put(jid,rec,pending=False)
             if str(rec.get('durable_backend') or '')=='mega':_r38_google_mega_delete(jid)
-        print(f'[R38 GOOGLE JOB] {jid} ok=False callback={delivered} {detail}',flush=True)
+        print(f'[R45 GOOGLE JOB] {jid} ok=False callback={delivered} {detail}',flush=True)
 
 process_google_job=process_google_job_r38
 
@@ -3996,14 +3996,14 @@ def _r39_process_file_job(job):
     started=time.time()
     try:
         if op in _R39_EXPENSIVE_OPS:
-            print(f'[R42 FILE START] {jid} op={op} lane=exclusive rss={_r42_mem_mb()}MB',flush=True)
+            print(f'[R45 FILE START] {jid} op={op} lane=exclusive rss={_r42_mem_mb()}MB',flush=True)
             with _R39_EXPENSIVE_SEM:
                 held=_r42_acquire_slots(_R42_COMPUTE_SLOTS)
                 try:
                     return _R39_BASE_PROCESS_FILE_JOB(job)
                 finally:
                     _r42_release_slots(held)
-        print(f'[R42 FILE START] {jid} op={op} lane=shared rss={_r42_mem_mb()}MB',flush=True)
+        print(f'[R45 FILE START] {jid} op={op} lane=shared rss={_r42_mem_mb()}MB',flush=True)
         held=_r42_acquire_slots(1)
         try:
             return _R39_BASE_PROCESS_FILE_JOB(job)
@@ -4020,7 +4020,7 @@ def _r39_process_file_job(job):
                     _R39_FILE_SIG.pop(sig,None)
                 else:
                     cur.update({'state':'done','completed_at':time.time(),'status':st}); _R39_FILE_SIG[sig]=cur
-        print(f'[R42 FILE END] {jid} op={op} status={st or "unknown"} elapsed={time.time()-started:.2f}s rss={_r42_mem_mb()}MB',flush=True)
+        print(f'[R45 FILE END] {jid} op={op} status={st or "unknown"} elapsed={time.time()-started:.2f}s rss={_r42_mem_mb()}MB',flush=True)
 
 process_file_job=_r39_process_file_job
 
@@ -4245,11 +4245,11 @@ def process_google_job_r42(job):
     jid=str((job or {}).get('id') or '')
     held=_r42_acquire_slots(1)
     try:
-        print(f'[R42 GOOGLE START] {jid} rss={_r42_mem_mb()}MB',flush=True)
+        print(f'[R45 GOOGLE START] {jid} rss={_r42_mem_mb()}MB',flush=True)
         return _R42_BASE_PROCESS_GOOGLE_JOB(job)
     finally:
         _r42_release_slots(held)
-        print(f'[R42 GOOGLE END] {jid} rss={_r42_mem_mb()}MB',flush=True)
+        print(f'[R45 GOOGLE END] {jid} rss={_r42_mem_mb()}MB',flush=True)
 process_google_job=process_google_job_r42
 process_google_job_r38=process_google_job_r42
 
@@ -4262,7 +4262,7 @@ if _R43_DIRECT_HEAVY:
     threading.Thread(target=_r35_result_loop,name='per-r43-result-2',daemon=True).start()
     threading.Thread(target=google_loop,name='per-r43-worker-google',daemon=True).start()
     threading.Thread(target=peer_loop,name='per-r43-worker-peer',daemon=True).start()
-    print('[R43 LEAN] direct FAST snapshot mode; old restore/event/checkpoint/recovery daemons disabled',flush=True)
+    print('[R45 LEAN] direct FAST snapshot mode; old restore/event/checkpoint/recovery daemons disabled',flush=True)
 else:
     threading.Thread(target=file_loop,name='per-r43-worker-files-1',daemon=True).start()
     threading.Thread(target=file_loop,name='per-r43-worker-files-2',daemon=True).start()
@@ -4407,20 +4407,20 @@ def internal_google_sheet_r41():
         job={'id':jid,'type':'google_sheet','created_at':time.time(),'payload':body}
         rec={'job_id':jid,'status':'queued','ok':None,'job':job,'recipient_chat_id':cid,'durable_backend':'front-redis','front_owned':True,'updated_at':time.time()}
         _r38_google_local_put(jid,rec); queued=_r38_google_enqueue(job)
-        print(f'[R43 GOOGLE PROVISIONAL] {jid} queued={int(bool(queued))} front=redis',flush=True)
+        print(f'[R45 GOOGLE PROVISIONAL] {jid} queued={int(bool(queued))} front=redis',flush=True)
         return {'ok':True,'status':'queued','job_id':jid,'queue_size':GOOGLE_Q.qsize(),'queued_now':bool(queued),'provisional':True,'durable':False,'durable_backend':'front-redis'},202
 
 
 app.view_functions['internal_google_sheet']=internal_google_sheet_r41
 
 try:
-    print('[R43 TRANSPORT] two-phase front-owned admission enabled; HEAVY Redis missing no longer blocks on synchronous MEGA for FAST-durable jobs',flush=True)
+    print('[R45 TRANSPORT] two-phase front-owned admission enabled; HEAVY Redis missing no longer blocks on synchronous MEGA for FAST-durable jobs',flush=True)
 except Exception:
     pass
 
 
 try:
-    print(f'[R43 RECOVERY] stale R39-R41 auto-replay disabled; front-owned jobs replay only from FAST; compute_slots={_R42_COMPUTE_SLOTS}',flush=True)
+    print(f'[R45 RECOVERY] stale R39-R41 auto-replay disabled; front-owned jobs replay only from FAST; compute_slots={_R42_COMPUTE_SLOTS}',flush=True)
 except Exception:
     pass
 
@@ -4431,42 +4431,81 @@ except Exception:
 # from FAST (/internal/split/state). This makes FAST the only data authority and turns
 # HEAVY into a deterministic compute service.
 def _r43_refresh_front_snapshot(job_id=''):
+    """R45 direct snapshot fetch.
+
+    FAST is authoritative.  Reuse the local mirror with HTTP 304 when its state token
+    is unchanged.  For a changed snapshot, stream gzip directly into a temp SQLite
+    file and perform only a cheap SQLite header/schema probe; the old full
+    PRAGMA quick_check on every job was unnecessary and could add tens of seconds.
+    """
     base=front_base(); secret=peer_secret()
     if not base or not secret:
-        raise RuntimeError('R43 FRONT_SERVICE_URL/PEER_SHARED_SECRET not configured')
+        raise RuntimeError('R45 FRONT_SERVICE_URL/PEER_SHARED_SECRET not configured')
     with _R43_SNAPSHOT_LOCK:
         started=time.time()
+        prior=str(_R43_SNAPSHOT_STATE.get('last_token') or '')
+        force_full=str(job_id or '').startswith(('r44-test-','r45-test-'))
+        headers={
+            'X-Peer-Secret':secret,
+            'X-R43-Job-Snapshot':'1',
+            'User-Agent':'per-r45-direct-snapshot/'+str(job_id or '')[:24],
+        }
+        if prior and CACHE_DB.exists() and not force_full:
+            headers['X-R45-If-State-Token']=prior
         try:
-            r=requests.get(base+'/internal/split/state',headers={
-                'X-Peer-Secret':secret,
-                'X-R43-Job-Snapshot':'1',
-                'User-Agent':'per-r43-direct-snapshot/'+str(job_id or '')[:24],
-            },timeout=(5,60))
+            r=requests.get(base+'/internal/split/state',headers=headers,timeout=(4,60),stream=True)
+            if r.status_code==304 and prior and CACHE_DB.exists():
+                token=str(r.headers.get('X-Split-State-Token','') or prior)
+                _R43_SNAPSHOT_STATE.update({'last_ok':time.time(),'last_error':'','last_token':token,'reused':int(_R43_SNAPSHOT_STATE.get('reused') or 0)+1})
+                print(f'[R45 SNAPSHOT REUSE] job={str(job_id)[:24]} elapsed={time.time()-started:.2f}s token={token[:32]}',flush=True)
+                return token
             if r.status_code!=200:
                 detail=''
                 try: detail=str((r.json() if r.content else {}).get('error') or (r.json() if r.content else {}).get('busy') or '')
-                except Exception: detail=(r.text or '')[:180]
+                except Exception:
+                    try:detail=(r.text or '')[:180]
+                    except Exception:detail=''
                 raise RuntimeError(f'FAST snapshot HTTP {r.status_code}: {detail[:220]}')
-            payload=bytes(r.content or b'')
-            if len(payload)<100: raise RuntimeError('FAST snapshot empty')
-            tmp=CACHE_DB.with_name('r43_incoming_'+secrets.token_hex(6)+'.sqlite3')
+            tmp=CACHE_DB.with_name('r45_incoming_'+secrets.token_hex(6)+'.sqlite3')
+            written=0
             try:
-                with gzip.GzipFile(fileobj=io.BytesIO(payload),mode='rb') as zin, open(tmp,'wb') as out:
-                    shutil.copyfileobj(zin,out,1024*1024)
-                ok,detail,_meta=_quick_check_db_v267(tmp)
-                if not ok: raise RuntimeError('FAST snapshot invalid: '+str(detail))
+                r.raw.decode_content=False
+                with gzip.GzipFile(fileobj=r.raw,mode='rb') as zin, open(tmp,'wb') as out:
+                    while True:
+                        chunk=zin.read(1024*1024)
+                        if not chunk:break
+                        out.write(chunk);written+=len(chunk)
+                if written<4096:
+                    raise RuntimeError(f'FAST snapshot too small: {written}')
+                with open(tmp,'rb') as fh:
+                    if fh.read(16)!=b'SQLite format 3\x00':
+                        raise RuntimeError('FAST snapshot invalid SQLite header')
+                con=None
+                try:
+                    con=sqlite3.connect(f'file:{tmp}?mode=ro',uri=True,timeout=2)
+                    row=con.execute('PRAGMA schema_version').fetchone()
+                    if row is None:raise RuntimeError('SQLite schema probe returned no row')
+                    con.execute('SELECT name FROM sqlite_master LIMIT 1').fetchone()
+                finally:
+                    try:
+                        if con is not None:con.close()
+                    except Exception:pass
                 CACHE_DB.parent.mkdir(parents=True,exist_ok=True)
                 os.replace(tmp,CACHE_DB)
             finally:
-                try: tmp.unlink(missing_ok=True)
-                except Exception: pass
+                try:tmp.unlink(missing_ok=True)
+                except Exception:pass
             token=str(r.headers.get('X-Split-State-Token','') or '')
-            _R43_SNAPSHOT_STATE.update({'last_ok':time.time(),'last_error':'','last_token':token,'fetches':int(_R43_SNAPSHOT_STATE.get('fetches') or 0)+1,'bytes':int(_R43_SNAPSHOT_STATE.get('bytes') or 0)+len(payload)})
-            print(f'[R43 SNAPSHOT] job={str(job_id)[:24]} bytes={len(payload)} elapsed={time.time()-started:.2f}s token={token[:32]}',flush=True)
+            compressed=int(r.headers.get('Content-Length') or 0)
+            _R43_SNAPSHOT_STATE.update({'last_ok':time.time(),'last_error':'','last_token':token,'fetches':int(_R43_SNAPSHOT_STATE.get('fetches') or 0)+1,'bytes':int(_R43_SNAPSHOT_STATE.get('bytes') or 0)+max(0,compressed),'sqlite_bytes':written})
+            print(f'[R45 SNAPSHOT] job={str(job_id)[:24]} sqlite={written}B wire={compressed or "?"}B elapsed={time.time()-started:.2f}s token={token[:32]}',flush=True)
             return token
         except Exception as exc:
             _R43_SNAPSHOT_STATE['last_error']=f'{type(exc).__name__}: {str(exc)[:220]}'
             raise
+        finally:
+            try:r.close()
+            except Exception:pass
 
 _R43_PREV_PROCESS_FILE_JOB = process_file_job
 _R43_PREV_PROCESS_GOOGLE_JOB = process_google_job_r38
@@ -4476,12 +4515,18 @@ def process_file_job_r43(job):
     body=dict((job or {}).get('payload') or {})
     op=str(body.get('operation') or '')
     with _R43_JOB_LOCK:
-        if _r34_state_dependent_operation(op):
-            _r43_refresh_front_snapshot(jid)
-            body['required_revision']=0
-            body['r43_snapshot_direct']=True
-            job=dict(job); job['payload']=body
-        return _R43_PREV_PROCESS_FILE_JOB(job)
+        try:
+            if _r34_state_dependent_operation(op):
+                _r43_refresh_front_snapshot(jid)
+                body['required_revision']=0
+                body['r43_snapshot_direct']=True
+                job=dict(job); job['payload']=body
+            return _R43_PREV_PROCESS_FILE_JOB(job)
+        finally:
+            try:
+                import gc as _r45_gc
+                body.clear(); _r45_gc.collect()
+            except Exception:pass
 
 process_file_job=process_file_job_r43
 
@@ -4490,12 +4535,18 @@ def process_google_job_r43(job):
     body=dict((job or {}).get('payload') or {})
     op=str(body.get('operation') or '')
     with _R43_JOB_LOCK:
-        if op in {'google_exact_query','google_period_query','google_tabl_query','google_sheet_rows'}:
-            _r43_refresh_front_snapshot(jid)
-            body['required_revision']=0
-            body['r43_snapshot_direct']=True
-            job=dict(job); job['payload']=body
-        return _R43_PREV_PROCESS_GOOGLE_JOB(job)
+        try:
+            if op in {'google_exact_query','google_period_query','google_tabl_query','google_sheet_rows'}:
+                _r43_refresh_front_snapshot(jid)
+                body['required_revision']=0
+                body['r43_snapshot_direct']=True
+                job=dict(job); job['payload']=body
+            return _R43_PREV_PROCESS_GOOGLE_JOB(job)
+        finally:
+            try:
+                import gc as _r45_gc
+                body.clear(); _r45_gc.collect()
+            except Exception:pass
 
 process_google_job=process_google_job_r43
 process_google_job_r38=process_google_job_r43
@@ -4519,7 +4570,7 @@ def internal_google_sheet_r43():
     return _R43_BASE_GOOGLE_ADMISSION()
 app.view_functions['internal_google_sheet']=internal_google_sheet_r43
 
-print('[R43 DIRECT] FAST is sole data authority; HEAVY pulls fresh SQLite before every data job; Redis/MEGA job-state daemons are not required',flush=True)
+print('[R45 DIRECT] FAST is sole data authority; HEAVY pulls fresh SQLite before every data job; Redis/MEGA job-state daemons are not required',flush=True)
 
 def _r43_bootstrap_snapshot_loop():
     # During HEAVY-first deploy the previous FAST instance is still live. Seed one
@@ -4537,7 +4588,7 @@ def _r43_bootstrap_snapshot_loop():
     print('[R43 BOOTSTRAP] FAST snapshot unavailable; will fetch on first real job',flush=True)
 
 if _R43_DIRECT_HEAVY:
-    threading.Thread(target=_r43_bootstrap_snapshot_loop,name='per-r43-bootstrap-snapshot',daemon=True).start()
+    print('[R45 BOOTSTRAP] eager snapshot skipped; first real data job pulls FAST state',flush=True)
 
 # ---------------------------------------------------------------------------
 # R44 DIAGNOSTIC INTEROP API
@@ -4712,21 +4763,23 @@ def r44_test_mega_file():
     except Exception as exc:
         shutil.rmtree(work,ignore_errors=True);return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:500]}'},500
 
-print('[R44 TEST] diagnostic API ready: status/echo/reverse/snapshot/mega-list/mega-file; Redis is optional and test-only',flush=True)
+print('[R45 TEST] diagnostic API ready: status/echo/reverse/snapshot/mega-list/mega-file; Redis optional/test-only; probes do not block FAST callbacks',flush=True)
 
+
+print('[R45 STABLE] direct FAST authority; conditional snapshots; cheap SQLite validation; no eager bootstrap',flush=True)
 
 if __name__ == '__main__':
     port=env_int('PORT',10000,1,65535)
     try:
         from waitress import serve as _r39_waitress_serve
         threads=env_int('HEAVY_HTTP_THREADS',8,4,32)
-        print(f'[R43 HTTP] waitress host=0.0.0.0 port={port} threads={threads}',flush=True)
+        print(f'[R45 HTTP] waitress host=0.0.0.0 port={port} threads={threads}',flush=True)
         _r39_waitress_serve(app,host='0.0.0.0',port=port,threads=threads,channel_timeout=120,cleanup_interval=15)
     except Exception as exc:
-        print(f'[R43 WAITRESS FALLBACK] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
+        print(f'[R45 WAITRESS FALLBACK] {type(exc).__name__}: {str(exc)[:220]}',flush=True)
         try:
             from werkzeug.serving import make_server as _r39_make_server
-            print(f'[R43 HTTP] werkzeug-threaded fallback host=0.0.0.0 port={port}',flush=True)
+            print(f'[R45 HTTP] werkzeug-threaded fallback host=0.0.0.0 port={port}',flush=True)
             _r39_make_server('0.0.0.0',port,app,threaded=True).serve_forever()
         except Exception as exc2:
             print(f'[R41 HTTP EMERGENCY] {type(exc2).__name__}: {str(exc2)[:220]}',flush=True)
