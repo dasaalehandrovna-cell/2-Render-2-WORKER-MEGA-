@@ -44,8 +44,8 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r50-legacy-seed-canonical'
-TRANSPORT_VERSION = 'vys-262-worker-r50-direct-snapshot+mega-seed+r44-diag'
+VERSION = 'vys-262-worker-r51-final-tail-mirror'
+TRANSPORT_VERSION = 'vys-262-worker-r51-revision-mirror+sync-shutdown+current-journal'
 
 
 def env_bool(name, default=False):
@@ -58,7 +58,7 @@ def env_int(name, default, lo, hi):
 _R43_DIRECT_HEAVY = env_bool('R43_DIRECT_HEAVY', True)
 _R43_JOB_LOCK = threading.RLock()
 _R43_SNAPSHOT_LOCK = threading.RLock()
-_R43_SNAPSHOT_STATE = {'last_ok':0.0,'last_error':'','last_token':'','fetches':0,'bytes':0}
+_R43_SNAPSHOT_STATE = {'last_ok':0.0,'last_error':'','last_token':'','fetches':0,'bytes':0,'covered_revision':0}
 
 def peer_secret(): return str(os.getenv('PEER_SHARED_SECRET','') or '').strip()
 def authorized():
@@ -2953,29 +2953,61 @@ def _r33_mega_find(pattern,limit=400):
 
 
 def _r33_journal(body,jid,current=False):
-    limit=max(100,min(20000,int(body.get('limit') or 5000))); paths=_r33_mega_find('journal_*.json.gz',min(300,limit))
-    out=FILE_DIR/f'{jid}.txt'; lines=[('ЖУРНАЛ ТЕКУЩЕЙ ВЕРСИИ · Пер-R43' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ · Пер-R43'),f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',f'MEGA файлов: {len(paths)}','']
+    """Build full or current-deploy journal from durable MEGA chunks.
+
+    R51 current journal is scoped by the actual FAST Render instance (or commit as a
+    fallback), never by a hard-coded historical release marker such as R43.
+    """
+    limit=max(100,min(20000,int(body.get('limit') or 5000)))
+    paths=_r33_mega_find('journal_*.json.gz',min(300,limit))
+    out=FILE_DIR/f'{jid}.txt'
     snap=body.get('front_runtime_snapshot') if isinstance(body.get('front_runtime_snapshot'),dict) else {}
-    if snap: lines.extend(['--- FAST Render #1 snapshot ---',json.dumps(snap,ensure_ascii=False,indent=2,default=str),'--- end FAST snapshot ---',''])
-    work=Path(tempfile.mkdtemp(prefix='r33_journal_'))
+    current_instance=str(snap.get('render_instance_id') or '')
+    current_commit=str(snap.get('render_git_commit') or '')
+    current_bot_version=str(snap.get('bot_version') or '')
+    lines=[('ЖУРНАЛ ТЕКУЩЕГО ДЕПЛОЯ' if current else 'МАКСИМАЛЬНЫЙ ЖУРНАЛ'),
+           f'Создано: {datetime.now(timezone.utc).isoformat(timespec="seconds")}',
+           f'MEGA файлов: {len(paths)}','']
+    if snap:
+        lines.extend(['--- FAST Render #1 snapshot ---',json.dumps(snap,ensure_ascii=False,indent=2,default=str),'--- end FAST snapshot ---',''])
+    work=Path(tempfile.mkdtemp(prefix='r51_journal_'))
+    matched_chunks=0
     try:
         with MEGA_LOCK:
             for remote in paths:
                 if len(lines)>=limit+4: break
-                d=work/secrets.token_hex(4); d.mkdir(parents=True,exist_ok=True); g=run_cmd(['mega-get',remote,str(d)],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+                d=work/secrets.token_hex(4); d.mkdir(parents=True,exist_ok=True)
+                g=run_cmd(['mega-get',remote,str(d)],timeout=env_int('MEGA_TIMEOUT',180,30,900))
                 if g.returncode!=0: continue
                 for f in d.rglob('*.gz'):
                     try:
-                        raw=gzip.decompress(f.read_bytes()).decode('utf-8','replace')
-                        # Preserve text/JSON as-is; current journal prefers lines mentioning current release.
-                        for line in raw.splitlines():
-                            if current and ('Пер-R43' not in line and 'r34' not in line.casefold()): continue
-                            lines.append(line)
+                        doc=json.loads(gzip.decompress(f.read_bytes()).decode('utf-8','replace'))
+                        if not isinstance(doc,dict): continue
+                        if current:
+                            doc_instance=str(doc.get('render_instance_id') or '')
+                            doc_commit=str(doc.get('render_git_commit') or '')
+                            doc_version=str(doc.get('bot_version') or '')
+                            if current_instance:
+                                if doc_instance!=current_instance: continue
+                            elif current_commit:
+                                if doc_commit!=current_commit: continue
+                            elif current_bot_version:
+                                if doc_version!=current_bot_version: continue
+                        rows=doc.get('rows') if isinstance(doc.get('rows'),list) else []
+                        if not rows: continue
+                        matched_chunks+=1
+                        for row in rows:
+                            if not isinstance(row,dict): continue
+                            lines.append(json.dumps(row,ensure_ascii=False,separators=(',',':'),default=str))
                             if len(lines)>=limit+4: break
-                    except Exception: pass
-        if current and len(lines)<=4: lines.append('В MEGA ещё нет строк текущего деплоя Пер-R43.')
-        out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); return out,('Журнал_текущей_версии_Пер-R43.txt' if current else 'Журнал_бота_Пер-R43.txt')
-    finally: shutil.rmtree(work,ignore_errors=True)
+                    except Exception:
+                        pass
+        if current and matched_chunks==0:
+            lines.append('В MEGA ещё нет журнальных строк текущего Render-деплоя.')
+        out.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+        return out,('Журнал_текущего_деплоя.txt' if current else 'Журнал_бота.txt')
+    finally:
+        shutil.rmtree(work,ignore_errors=True)
 
 
 def _r33_runtime_zip(body,jid):
@@ -4401,7 +4433,7 @@ except Exception:
 # file/Google job it downloads one transactionally consistent SQLite gzip directly
 # from FAST (/internal/split/state). This makes FAST the only data authority and turns
 # HEAVY into a deterministic compute service.
-def _r43_refresh_front_snapshot(job_id=''):
+def _r43_refresh_front_snapshot(job_id='', required_revision=0):
     """R45 direct snapshot fetch.
 
     FAST is authoritative.  Reuse the local mirror with HTTP 304 when its state token
@@ -4427,7 +4459,8 @@ def _r43_refresh_front_snapshot(job_id=''):
             r=requests.get(base+'/internal/split/state',headers=headers,timeout=(4,60),stream=True)
             if r.status_code==304 and prior and CACHE_DB.exists():
                 token=str(r.headers.get('X-Split-State-Token','') or prior)
-                _R43_SNAPSHOT_STATE.update({'last_ok':time.time(),'last_error':'','last_token':token,'reused':int(_R43_SNAPSHOT_STATE.get('reused') or 0)+1})
+                _R43_SNAPSHOT_STATE.update({'last_ok':time.time(),'last_error':'','last_token':token,'reused':int(_R43_SNAPSHOT_STATE.get('reused') or 0)+1,
+                                             'covered_revision':max(int(_R43_SNAPSHOT_STATE.get('covered_revision') or 0),int(required_revision or 0))})
                 print(f'[R45 SNAPSHOT REUSE] job={str(job_id)[:24]} elapsed={time.time()-started:.2f}s token={token[:32]}',flush=True)
                 return token
             if r.status_code!=200:
@@ -4468,7 +4501,8 @@ def _r43_refresh_front_snapshot(job_id=''):
                 except Exception:pass
             token=str(r.headers.get('X-Split-State-Token','') or '')
             compressed=int(r.headers.get('Content-Length') or 0)
-            _R43_SNAPSHOT_STATE.update({'last_ok':time.time(),'last_error':'','last_token':token,'fetches':int(_R43_SNAPSHOT_STATE.get('fetches') or 0)+1,'bytes':int(_R43_SNAPSHOT_STATE.get('bytes') or 0)+max(0,compressed),'sqlite_bytes':written})
+            _R43_SNAPSHOT_STATE.update({'last_ok':time.time(),'last_error':'','last_token':token,'fetches':int(_R43_SNAPSHOT_STATE.get('fetches') or 0)+1,'bytes':int(_R43_SNAPSHOT_STATE.get('bytes') or 0)+max(0,compressed),'sqlite_bytes':written,
+                                         'covered_revision':max(int(_R43_SNAPSHOT_STATE.get('covered_revision') or 0),int(required_revision or 0))})
             print(f'[R45 SNAPSHOT] job={str(job_id)[:24]} sqlite={written}B wire={compressed or "?"}B elapsed={time.time()-started:.2f}s token={token[:32]}',flush=True)
             return token
         except Exception as exc:
@@ -4478,6 +4512,22 @@ def _r43_refresh_front_snapshot(job_id=''):
             try:r.close()
             except Exception:pass
 
+def _r51_mirror_covers_required_revision(body):
+    """Reuse only a revision range proven by a prior exact FAST snapshot.
+
+    Do not infer completeness from MAX(event revision): revisions are time_ns values and
+    different shards may arrive independently.  `covered_revision` advances only when
+    an exact /internal/split/state image (or its 304-equivalent) has covered that job's
+    revision fence.
+    """
+    try: required=int((body or {}).get('required_revision') or 0)
+    except Exception: required=0
+    covered=int(_R43_SNAPSHOT_STATE.get('covered_revision') or 0)
+    if required<=0 or not CACHE_DB.exists():
+        return False,required,covered
+    return bool(covered>=required),required,covered
+
+
 def process_file_job_r43(job):
     jid=str((job or {}).get('id') or '')
     body=dict((job or {}).get('payload') or {})
@@ -4485,9 +4535,15 @@ def process_file_job_r43(job):
     with _R43_JOB_LOCK:
         try:
             if _r34_state_dependent_operation(op):
-                _r43_refresh_front_snapshot(jid)
-                body['required_revision']=0
-                body['r43_snapshot_direct']=True
+                covered,required,current=_r51_mirror_covers_required_revision(body)
+                if covered:
+                    print(f'[R51 MIRROR REUSE] file job={jid[:24]} required={required} applied={current}',flush=True)
+                    body['required_revision']=0
+                    body['r51_mirror_reused']=True
+                else:
+                    _r43_refresh_front_snapshot(jid, required_revision=required)
+                    body['required_revision']=0
+                    body['r43_snapshot_direct']=True
                 job=dict(job); job['payload']=body
             return _r39_process_file_job(job)
         finally:
@@ -4504,10 +4560,18 @@ def process_google_job_r43(job):
     op=str(body.get('operation') or '')
     with _R43_JOB_LOCK:
         try:
-            if op in {'google_exact_query','google_period_query','google_tabl_query','google_sheet_rows'}:
-                _r43_refresh_front_snapshot(jid)
-                body['required_revision']=0
-                body['r43_snapshot_direct']=True
+            # google_sheet_rows already contains its complete row payload and must not
+            # trigger a business-state snapshot at all.
+            if op in {'google_exact_query','google_period_query','google_tabl_query'}:
+                covered,required,current=_r51_mirror_covers_required_revision(body)
+                if covered:
+                    print(f'[R51 MIRROR REUSE] google job={jid[:24]} required={required} applied={current}',flush=True)
+                    body['required_revision']=0
+                    body['r51_mirror_reused']=True
+                else:
+                    _r43_refresh_front_snapshot(jid, required_revision=required)
+                    body['required_revision']=0
+                    body['r43_snapshot_direct']=True
                 job=dict(job); job['payload']=body
             return process_google_job_r42(job)
         finally:
