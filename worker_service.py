@@ -303,6 +303,18 @@ def _event_reconcile_loop_v268():
     while True:
         time.sleep(env_int('WORKER_EVENT_REDIS_RECONCILE_SEC',5,1,300))
         try:
+            if not str(os.getenv('REDIS_URL','') or '').strip() or _redis is None:
+                try:
+                    _event_db_init_v268()
+                    with EVENT_LOCK:
+                        conn=sqlite3.connect(EVENT_DB,timeout=10)
+                        pending=int(conn.execute("SELECT COUNT(*) FROM events WHERE state IN ('received','failed_retry','committed')").fetchone()[0])
+                        conn.close()
+                    with STATE_LOCK:
+                        STATE['event_pending']=pending; STATE['event_last_error']=''
+                except Exception:
+                    pass
+                continue
             _event_hydrate_pending_from_redis_v268(500)
             # R15: any Worker-local event not yet guaranteed in Redis is retried here.
             _event_db_init_v268()
@@ -1704,15 +1716,24 @@ def internal_event_receipt_v268():
     row['state']='received'; row['received_at']=float(row.get('received_at') or time.time()); row['updated_at']=time.time()
     if not _event_local_upsert_v268(row):
         return {'ok':False,'error':'worker local event journal failed'},503
-    queued=_event_redis_enqueue_v270(row)
-    if not queued:
-        rok,rdetail=_event_redis_store_v268(row)
-        if not rok:
-            with STATE_LOCK: STATE['event_last_error']=str(rdetail)[:220]
-            return {'ok':False,'error':'event witness queue+Redis failed: '+str(rdetail)[:180]},503
+    # R54 Redis-OFF contract: the user's explicit Redis switch must not eventually
+    # fill EVENT_REDIS_Q and turn every normal Telegram message into HTTP 503.
+    # Worker-local SQLite is FULL-synchronous and is enough for raw-update witness;
+    # committed business state is independently mirrored through the R32 MEGA stream.
+    redis_enabled = bool(str(os.getenv('REDIS_URL','') or '').strip()) and (_redis is not None)
+    if redis_enabled:
+        queued=_event_redis_enqueue_v270(row)
+        if not queued:
+            rok,rdetail=_event_redis_store_v268(row)
+            if not rok:
+                with STATE_LOCK: STATE['event_last_error']=str(rdetail)[:220]
+                return {'ok':False,'error':'event witness queue+Redis failed: '+str(rdetail)[:180]},503
+        durability='worker_local+redis_async'
+    else:
+        durability='worker_local_redis_off'
     with STATE_LOCK:
         STATE['event_received']=int(STATE.get('event_received') or 0)+1; STATE['event_last_at']=time.time(); STATE['event_last_error']=''
-    return {'ok':True,'event_id':eid,'state':'received','durable':'worker_local+redis_async'},200
+    return {'ok':True,'event_id':eid,'state':'received','durable':durability},200
 
 @app.route('/internal/event/commit', methods=['POST'])
 def internal_event_commit_v268():
@@ -1722,12 +1743,19 @@ def internal_event_commit_v268():
     state='committed' if str(row.get('state') or '')=='committed' else 'failed_retry'
     row.update({'event_id':eid,'update_id':str(row.get('update_id') or eid),'state':state,'updated_at':time.time()})
     if state=='committed' and not float(row.get('committed_at') or 0.0): row['committed_at']=time.time()
-    _event_local_upsert_v268(row); rok,rdetail=_event_redis_store_v268(row)
-    if not rok: return {'ok':False,'error':'Redis event update failed: '+str(rdetail)[:180]},503
+    if not _event_local_upsert_v268(row):
+        return {'ok':False,'error':'worker local event commit journal failed'},503
+    redis_enabled = bool(str(os.getenv('REDIS_URL','') or '').strip()) and (_redis is not None)
+    if redis_enabled:
+        rok,rdetail=_event_redis_store_v268(row)
+        if not rok: return {'ok':False,'error':'Redis event update failed: '+str(rdetail)[:180]},503
+        durability='worker_local+redis'
+    else:
+        durability='worker_local_redis_off'
     with STATE_LOCK:
         if state=='committed': STATE['event_committed']=int(STATE.get('event_committed') or 0)+1
         STATE['event_last_at']=time.time(); STATE['event_last_error']=''
-    return {'ok':True,'event_id':eid,'state':state},200
+    return {'ok':True,'event_id':eid,'state':state,'durable':durability},200
 
 @app.route('/internal/events/pending', methods=['GET'])
 def internal_events_pending_v268():
