@@ -44,8 +44,40 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r51-final-tail-mirror'
-TRANSPORT_VERSION = 'vys-262-worker-r51-revision-mirror+sync-shutdown+current-journal'
+VERSION = 'vys-262-worker-r52-forensic'
+TRANSPORT_VERSION = 'vys-262-worker-r52-forensic-transport'
+R52_FORENSIC_LOG = str(os.getenv('R52_FORENSIC_LOG','1') or '1').strip().lower() not in {'0','false','no','off'}
+
+def _r52h(event, **fields):
+    if not R52_FORENSIC_LOG: return
+    try:
+        parts=[f'R52DIAG HEAVY event={str(event or "?")[:80]}',f'mono={time.monotonic():.3f}',f'thread={threading.current_thread().name}',f'tid={threading.get_ident()}']
+        for k,v in fields.items():
+            low=str(k).casefold()
+            if any(x in low for x in ('token','secret','password','authorization','cookie','session','credential','private_key')): v='<redacted>'
+            if isinstance(v,(dict,list,tuple,set)): v=json.dumps(v,ensure_ascii=False,separators=(',',':'),default=str)
+            text=str(v if v is not None else '').replace('\n','\\n').replace('\r','\\r')
+            parts.append(f'{str(k)[:60]}={text[:900]}')
+        print(' '.join(parts),flush=True)
+    except Exception: pass
+
+@app.before_request
+def _r52h_http_enter():
+    if not R52_FORENSIC_LOG: return None
+    try:
+        request.environ['r52.started_mono']=time.monotonic()
+        _r52h('HTTP_IN',method=request.method,path=request.path,content_length=request.content_length or 0,user_agent=str(request.headers.get('User-Agent') or '')[:180],job_q=JOB_Q.qsize() if 'JOB_Q' in globals() else -1,google_q=GOOGLE_Q.qsize() if 'GOOGLE_Q' in globals() else -1)
+    except Exception: pass
+    return None
+
+@app.after_request
+def _r52h_http_exit(response):
+    if R52_FORENSIC_LOG:
+        try:
+            started=float(request.environ.get('r52.started_mono') or time.monotonic())
+            _r52h('HTTP_OUT',method=request.method,path=request.path,status=getattr(response,'status_code',0),elapsed=time.monotonic()-started,content_length=getattr(response,'content_length',None),job_q=JOB_Q.qsize() if 'JOB_Q' in globals() else -1,google_q=GOOGLE_Q.qsize() if 'GOOGLE_Q' in globals() else -1)
+        except Exception: pass
+    return response
 
 
 def env_bool(name, default=False):
