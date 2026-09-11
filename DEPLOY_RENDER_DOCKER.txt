@@ -1,4 +1,4 @@
-RENDER №2 WORKER — ОБЯЗАТЕЛЬНО
+RENDER №2 WORKER — ОБЯЗАТЕЛЬНО_
 1. Render Dashboard -> service render-2-worker-mega -> Settings -> Build -> Source -> Edit.
 2. Runtime = Docker.
 3. Dockerfile Path = ./Dockerfile (если поле показывается).
