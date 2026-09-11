@@ -44,7 +44,7 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r52-forensic'
+VERSION = 'vys-262-worker-r60-redis-logical-modes-inspector'
 TRANSPORT_VERSION = 'vys-262-worker-r52-forensic-transport'
 R52_FORENSIC_LOG = str(os.getenv('R52_FORENSIC_LOG','1') or '1').strip().lower() not in {'0','false','no','off'}
 
@@ -83,6 +83,10 @@ def _r52h_http_exit(response):
 def env_bool(name, default=False):
     return str(os.getenv(name, '1' if default else '0') or '').strip().lower() in {'1','true','yes','on','да'}
 
+def mega_enabled():
+    return env_bool('MEGA_ENABLED', True)
+
+
 def env_int(name, default, lo, hi):
     try: return max(lo, min(hi, int(os.getenv(name, str(default)) or str(default))))
     except Exception: return default
@@ -105,10 +109,30 @@ def front_base():
         looks_private = private or raw.endswith('.internal') or '.internal:' in raw or (raw.startswith('render-') and ':' in raw)
         raw = ('http://' if looks_private else 'https://') + raw
     return raw
-def mega_root(): return '/' + str(os.getenv('MEGA_BACKUP_DIR','TelegramBotBackups2-2') or 'TelegramBotBackups2-2').strip('/')
+def mega_root():
+    """R58: the only permitted MEGA namespace is Render MEGA_BACKUP_DIR."""
+    raw = str(os.getenv('MEGA_BACKUP_DIR','') or '').strip().replace('\\','/')
+    if not raw.strip('/'):
+        if mega_enabled():
+            raise RuntimeError('MEGA_ENABLED=1 requires MEGA_BACKUP_DIR in Render; strict root policy refuses defaults')
+        return '/__MEGA_DISABLED__'
+    return '/' + raw.strip('/')
+
+
+def _mega_path_within_root(path):
+    root = mega_root().rstrip('/')
+    value = '/' + str(path or '').strip().strip('/')
+    return value == root or value.startswith(root + '/')
 def remote_db_dir(): return mega_root().rstrip('/') + '/database'
 def remote_latest(): return remote_db_dir().rstrip('/') + '/latest_bot_state.sqlite3.gz'
 def remote_history_dir(): return remote_db_dir().rstrip('/') + '/history'
+
+# R58 fail closed: with MEGA enabled there must be exactly one explicit Render root.
+if mega_enabled():
+    _R58_STRICT_MEGA_ROOT = mega_root()
+    print(f'[R58 MEGA] STRICT ROOT locked to {_R58_STRICT_MEGA_ROOT}', flush=True)
+else:
+    _R58_STRICT_MEGA_ROOT = str(os.getenv('MEGA_BACKUP_DIR','') or '').strip()
 
 STATE_LOCK = threading.RLock()
 MEGA_LOCK = threading.RLock()
@@ -431,10 +455,14 @@ def redis_load_snapshot_to_cache():
 
 
 def run_cmd(args, timeout=120):
+    if args and str(args[0]).startswith('mega-') and not mega_enabled():
+        return subprocess.CompletedProcess(args, 90, '', 'MEGA disabled by MEGA_ENABLED=0')
     return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
 
 
 def mega_login():
+    if not mega_enabled():
+        return False, 'MEGA disabled by MEGA_ENABLED=0'
     login_timeout = env_int('MEGA_LOGIN_TIMEOUT',120,30,300)
     try:
         who = run_cmd(['mega-whoami'], timeout=min(20,login_timeout))
@@ -507,21 +535,13 @@ def prepare_mega_layout():
 
 
 def mega_legacy_roots():
-    raw = str(os.getenv('MEGA_LEGACY_BACKUP_DIRS','/TelegramBotBackups-2T,/TelegramBotBackups') or '')
-    out = []
-    current = mega_root()
-    for item in raw.split(','):
-        item = '/' + str(item or '').strip().strip('/')
-        if item != '/' and item != current and item not in out:
-            out.append(item)
-    return out
+    # R58: legacy roots are intentionally disabled.
+    return []
 
 
 def mega_restore_candidates():
-    rows = [remote_latest()]
-    for root in mega_legacy_roots():
-        rows.append(root.rstrip('/') + '/database/latest_bot_state.sqlite3.gz')
-    return rows
+    # R58: restore may read only the configured Render root.
+    return [remote_latest()]
 
 
 def quick_check_gzip(gz_path: Path):
@@ -833,6 +853,8 @@ def fetch_front_snapshot():
 
 
 def mega_promote_snapshot(local_gz: Path):
+    if not mega_enabled():
+        return True, 'MEGA disabled by MEGA_ENABLED=0; local cache only'
     with MEGA_LOCK:
         ok, detail = prepare_mega_layout()
         if not ok: return False, detail
@@ -970,20 +992,7 @@ def _download_mega_latest():
                     STATE['last_restore_download_at'] = time.time()
                 if not accept and cache_exists:
                     return CACHE_LATEST, f'MEGA snapshot older than restore cache; kept cache rev={current_revision}'
-                if idx > 0:
-                    # R50 migration invariant: if HEAVY had to bootstrap from a legacy
-                    # root, immediately seed the configured canonical root. Otherwise
-                    # a freshly restarted FAST could see an empty new root forever.
-                    seed_ok, seed_detail = mega_promote_snapshot(CACHE_LATEST)
-                    with STATE_LOCK:
-                        STATE['r50_legacy_seed_ok'] = bool(seed_ok)
-                        STATE['r50_legacy_seed_detail'] = str(seed_detail)[:220]
-                        STATE['r50_legacy_seed_at'] = time.time() if seed_ok else 0.0
-                        if seed_ok:
-                            STATE['last_mega_upload_at'] = time.time()
-                    print(f'[R50 MEGA SEED] source={remote} ok={seed_ok} {seed_detail}', flush=True)
-                    return CACHE_LATEST, f'MEGA legacy restore cache OK: {remote}; canonical_seed={seed_ok} {seed_detail}'
-                return CACHE_LATEST, 'MEGA latest OK'
+                return CACHE_LATEST, f'MEGA configured-root latest OK: {remote}'
             finally:
                 shutil.rmtree(work, ignore_errors=True)
         return None, last_detail
@@ -1700,7 +1709,7 @@ def internal_r32_status():
 def health():
     if request.method == 'HEAD': return '',200
     with STATE_LOCK: state=dict(STATE)
-    return {'ok':True,'role':'worker','version':VERSION,'front_configured':bool(front_base()),'mega_configured':bool(os.getenv('MEGA_SESSION') or (os.getenv('MEGA_EMAIL') and os.getenv('MEGA_PASSWORD'))),'google_configured':bool(os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')),'queue_size':JOB_Q.qsize(),'google_queue_size':GOOGLE_Q.qsize(),'state':state},200
+    return {'ok':True,'role':'worker','version':VERSION,'front_configured':bool(front_base()),'mega_enabled':mega_enabled(),'mega_configured':bool(mega_enabled() and (os.getenv('MEGA_SESSION') or (os.getenv('MEGA_EMAIL') and os.getenv('MEGA_PASSWORD')))),'google_configured':bool(os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')),'queue_size':JOB_Q.qsize(),'google_queue_size':GOOGLE_Q.qsize(),'state':state},200
 
 @app.route('/internal/event/receipt', methods=['POST'])
 def internal_event_receipt_v268():
@@ -3244,11 +3253,14 @@ def _r34_process_state_event_wire(wire,max_wire):
     # descriptors to their background sender.
     if _R43_DIRECT_HEAVY:
         new_ids=[]
-        mok,mdetail,_bytes=_r33_archive_events_direct(events)
-        if not mok:
-            with STATE_LOCK: STATE['r32_state_last_error']=str(mdetail)[:220]
-            return {'ok':False,'error':'R49 MEGA event durability unavailable: '+str(mdetail)[:180]},503
-        durable='mega-direct'
+        if mega_enabled():
+            mok,mdetail,_bytes=_r33_archive_events_direct(events)
+            if not mok:
+                with STATE_LOCK: STATE['r32_state_last_error']=str(mdetail)[:220]
+                return {'ok':False,'error':'MEGA event durability unavailable: '+str(mdetail)[:180]},503
+            durable='mega-direct'
+        else:
+            durable='local-only-mega-disabled'
     else:
         durable=''; new_ids=[]; rok,rdetail,new_ids=_r32_redis_store_events(events)
         if rok:
@@ -4879,25 +4891,41 @@ def internal_restore_failed_tasks():
         shutil.rmtree(work,ignore_errors=True)
 
 
+def _r59_redis_quick_probe():
+    if _redis is None:
+        return False, 'redis package unavailable'
+    url=str(os.getenv('REDIS_URL','') or '').strip()
+    if not url:
+        return False, 'REDIS_URL empty after runtime enable'
+    client=None
+    try:
+        client=_redis.Redis.from_url(url,socket_connect_timeout=0.8,socket_timeout=1.2,health_check_interval=30)
+        ok=bool(client.ping())
+        return (ok,'PING=PONG' if ok else 'PING failed')
+    except Exception as exc:
+        return False,f'{type(exc).__name__}: {str(exc)[:180]}'
+    finally:
+        try:
+            if client is not None: client.close()
+        except Exception: pass
+
 @app.route('/internal/runtime/redis', methods=['GET','POST'])
 def internal_runtime_redis():
-    """Owner-controlled runtime Redis switch. Packaged default is OFF after every restart."""
+    """R59 owner-controlled runtime Redis switch with a real short PING."""
     if not authorized():
         return {'ok':False},404
-    global _REDIS_CLIENT
+    global _REDIS_CLIENT, _R44_TEST_REDIS_CLIENT
     if request.method == 'POST':
         body = request.get_json(silent=True) or {}
         requested = bool(body.get('enabled'))
-        state = set_redis_runtime_enabled(requested)
-        # Drop clients after every transition so no cached connection can bypass OFF.
+
+        # Close cached clients first so every transition is applied to a fresh socket.
         with _REDIS_LOCK:
             old = _REDIS_CLIENT
             _REDIS_CLIENT = None
         try:
-            if old is not None:
-                old.close()
-        except Exception:
-            pass
+            if old is not None: old.close()
+        except Exception: pass
         try:
             with _R44_TEST_REDIS_LOCK:
                 test_old = _R44_TEST_REDIS_CLIENT
@@ -4905,14 +4933,192 @@ def internal_runtime_redis():
             if test_old is not None:
                 try: test_old.close()
                 except Exception: pass
-        except Exception:
-            pass
-        with STATE_LOCK:
-            STATE['redis_cache_ok'] = False
-            STATE['redis_last_error'] = '' if state.get('enabled') else 'runtime Redis disabled by owner'
+        except Exception: pass
+
+        state = set_redis_runtime_enabled(requested)
+        if requested:
+            if not bool(state.get('enabled')):
+                err=str(state.get('error') or 'HEAVY Redis was not enabled')[:240]
+                return {'ok':False,'role':'heavy','redis':state,'error':err},409
+            ping_ok,ping_detail=_r59_redis_quick_probe()
+            if not ping_ok:
+                state=set_redis_runtime_enabled(False)
+                state['error']=ping_detail
+                with STATE_LOCK:
+                    STATE['redis_cache_ok']=False; STATE['redis_last_error']=ping_detail
+                return {'ok':False,'role':'heavy','redis':state,'error':ping_detail},503
+            state['ping']='PONG'
+            with STATE_LOCK:
+                STATE['redis_cache_ok']=True; STATE['redis_last_error']=''
+        else:
+            with STATE_LOCK:
+                STATE['redis_cache_ok']=False; STATE['redis_last_error']='runtime Redis disabled by owner'
     else:
         state = redis_runtime_state()
     return {'ok':True,'role':'heavy','redis':state},200
+
+
+def _r60_redis_decode(value, limit=220):
+    if value is None:
+        return ''
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode('utf-8', errors='replace')
+    text = str(value).replace('\x00', '').replace('\r', ' ').replace('\n', ' ')
+    # Never expose credentials/tokens in Telegram diagnostics.
+    text = re.sub(r'(?i)(redis|rediss)://[^@\s]+@', r'\1://***@', text)
+    text = re.sub(r'\b\d{6,12}:[A-Za-z0-9_-]{20,}\b', '<bot-token>', text)
+    text = re.sub(r'(?i)(password|passwd|secret|token|authorization|cookie)["\'\s:=]+[^,}\]\s]{4,}', r'\1=<masked>', text)
+    return text[:max(20, int(limit))]
+
+
+def _r60_redis_sensitive_key(key):
+    low = str(key or '').casefold()
+    return any(x in low for x in ('password','passwd','secret','token','credential','authorization','cookie','session'))
+
+
+def _r60_redis_key_row(client, key):
+    name = key.decode('utf-8', errors='replace') if isinstance(key,(bytes,bytearray)) else str(key)
+    try:
+        typ = client.type(key)
+        if isinstance(typ,(bytes,bytearray)): typ = typ.decode('utf-8',errors='replace')
+        typ = str(typ or 'unknown')
+    except Exception:
+        typ = 'unknown'
+    try: ttl_ms = int(client.pttl(key))
+    except Exception: ttl_ms = -3
+    try:
+        mem = client.memory_usage(key)
+        mem = int(mem or 0)
+    except Exception:
+        mem = 0
+    preview=''; count=None
+    sensitive=_r60_redis_sensitive_key(name)
+    try:
+        if typ == 'string':
+            count=int(client.strlen(key) or 0)
+            if sensitive:
+                preview='<masked-sensitive-key>'
+            elif count <= 8192:
+                preview=_r60_redis_decode(client.get(key),180)
+            else:
+                preview=f'<string {count} bytes>'
+        elif typ == 'hash':
+            count=int(client.hlen(key) or 0)
+            if sensitive:
+                preview='<masked-sensitive-key>'
+            else:
+                cur, vals=client.hscan(key,0,count=3)
+                bits=[]
+                for k,v in list((vals or {}).items())[:3]:
+                    bits.append(_r60_redis_decode(k,50)+'='+_r60_redis_decode(v,80))
+                preview='; '.join(bits)
+        elif typ == 'list':
+            count=int(client.llen(key) or 0)
+            if sensitive: preview='<masked-sensitive-key>'
+            else: preview=' | '.join(_r60_redis_decode(x,90) for x in (client.lrange(key,0,2) or []))
+        elif typ == 'set':
+            count=int(client.scard(key) or 0)
+            if sensitive: preview='<masked-sensitive-key>'
+            else:
+                cur, vals=client.sscan(key,0,count=3)
+                preview=' | '.join(_r60_redis_decode(x,90) for x in list(vals or [])[:3])
+        elif typ == 'zset':
+            count=int(client.zcard(key) or 0)
+            if sensitive: preview='<masked-sensitive-key>'
+            else:
+                vals=client.zrange(key,0,2,withscores=True) or []
+                preview=' | '.join(_r60_redis_decode(v,80)+f' ({score:g})' for v,score in vals)
+        elif typ == 'stream':
+            count=int(client.xlen(key) or 0)
+            preview='<stream entries>' if sensitive else f'<stream {count} entries>'
+    except Exception as exc:
+        preview=f'<preview {type(exc).__name__}>'
+    return {'key':name[:240],'type':typ,'ttl_ms':ttl_ms,'bytes':mem,'count':count,'preview':preview[:220]}
+
+
+def _r60_redis_prefix(name):
+    parts=str(name or '').split(':')
+    if not parts: return '(empty)'
+    if parts[0]=='vysbot' and len(parts)>=3: return ':'.join(parts[:3])+':*'
+    if parts[0]=='vys262' and len(parts)>=2: return ':'.join(parts[:2])+':*'
+    if parts[0]=='per' and len(parts)>=4: return ':'.join(parts[:4])+':*'
+    return ':'.join(parts[:min(3,len(parts))])+(':*' if len(parts)>3 else '')
+
+
+@app.route('/internal/runtime/redis/inspect', methods=['GET'])
+def internal_runtime_redis_inspect():
+    """R60 owner Redis inspector. Read-only, bounded and secret-masked."""
+    if not authorized():
+        return {'ok':False},404
+    state=redis_runtime_state()
+    if not bool(state.get('master_enabled')):
+        return {'ok':False,'error':'REDIS_ENABLED=0 in Render','redis':state},409
+    if not bool(state.get('enabled')):
+        return {'ok':False,'error':'Redis runtime is OFF','redis':state},409
+    if _redis is None:
+        return {'ok':False,'error':'redis package unavailable','redis':state},503
+    url=str(os.getenv('REDIS_URL','') or '').strip()
+    if not url:
+        return {'ok':False,'error':'REDIS_URL empty','redis':state},409
+    try:
+        page=max(0,min(99,int(request.args.get('page','0') or 0)))
+        page_size=max(5,min(20,int(request.args.get('page_size','10') or 10)))
+    except Exception:
+        page=0; page_size=10
+    client=None
+    try:
+        client=_redis.Redis.from_url(url,socket_connect_timeout=0.9,socket_timeout=1.5,health_check_interval=30)
+        pong=bool(client.ping())
+        info_mem=client.info('memory') or {}
+        info_stats=client.info('stats') or {}
+        info_clients=client.info('clients') or {}
+        try: dbsize=int(client.dbsize() or 0)
+        except Exception: dbsize=0
+        keys=[]; cursor=0; truncated=False
+        # Bound diagnostics even if Redis grows unexpectedly.
+        for raw in client.scan_iter(match='*',count=200):
+            keys.append(raw)
+            if len(keys)>=500:
+                truncated=True; break
+        keys.sort(key=lambda x: (x.decode('utf-8',errors='replace') if isinstance(x,(bytes,bytearray)) else str(x)))
+        prefix_counts={}
+        decoded=[]
+        for raw in keys:
+            name=raw.decode('utf-8',errors='replace') if isinstance(raw,(bytes,bytearray)) else str(raw)
+            decoded.append((name,raw))
+            pref=_r60_redis_prefix(name); prefix_counts[pref]=int(prefix_counts.get(pref,0))+1
+        total_seen=len(decoded)
+        pages=max(1,(total_seen+page_size-1)//page_size)
+        page=max(0,min(page,pages-1))
+        chosen=decoded[page*page_size:(page+1)*page_size]
+        entries=[_r60_redis_key_row(client,raw) for _,raw in chosen]
+        top_prefix=sorted(prefix_counts.items(),key=lambda kv:(-kv[1],kv[0]))[:12]
+        payload={
+            'ok':True,'role':'heavy','redis':state,'ping':'PONG' if pong else 'FAIL',
+            'dbsize':dbsize,'scanned':total_seen,'truncated':truncated,
+            'page':page,'pages':pages,'page_size':page_size,'entries':entries,
+            'prefixes':[{'prefix':k,'count':v} for k,v in top_prefix],
+            'memory':{
+                'used_memory':int(info_mem.get('used_memory') or 0),
+                'used_memory_human':str(info_mem.get('used_memory_human') or ''),
+                'maxmemory':int(info_mem.get('maxmemory') or 0),
+                'maxmemory_human':str(info_mem.get('maxmemory_human') or ''),
+            },
+            'stats':{
+                'keyspace_hits':int(info_stats.get('keyspace_hits') or 0),
+                'keyspace_misses':int(info_stats.get('keyspace_misses') or 0),
+                'evicted_keys':int(info_stats.get('evicted_keys') or 0),
+                'expired_keys':int(info_stats.get('expired_keys') or 0),
+                'connected_clients':int(info_clients.get('connected_clients') or 0),
+            },
+        }
+        return payload,200
+    except Exception as exc:
+        return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:260]}','redis':state},503
+    finally:
+        try:
+            if client is not None: client.close()
+        except Exception: pass
 
 
 @app.route('/internal/r44/test/status',methods=['GET'])

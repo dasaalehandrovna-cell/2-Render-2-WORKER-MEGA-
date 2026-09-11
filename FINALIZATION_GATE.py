@@ -161,13 +161,24 @@ elif ROLE=='heavy':
     try: q=int(env.get('WORKER_EVENT_REDIS_QUEUE_MAX',999999))
     except Exception: q=999999
     ok('heavy_event_queue',q<=1024,f'WORKER_EVENT_REDIS_QUEUE_MAX={q}')
-    ok('r49_redis_packaged_default_off',
-       '"REDIS_RUNTIME_DEFAULT": "0"' in text('runtime_config.py') and '/internal/runtime/redis' in s,
-       'HEAVY Redis runtime switch/default OFF missing')
-    ok('r49_state_events_mega_durable_without_redis',
-       'def _r33_archive_events_direct' in s and "durable='mega-direct'" in s and
-       "R49 MEGA event durability unavailable" in s,
-       'HEAVY must durably archive state events to MEGA before ACK when Redis is OFF')
+    ok('r60_redis_render_enabled_is_restart_default',
+       '_apply_redis_runtime_state(_REDIS_RENDER_ENABLED)' in text('runtime_config.py') and
+       '"restart_enabled": bool(_REDIS_RENDER_ENABLED)' in text('runtime_config.py') and
+       '_REDIS_START_ENABLED' not in text('runtime_config.py') and '/internal/runtime/redis' in s,
+       'HEAVY REDIS_ENABLED must be the single logical restart default')
+    ok('r60_redis_runtime_ping_and_inspector',
+       'def _r59_redis_quick_probe' in s and "state['ping']='PONG'" in s and
+       'global _REDIS_CLIENT, _R44_TEST_REDIS_CLIENT' in s and 'set_redis_runtime_enabled(False)' in s and
+       "/internal/runtime/redis/inspect" in s and 'def _r60_redis_key_row' in s,
+       'HEAVY Redis transition must close clients, PING and rollback on failure')
+    ok('r59_render_env_snapshot',
+       'def render_env_snapshot' in text('runtime_config.py'),
+       'HEAVY must preserve raw Render ENV for diagnostics')
+    ok('r56_state_events_respect_mega_master_switch',
+       'def _r33_archive_events_direct' in s and "if mega_enabled():" in s and
+       "durable='mega-direct'" in s and "durable='local-only-mega-disabled'" in s and
+       "MEGA event durability unavailable" in s,
+       'HEAVY must use MEGA durability only when MEGA_ENABLED=1 and local mirror when explicitly disabled')
     ok('r49_snapshot_sync_promote',
        "X-Snapshot-Promote-Mode" in s and 'mega_promote_snapshot(incoming)' in s and "'mega_promoted':True" in s,
        'exact snapshot sync promotion contract missing')
