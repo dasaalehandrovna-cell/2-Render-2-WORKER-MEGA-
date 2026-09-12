@@ -178,9 +178,15 @@ elif ROLE=='heavy':
        'HEAVY must preserve raw Render ENV for diagnostics')
     ok('r56_state_events_respect_mega_master_switch',
        'def _r33_archive_events_direct' in s and "if mega_enabled():" in s and
-       "durable='mega-direct'" in s and "durable='local-only-mega-disabled'" in s and
+       "durable='mega-direct'" in s and "durable='local-only-redis-mega-disabled'" in s and
        "MEGA event durability unavailable" in s,
-       'HEAVY must use MEGA durability only when MEGA_ENABLED=1 and local mirror when explicitly disabled')
+       'HEAVY must use MEGA durability only when enabled and local-only mode when both remote stores are disabled')
+    ok('r63_shared_redis_state_durability',
+       'redis_active = _redis_client() is not None' in s and '_r32_redis_store_events(events)' in s and
+       "durable='redis'" in s and '_R32_MEGA_WAKE.set()' in s and
+       'def _r63_seed_shared_redis_from_front' in s and 'redis_load_snapshot_to_cache()' in s and
+       '_r32_replay_state_events_from_redis(limit=50000)' in s and 'r63-redis-checkpoint' in s,
+       'direct HEAVY must keep shared Redis full snapshot + logical state-event tail durable and recoverable')
     ok('r49_snapshot_sync_promote',
        "X-Snapshot-Promote-Mode" in s and 'mega_promote_snapshot(incoming)' in s and "'mega_promoted':True" in s,
        'exact snapshot sync promotion contract missing')

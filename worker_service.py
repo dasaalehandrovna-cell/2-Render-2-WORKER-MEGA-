@@ -44,7 +44,7 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r61-render-owned-redis-start-inspector'
+VERSION = 'vys-262-worker-r63-shared-redis-recovery'
 TRANSPORT_VERSION = 'vys-262-worker-r52-forensic-transport'
 R52_FORENSIC_LOG = str(os.getenv('R52_FORENSIC_LOG','1') or '1').strip().lower() not in {'0','false','no','off'}
 
@@ -3248,11 +3248,22 @@ def _r34_process_state_event_wire(wire,max_wire):
         events=[x for x in events if _r32_event_valid(x)]
         if not events: raise ValueError('no valid events')
     except Exception as exc: return {'ok':False,'error':f'R34 event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
-    # R49 Redis-free contract: every acknowledged state batch must already be
-    # durable in MEGA. The upload runs on HEAVY, while FAST callbacks only enqueue
-    # descriptors to their background sender.
-    if _R43_DIRECT_HEAVY:
-        new_ids=[]
+    # R63 shared-Redis durability. When Redis runtime is ON, every acknowledged
+    # logical state batch is stored there first, even in direct R43 mode.  MEGA is
+    # then only an archival/fallback backend, so FAST no longer waits on MEGA for
+    # normal changes.  When Redis is intentionally OFF, preserve the strict MEGA
+    # direct path (or local-only mode if MEGA is also OFF).
+    redis_active = _redis_client() is not None
+    new_ids=[]
+    if redis_active:
+        rok,rdetail,new_ids=_r32_redis_store_events(events)
+        if not rok:
+            with STATE_LOCK: STATE['r32_state_last_error']='Redis durability failed: '+str(rdetail)[:180]
+            return {'ok':False,'error':'Redis state durability unavailable: '+str(rdetail)[:180]},503
+        durable='redis'
+        if mega_enabled() and new_ids:
+            _R32_MEGA_WAKE.set()
+    elif _R43_DIRECT_HEAVY:
         if mega_enabled():
             mok,mdetail,_bytes=_r33_archive_events_direct(events)
             if not mok:
@@ -3260,9 +3271,9 @@ def _r34_process_state_event_wire(wire,max_wire):
                 return {'ok':False,'error':'MEGA event durability unavailable: '+str(mdetail)[:180]},503
             durable='mega-direct'
         else:
-            durable='local-only-mega-disabled'
+            durable='local-only-redis-mega-disabled'
     else:
-        durable=''; new_ids=[]; rok,rdetail,new_ids=_r32_redis_store_events(events)
+        durable=''; rok,rdetail,new_ids=_r32_redis_store_events(events)
         if rok:
             durable='redis'
             if new_ids: _R32_MEGA_WAKE.set()
@@ -4667,6 +4678,32 @@ def google_loop():
                 _R38_GOOGLE_ENQUEUED.discard(jid)
             GOOGLE_Q.task_done()
 
+def _r63_seed_shared_redis_from_front():
+    """Ensure shared Redis has a full baseline without blocking FAST UI.
+
+    State events alone cannot rebuild an empty database.  On HEAVY startup, if Redis
+    is enabled but the full snapshot key is absent, fetch one exact FAST snapshot,
+    gzip the local mirror, and store it in Redis.
+    """
+    client=_redis_client()
+    if client is None:
+        return
+    try:
+        if client.exists(_REDIS_SNAPSHOT_KEY):
+            return
+    except Exception as exc:
+        print(f'[R63 REDIS SEED] exists error={type(exc).__name__}: {str(exc)[:180]}',flush=True)
+        return
+    try:
+        _r43_refresh_front_snapshot('r63-redis-seed')
+        ok,detail,meta=_gzip_cache_db_v267()
+        if not ok:
+            raise RuntimeError(detail)
+        rok,rdetail=redis_store_snapshot(CACHE_LATEST,meta,clear_deltas=True)
+        print(f'[R63 REDIS SEED] ok={rok} {rdetail}',flush=True)
+    except Exception as exc:
+        print(f'[R63 REDIS SEED] error={type(exc).__name__}: {str(exc)[:240]}',flush=True)
+
 _R48_WORKERS_STARTED=False
 _R48_WORKERS_START_LOCK=threading.Lock()
 
@@ -4683,7 +4720,20 @@ def _start_final_workers():
         threading.Thread(target=_r35_result_loop,name='per-r48-result-2',daemon=True).start()
         threading.Thread(target=google_loop,name='per-r48-worker-google',daemon=True).start()
         threading.Thread(target=peer_loop,name='per-r48-worker-peer',daemon=True).start()
-        print('[R48 HEAVY] final R43 owners active; direct FAST snapshot mode',flush=True)
+        if _redis_client() is not None:
+            try:
+                rok,rdetail=redis_load_snapshot_to_cache()
+                print(f'[R63 REDIS BOOT] snapshot ok={rok} {rdetail}',flush=True)
+                if rok:
+                    eok,edetail=_r32_replay_state_events_from_redis(limit=50000)
+                    print(f'[R63 REDIS BOOT] events ok={eok} {edetail}',flush=True)
+            except Exception as exc:
+                print(f'[R63 REDIS BOOT] error={type(exc).__name__}: {str(exc)[:220]}',flush=True)
+            threading.Thread(target=_r63_seed_shared_redis_from_front,name='r63-redis-seed',daemon=True).start()
+            threading.Thread(target=_checkpoint_loop_v267,name='r63-redis-checkpoint',daemon=True).start()
+            if mega_enabled():
+                threading.Thread(target=_r32_mega_event_loop,name='r63-redis-mega-archive',daemon=True).start()
+        print('[R63 HEAVY] direct FAST compute + shared Redis mirror/recovery',flush=True)
         return
 
     # Legacy non-direct mode is kept only for explicit emergency configuration.
@@ -5199,7 +5249,7 @@ def r44_test_mega_file():
 print('[R45 TEST] diagnostic API ready: status/echo/reverse/snapshot/mega-list/mega-file; Redis optional/test-only; probes do not block FAST callbacks',flush=True)
 
 
-print('[R45 STABLE] direct FAST authority; conditional snapshots; cheap SQLite validation; no eager bootstrap',flush=True)
+print('[R63 STABLE] FAST authority; Redis full+events recovery; MEGA fallback/archive',flush=True)
 
 if __name__ == '__main__':
     _start_final_workers()
