@@ -40,11 +40,11 @@ from openpyxl import Workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from runtime_config import install_internal_runtime_config, CONFIG_VERSION as INTERNAL_CONFIG_VERSION, redis_runtime_state, set_redis_runtime_enabled
+from runtime_config import install_internal_runtime_config, CONFIG_VERSION as INTERNAL_CONFIG_VERSION, redis_runtime_state, set_redis_runtime_enabled, redis_effective_url, redis_render_url
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r60-redis-logical-modes-inspector'
+VERSION = 'vys-262-worker-r61-render-owned-redis-start-inspector'
 TRANSPORT_VERSION = 'vys-262-worker-r52-forensic-transport'
 R52_FORENSIC_LOG = str(os.getenv('R52_FORENSIC_LOG','1') or '1').strip().lower() not in {'0','false','no','off'}
 
@@ -327,7 +327,7 @@ def _event_reconcile_loop_v268():
     while True:
         time.sleep(env_int('WORKER_EVENT_REDIS_RECONCILE_SEC',5,1,300))
         try:
-            if not str(os.getenv('REDIS_URL','') or '').strip() or _redis is None:
+            if not str(redis_effective_url() or '').strip() or _redis is None:
                 try:
                     _event_db_init_v268()
                     with EVENT_LOCK:
@@ -362,7 +362,7 @@ def _redis_client():
     global _REDIS_CLIENT, _R44_TEST_REDIS_CLIENT
     if _redis is None:
         return None
-    url = str(os.getenv('REDIS_URL','') or '').strip()
+    url = str(redis_effective_url() or '').strip()
     if not url:
         return None
     with _REDIS_LOCK:
@@ -1729,7 +1729,7 @@ def internal_event_receipt_v268():
     # fill EVENT_REDIS_Q and turn every normal Telegram message into HTTP 503.
     # Worker-local SQLite is FULL-synchronous and is enough for raw-update witness;
     # committed business state is independently mirrored through the R32 MEGA stream.
-    redis_enabled = bool(str(os.getenv('REDIS_URL','') or '').strip()) and (_redis is not None)
+    redis_enabled = bool(str(redis_effective_url() or '').strip()) and (_redis is not None)
     if redis_enabled:
         queued=_event_redis_enqueue_v270(row)
         if not queued:
@@ -1754,7 +1754,7 @@ def internal_event_commit_v268():
     if state=='committed' and not float(row.get('committed_at') or 0.0): row['committed_at']=time.time()
     if not _event_local_upsert_v268(row):
         return {'ok':False,'error':'worker local event commit journal failed'},503
-    redis_enabled = bool(str(os.getenv('REDIS_URL','') or '').strip()) and (_redis is not None)
+    redis_enabled = bool(str(redis_effective_url() or '').strip()) and (_redis is not None)
     if redis_enabled:
         rok,rdetail=_event_redis_store_v268(row)
         if not rok: return {'ok':False,'error':'Redis event update failed: '+str(rdetail)[:180]},503
@@ -4766,7 +4766,7 @@ def _r44_test_redis_client():
             except Exception: _R44_TEST_REDIS_CLIENT=None
         if _redis is None:
             _R44_TEST_REDIS_ERROR='redis package unavailable'; return None
-        url=str(os.getenv('REDIS_URL','') or '').strip()
+        url=str(redis_effective_url() or '').strip()
         if not url:
             _R44_TEST_REDIS_ERROR='REDIS_URL not configured'; return None
         try:
@@ -4894,7 +4894,7 @@ def internal_restore_failed_tasks():
 def _r59_redis_quick_probe():
     if _redis is None:
         return False, 'redis package unavailable'
-    url=str(os.getenv('REDIS_URL','') or '').strip()
+    url=str(redis_effective_url() or '').strip()
     if not url:
         return False, 'REDIS_URL empty after runtime enable'
     client=None
@@ -5057,7 +5057,7 @@ def internal_runtime_redis_inspect():
         return {'ok':False,'error':'Redis runtime is OFF','redis':state},409
     if _redis is None:
         return {'ok':False,'error':'redis package unavailable','redis':state},503
-    url=str(os.getenv('REDIS_URL','') or '').strip()
+    url=str(redis_effective_url() or '').strip()
     if not url:
         return {'ok':False,'error':'REDIS_URL empty','redis':state},409
     try:

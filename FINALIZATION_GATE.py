@@ -161,11 +161,13 @@ elif ROLE=='heavy':
     try: q=int(env.get('WORKER_EVENT_REDIS_QUEUE_MAX',999999))
     except Exception: q=999999
     ok('heavy_event_queue',q<=1024,f'WORKER_EVENT_REDIS_QUEUE_MAX={q}')
-    ok('r60_redis_render_enabled_is_restart_default',
-       '_apply_redis_runtime_state(_REDIS_RENDER_ENABLED)' in text('runtime_config.py') and
-       '"restart_enabled": bool(_REDIS_RENDER_ENABLED)' in text('runtime_config.py') and
-       '_REDIS_START_ENABLED' not in text('runtime_config.py') and '/internal/runtime/redis' in s,
-       'HEAVY REDIS_ENABLED must be the single logical restart default')
+    ok('r61_redis_render_owned_master_and_start',
+       '_REDIS_START_ENABLED = _render_flag("REDIS_START_ENABLED", False)' in text('runtime_config.py') and
+       '_apply_redis_runtime_state(_REDIS_RENDER_ENABLED and _REDIS_START_ENABLED)' in text('runtime_config.py') and
+       'def redis_effective_url' in text('runtime_config.py') and
+       'os.environ["REDIS_ENABLED"]' not in text('runtime_config.py') and 'os.environ["REDIS_URL"]' not in text('runtime_config.py') and
+       '/internal/runtime/redis' in s,
+       'HEAVY Redis master/start/URL must remain Render-owned')
     ok('r60_redis_runtime_ping_and_inspector',
        'def _r59_redis_quick_probe' in s and "state['ping']='PONG'" in s and
        'global _REDIS_CLIENT, _R44_TEST_REDIS_CLIENT' in s and 'set_redis_runtime_enabled(False)' in s and

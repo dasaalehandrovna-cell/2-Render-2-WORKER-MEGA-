@@ -19,6 +19,8 @@ COPY worker_service.py runtime_config.py ./
 # R49: compile is not enough; execute module import after dependencies are installed.
 # This catches use-before-definition / bad final-owner aliases during Docker build.
 RUN python -m py_compile worker_service.py runtime_config.py \
- && python -c "import worker_service as w; assert w.process_file_job.__name__ == 'process_file_job_r43'; assert w.process_google_job.__name__ == 'process_google_job_r43'; assert not w._R48_WORKERS_STARTED; print('R49 HEAVY startup smoke PASS')"
+ && MEGA_ENABLED=0 REDIS_ENABLED=0 REDIS_START_ENABLED=0 \
+    MEGA_EMAIL= MEGA_PASSWORD= MEGA_BACKUP_DIR= REDIS_URL= \
+    python -c "import worker_service as w; assert w.process_file_job.__name__ == 'process_file_job_r43'; assert w.process_google_job.__name__ == 'process_google_job_r43'; assert not w._R48_WORKERS_STARTED; print('R49 HEAVY startup smoke PASS')"
 
 CMD ["python", "worker_service.py"]
