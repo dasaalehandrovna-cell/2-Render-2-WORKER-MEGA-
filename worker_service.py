@@ -5246,10 +5246,114 @@ def r44_test_mega_file():
     except Exception as exc:
         shutil.rmtree(work,ignore_errors=True);return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:500]}'},500
 
+
+# R65 manual recovery browser: owner-triggered read-only access to the whole MEGA
+# account through HEAVY.  Normal automatic storage remains strictly locked to
+# MEGA_BACKUP_DIR/mega_root(); these endpoints never write outside that root.
+def _r65_manual_mega_path(raw):
+    text=str(raw or '').strip() or '/'
+    if not text.startswith('/'):
+        text='/'+text.lstrip('/')
+    path=_r44_posixpath.normpath(text)
+    if not path.startswith('/'):
+        path='/'+path
+    if '..' in path.split('/'):
+        raise ValueError('invalid MEGA recovery path')
+    return path
+
+
+def _r65_manual_mega_immediate(path):
+    """List only the immediate children of an arbitrary MEGA recovery folder."""
+    path=_r65_manual_mega_path(path)
+    ok,detail=mega_login()
+    if not ok:
+        raise RuntimeError(detail)
+    start=time.monotonic()
+    with MEGA_LOCK:
+        proc=run_cmd(['mega-ls','-l',path],timeout=env_int('R65_MEGA_BROWSE_TIMEOUT',60,10,240))
+    if proc.returncode!=0:
+        raise RuntimeError((proc.stderr or proc.stdout or 'mega-ls failed')[:500])
+    entries=[]
+    for raw in (proc.stdout or '').splitlines():
+        line=str(raw or '').strip()
+        if not line or line.upper().startswith('FLAGS ') or line.startswith('Versions of '):
+            continue
+        # MEGAcmd -l format: FLAGS VERS SIZE DATE TIME NAME (NAME may contain spaces).
+        parts=line.split(None,5)
+        if len(parts)<6:
+            continue
+        flags,name=parts[0],parts[5].strip()
+        if not name or name in {'.','..'}:
+            continue
+        kind='dir' if flags.startswith('d') else 'file'
+        child=(path.rstrip('/')+'/'+name) if path!='/' else '/'+name
+        child=_r44_posixpath.normpath(child)
+        entries.append({'type':kind,'name':name,'path':child})
+    dedup={}
+    for row in entries:
+        dedup[(row.get('type'),row.get('path'))]=row
+    entries=list(dedup.values())
+    entries.sort(key=lambda r:(0 if r.get('type')=='dir' else 1,str(r.get('name') or '').casefold()))
+    parent='/' if path=='/' else (_r44_posixpath.dirname(path.rstrip('/')) or '/')
+    return {'path':path,'parent':parent,'entries':entries,'elapsed_mega':round(time.monotonic()-start,3),'configured_root':mega_root()}
+
+
+@app.route('/internal/r65/mega/list',methods=['GET'])
+def r65_manual_mega_list():
+    if not authorized():
+        return {'ok':False},404
+    try:
+        obj=_r65_manual_mega_immediate(request.args.get('path','/'))
+        print(f"[R65 MEGA BROWSER] list path={obj.get('path')} entries={len(obj.get('entries') or [])}",flush=True)
+        return {'ok':True,**obj},200
+    except Exception as exc:
+        return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:600]}','configured_root':mega_root()},502
+
+
+@app.route('/internal/r65/mega/file',methods=['GET'])
+def r65_manual_mega_file():
+    if not authorized():
+        return {'ok':False},404
+    try:
+        path=_r65_manual_mega_path(request.args.get('path',''))
+        if path=='/':
+            return {'ok':False,'error':'file path required'},400
+    except Exception as exc:
+        return {'ok':False,'error':str(exc)[:300]},400
+    ok,detail=mega_login()
+    if not ok:
+        return {'ok':False,'error':detail[:400]},502
+    work=Path(tempfile.mkdtemp(prefix='r65_mega_recovery_'))
+    try:
+        with MEGA_LOCK:
+            proc=run_cmd(['mega-get',path,str(work)],timeout=env_int('R65_MEGA_FILE_TIMEOUT',240,30,900))
+        if proc.returncode!=0:
+            shutil.rmtree(work,ignore_errors=True)
+            return {'ok':False,'error':(proc.stderr or proc.stdout or 'mega-get failed')[:700]},502
+        candidates=[x for x in work.rglob('*') if x.is_file()]
+        if not candidates:
+            shutil.rmtree(work,ignore_errors=True)
+            return {'ok':False,'error':'MEGA file not downloaded'},404
+        local=candidates[0]
+        size=local.stat().st_size
+        limit=max(16,min(512,int(os.getenv('R65_MEGA_FILE_MAX_MB','256') or '256')))*1024*1024
+        if size>limit:
+            shutil.rmtree(work,ignore_errors=True)
+            return {'ok':False,'error':f'file too large for recovery transfer: {size} > {limit}'},413
+        resp=send_file(str(local),as_attachment=True,download_name=local.name,mimetype='application/octet-stream',conditional=False,max_age=0)
+        resp.headers['X-R65-Mega-Path']=path[:700]
+        resp.headers['X-R65-File-Size']=str(size)
+        resp.call_on_close(lambda: shutil.rmtree(work,ignore_errors=True))
+        print(f'[R65 MEGA BROWSER] file path={path} bytes={size}',flush=True)
+        return resp
+    except Exception as exc:
+        shutil.rmtree(work,ignore_errors=True)
+        return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:700]}'},500
+
 print('[R45 TEST] diagnostic API ready: status/echo/reverse/snapshot/mega-list/mega-file; Redis optional/test-only; probes do not block FAST callbacks',flush=True)
 
 
-print('[R63 STABLE] FAST authority; Redis full+events recovery; MEGA fallback/archive',flush=True)
+print('[R65 STABLE] FAST authority; Redis recovery; priority-nav compatible; manual all-MEGA recovery browser ready; automatic MEGA root remains strict',flush=True)
 
 if __name__ == '__main__':
     _start_final_workers()

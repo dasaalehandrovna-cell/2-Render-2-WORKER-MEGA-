@@ -1,9 +1,10 @@
-# R60 — Redis logical modes + inspector
+# R65 HEAVY — Manual whole-account MEGA recovery browser
 
-- `REDIS_ENABLED=0`: hard OFF.
-- `REDIS_ENABLED=1`: Redis starts ON after deploy.
-- Runtime menu changes are temporary until restart.
-- `REDIS_START_ENABLED` is ignored in R60.
-- HEAVY `/internal/runtime/redis` applies explicit ON/OFF transitions with fresh client sockets and PING verification.
-- HEAVY `/internal/runtime/redis/inspect` is read-only, authenticated, bounded to 500 keys and masks sensitive previews.
-- SQLite/local ledgers remain the correctness layer; Redis is background cache/outbox acceleration.
+- Added authenticated read-only manual recovery endpoints:
+  - `GET /internal/r65/mega/list`
+  - `GET /internal/r65/mega/file`
+- Folder listing uses immediate `mega-ls -l` output instead of recursively scanning the whole account.
+- Manual browser may read arbitrary folders in the logged-in MEGA account for owner-triggered recovery.
+- Automatic production MEGA paths remain strictly locked to Render `MEGA_BACKUP_DIR` via existing `mega_root()` policy.
+- No automatic write outside the strict root was added.
+- No PREV/ORIG/BASE compatibility chain added.

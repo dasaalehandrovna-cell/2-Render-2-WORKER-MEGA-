@@ -202,6 +202,13 @@ elif ROLE=='heavy':
     ok('r49_worker_redis_snapshot_key',
        'vys262:bot_state:latest_gz' in s and 'redis_load_snapshot_to_cache' in s,
        'HEAVY emergency cache must understand the same Redis snapshot key')
+    ok('r65_manual_all_mega_recovery_browser',
+       'def _r65_manual_mega_path' in s and '/internal/r65/mega/list' in s and '/internal/r65/mega/file' in s and
+       "run_cmd(['mega-get',path,str(work)]" in s,
+       'HEAVY must expose authenticated read-only manual whole-account MEGA recovery endpoints')
+    ok('r65_automatic_mega_root_remains_strict',
+       '_R58_STRICT_MEGA_ROOT = mega_root()' in s and 'MEGA_ENABLED=1 requires MEGA_BACKUP_DIR' in s,
+       'manual browser must not weaken strict automatic MEGA root policy')
 else:
     errors.append('cannot detect role')
 
