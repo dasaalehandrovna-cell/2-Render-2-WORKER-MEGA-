@@ -44,7 +44,7 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r63-shared-redis-recovery'
+VERSION = 'vys-262-worker-r68-release-structure'
 TRANSPORT_VERSION = 'vys-262-worker-r52-forensic-transport'
 R52_FORENSIC_LOG = str(os.getenv('R52_FORENSIC_LOG','1') or '1').strip().lower() not in {'0','false','no','off'}
 
