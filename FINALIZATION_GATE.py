@@ -25,7 +25,7 @@ def compile_all():
 compile_all()
 _require_info = str(os.getenv('FINALIZATION_REQUIRE_INFO','1')).strip().lower() not in {'0','false','no','off'}
 _runtime_build = str(os.getenv('FINALIZATION_RUNTIME_BUILD','0')).strip().lower() in {'1','true','yes','on'}
-for req in ['INFO/PROJECT_RULES.md','INFO/PATCH_PROTOCOL.md','INFO/FINALIZATION_REPORT.md','INFO/BOT_MAP.md','INFO/CHANGELOG.md','INFO/NEXT_CHAT_HANDOFF.md','INFO/DEPLOY_R68_RU.md']:
+for req in ['INFO/PROJECT_RULES.md','INFO/PATCH_PROTOCOL.md','INFO/FINALIZATION_REPORT.md','INFO/BOT_MAP.md','INFO/CHANGELOG.md','INFO/NEXT_CHAT_HANDOFF.md','INFO/DEPLOY_R69_RU.md']:
     if _require_info:
         ok('required_'+req,(ROOT/req).is_file(),req)
 ok('required_FINALIZATION_GATE.py',(ROOT/'FINALIZATION_GATE.py').is_file(),'FINALIZATION_GATE.py')
@@ -34,20 +34,20 @@ if ROLE=='heavy':
     expected_root={'Dockerfile','FINALIZATION_GATE.py','requirements.txt','runtime_config.py','worker_service.py'}
     actual_root={p.name for p in ROOT.iterdir() if p.is_file()}
     if not _runtime_build:
-        ok('r68_deploy_root_only',actual_root==expected_root,f'actual={sorted(actual_root)} expected={sorted(expected_root)}')
+        ok('r69_deploy_root_only',actual_root==expected_root,f'actual={sorted(actual_root)} expected={sorted(expected_root)}')
     else:
         expected_runtime={'FINALIZATION_GATE.py','requirements.txt','runtime_config.py','worker_service.py'}
-        ok('r68_runtime_build_root',actual_root==expected_runtime,f'actual={sorted(actual_root)} expected={sorted(expected_runtime)}')
-    ok('r68_no_root_docs',not any((ROOT/n).exists() for n in ['PROJECT_RULES.md','PATCH_PROTOCOL.md','FINALIZATION_REPORT.md']),'all documentation must live under INFO/')
+        ok('r69_runtime_build_root',actual_root==expected_runtime,f'actual={sorted(actual_root)} expected={sorted(expected_runtime)}')
+    ok('r69_no_root_docs',not any((ROOT/n).exists() for n in ['PROJECT_RULES.md','PATCH_PROTOCOL.md','FINALIZATION_REPORT.md']),'all documentation must live under INFO/')
     if _require_info:
         rules=(ROOT/'INFO/PROJECT_RULES.md').read_text(encoding='utf-8',errors='replace') if (ROOT/'INFO/PROJECT_RULES.md').exists() else ''
         handoff=(ROOT/'INFO/NEXT_CHAT_HANDOFF.md').read_text(encoding='utf-8',errors='replace') if (ROOT/'INFO/NEXT_CHAT_HANDOFF.md').exists() else ''
         changelog=(ROOT/'INFO/CHANGELOG.md').read_text(encoding='utf-8',errors='replace') if (ROOT/'INFO/CHANGELOG.md').exists() else ''
         botmap=(ROOT/'INFO/BOT_MAP.md').read_text(encoding='utf-8',errors='replace') if (ROOT/'INFO/BOT_MAP.md').exists() else ''
-        ok('r68_version_plus_one_rule','Каждая следующая версия = предыдущая +1.' in rules,'release increment rule missing')
-        ok('r68_handoff_r69','R68' in handoff and 'R69' in handoff and 'PATCH → FINALIZE → TEST → PACKAGE' in handoff,'next chat must know R68→R69 workflow')
-        ok('r68_history_present','R68' in changelog and 'R67' in changelog,'changelog must include R67 and R68 history')
-        ok('r68_fast_edit_map','БЫСТРАЯ КАРТА ПРАВОК' in botmap and 'worker_service.py' in botmap and 'runtime_config.py' in botmap,'quick edit map missing')
+        ok('r69_version_plus_one_rule','Каждая следующая версия = предыдущая +1.' in rules,'release increment rule missing')
+        ok('r69_handoff_r70','R69' in handoff and 'R70' in handoff and 'PATCH → FINALIZE → TEST → PACKAGE' in handoff,'next chat must know R68→R69 workflow')
+        ok('r69_history_present','R69' in changelog and 'R68' in changelog and 'R67' in changelog,'changelog must include R67 and R68 history')
+        ok('r69_fast_edit_map','БЫСТРАЯ КАРТА ПРАВОК' in botmap and 'worker_service.py' in botmap and 'runtime_config.py' in botmap,'quick edit map missing')
 
 if ROLE=='fast':
     manifest=json.loads(text('modules_manifest.json'))
@@ -178,7 +178,7 @@ elif ROLE=='heavy':
         docker=text('Dockerfile')
         ok('heavy_docker_startup_smoke',
            'FINALIZATION_REQUIRE_INFO=0 FINALIZATION_RUNTIME_BUILD=1 python FINALIZATION_GATE.py' in docker and
-           'R68 HEAVY startup smoke PASS' in docker and 'import worker_service as w' in docker,
+           'R69 HEAVY startup smoke PASS' in docker and 'import worker_service as w' in docker,
            'Docker build must execute runtime gate and startup import smoke')
     ok('heavy_state_events_route','/internal/state/events' in s,'state events endpoint missing')
     ns={}; exec(text('runtime_config.py'),ns); env=ns.get('WORKER_INTERNAL_ENV') or {}
