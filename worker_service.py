@@ -44,7 +44,7 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r69-verified-release'
+VERSION = 'vys-262-worker-r70-e2e-release'
 TRANSPORT_VERSION = 'vys-262-worker-r52-forensic-transport'
 R52_FORENSIC_LOG = str(os.getenv('R52_FORENSIC_LOG','1') or '1').strip().lower() not in {'0','false','no','off'}
 
@@ -5187,6 +5187,52 @@ def r44_test_echo():
     if not authorized():return {'ok':False},404
     body=request.get_json(silent=True) or {};nonce=str(body.get('nonce') or '')[:120]
     return _r44_test_wrap({'ok':True,'role':'heavy','nonce':nonce,'received_at':time.time(),'version':VERSION},200)
+
+# R70 end-to-end scratch path.  This is deliberately isolated from business data:
+# it proves that HEAVY can receive, durably write/read, process and callback the result.
+_R70_TEST_DB = CACHE_DIR / 'r70_e2e_test.sqlite3'
+_R70_TEST_LOCK = threading.RLock()
+
+def _r70_test_store_roundtrip(nonce: str, payload_hash: str) -> dict:
+    started=time.monotonic(); processed=hashlib.sha256(('R70:'+str(payload_hash)).encode('utf-8')).hexdigest()
+    with _R70_TEST_LOCK:
+        con=sqlite3.connect(str(_R70_TEST_DB),timeout=5,check_same_thread=False)
+        try:
+            con.execute('CREATE TABLE IF NOT EXISTS r70_roundtrip (nonce TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, processed_hash TEXT NOT NULL, created_at REAL NOT NULL)')
+            con.execute('INSERT OR REPLACE INTO r70_roundtrip(nonce,payload_hash,processed_hash,created_at) VALUES(?,?,?,?)',(str(nonce),str(payload_hash),processed,time.time()))
+            con.commit()
+            row=con.execute('SELECT payload_hash,processed_hash,created_at FROM r70_roundtrip WHERE nonce=?',(str(nonce),)).fetchone()
+            con.execute('DELETE FROM r70_roundtrip WHERE created_at<?',(time.time()-86400,));con.commit()
+        finally:
+            con.close()
+    if not row or str(row[0])!=str(payload_hash) or str(row[1])!=processed:
+        raise RuntimeError('R70 scratch write/read verification failed')
+    return {'stored':True,'read_back':True,'payload_hash':str(row[0]),'processed_hash':str(row[1]),'store_elapsed':round(time.monotonic()-started,4)}
+
+@app.route('/internal/r70/test/roundtrip',methods=['POST'])
+def r70_test_roundtrip():
+    if not authorized():return {'ok':False},404
+    started=time.monotonic();body=request.get_json(silent=True) or {}
+    nonce=str(body.get('nonce') or '')[:120];payload=str(body.get('payload') or '')[:4000]
+    if not nonce:return {'ok':False,'error':'nonce missing'},400
+    payload_hash=hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    try:
+        stored=_r70_test_store_roundtrip(nonce,payload_hash)
+        callback={'ok':False,'status':None,'elapsed':0.0,'error':'front not configured'}
+        base=front_base();secret=peer_secret()
+        if base and secret:
+            cb_start=time.monotonic()
+            try:
+                r=requests.post(base+'/internal/r70/test/result',json={'nonce':nonce,'payload_hash':payload_hash,'processed_hash':stored['processed_hash'],'from':'heavy','ts':time.time()},headers={'X-Peer-Secret':secret,'User-Agent':'per-r70-heavy-e2e'},timeout=(4,12))
+                try: rp=r.json() if r.content else {}
+                except Exception: rp={}
+                callback={'ok':bool(200<=r.status_code<300 and isinstance(rp,dict) and rp.get('ok') and str(rp.get('nonce') or '')==nonce and str(rp.get('processed_hash') or '')==stored['processed_hash']),'status':int(r.status_code),'elapsed':round(time.monotonic()-cb_start,4),'reply':rp}
+            except Exception as exc:
+                callback={'ok':False,'status':None,'elapsed':round(time.monotonic()-cb_start,4),'error':f'{type(exc).__name__}: {str(exc)[:300]}'}
+        ok=bool(stored.get('stored') and stored.get('read_back') and callback.get('ok'))
+        return _r44_test_wrap({'ok':ok,'role':'heavy','nonce':nonce,'accepted':True,'stored':stored.get('stored'),'read_back':stored.get('read_back'),'payload_hash':payload_hash,'processed_hash':stored.get('processed_hash'),'store_elapsed':stored.get('store_elapsed'),'front_callback':callback,'total_elapsed':round(time.monotonic()-started,4),'worker_version':VERSION},200 if ok else 502)
+    except Exception as exc:
+        return _r44_test_wrap({'ok':False,'nonce':nonce,'accepted':True,'error':f'{type(exc).__name__}: {str(exc)[:500]}','total_elapsed':round(time.monotonic()-started,4)},502)
 
 @app.route('/internal/r44/test/reverse',methods=['POST'])
 def r44_test_reverse():

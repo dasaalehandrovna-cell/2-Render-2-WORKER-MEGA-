@@ -16,12 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # R45: copy the complete HEAVY application into /app before CMD.
 COPY worker_service.py runtime_config.py FINALIZATION_GATE.py ./
 
-# R69: compile is not enough; execute module import after dependencies are installed.
+# R70: compile is not enough; execute module import after dependencies are installed.
 # This catches use-before-definition / bad final-owner aliases during Docker build.
 RUN python -m py_compile worker_service.py runtime_config.py FINALIZATION_GATE.py \
  && FINALIZATION_REQUIRE_INFO=0 FINALIZATION_RUNTIME_BUILD=1 python FINALIZATION_GATE.py \
  && MEGA_ENABLED=0 REDIS_ENABLED=0 REDIS_START_ENABLED=0 \
     MEGA_EMAIL= MEGA_PASSWORD= MEGA_BACKUP_DIR= REDIS_URL= \
-    python -c "import worker_service as w; assert w.process_file_job.__name__ == 'process_file_job_r43'; assert w.process_google_job.__name__ == 'process_google_job_r43'; assert not w._R48_WORKERS_STARTED; print('R69 HEAVY startup smoke PASS')"
+    python -c "import worker_service as w; assert w.process_file_job.__name__ == 'process_file_job_r43'; assert w.process_google_job.__name__ == 'process_google_job_r43'; assert not w._R48_WORKERS_STARTED; print('R70 HEAVY startup smoke PASS')"
 
 CMD ["python", "worker_service.py"]

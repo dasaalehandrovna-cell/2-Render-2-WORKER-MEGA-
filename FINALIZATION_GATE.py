@@ -178,7 +178,7 @@ elif ROLE=='heavy':
         docker=text('Dockerfile')
         ok('heavy_docker_startup_smoke',
            'FINALIZATION_REQUIRE_INFO=0 FINALIZATION_RUNTIME_BUILD=1 python FINALIZATION_GATE.py' in docker and
-           'R69 HEAVY startup smoke PASS' in docker and 'import worker_service as w' in docker,
+           'R70 HEAVY startup smoke PASS' in docker and 'import worker_service as w' in docker,
            'Docker build must execute runtime gate and startup import smoke')
     ok('heavy_state_events_route','/internal/state/events' in s,'state events endpoint missing')
     ns={}; exec(text('runtime_config.py'),ns); env=ns.get('WORKER_INTERNAL_ENV') or {}
@@ -236,6 +236,13 @@ elif ROLE=='heavy':
     ok('r65_automatic_mega_root_remains_strict',
        '_R58_STRICT_MEGA_ROOT = mega_root()' in s and 'MEGA_ENABLED=1 requires MEGA_BACKUP_DIR' in s,
        'manual browser must not weaken strict automatic MEGA root policy')
+    ok('r70_heavy_e2e_roundtrip_endpoint',
+       "@app.route('/internal/r70/test/roundtrip',methods=['POST'])" in s and
+       'def _r70_test_store_roundtrip' in s and
+       "CREATE TABLE IF NOT EXISTS r70_roundtrip" in s and
+       "/internal/r70/test/result" in s and
+       "R70 scratch write/read verification failed" in s,
+       'HEAVY must prove accept → durable scratch write/read → process → callback to FAST without touching business state')
 else:
     errors.append('cannot detect role')
 
