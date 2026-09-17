@@ -31,20 +31,17 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 import requests
-try:
-    import redis as _redis
-except Exception:
-    _redis = None
+_redis = None  # очнись_12.2: Redis client/package removed from HEAVY
 from flask import Flask, request, Response, send_file
 from openpyxl import Workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from runtime_config import install_internal_runtime_config, CONFIG_VERSION as INTERNAL_CONFIG_VERSION, redis_runtime_state, set_redis_runtime_enabled, redis_effective_url, redis_render_url
+from runtime_config import install_internal_runtime_config, CONFIG_VERSION as INTERNAL_CONFIG_VERSION
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'очнись_12-heavy'
+VERSION = 'очнись_12.2-heavy'
 TRANSPORT_VERSION = 'vys-262-worker-r52-forensic-transport'
 R52_FORENSIC_LOG = str(os.getenv('R52_FORENSIC_LOG','1') or '1').strip().lower() not in {'0','false','no','off'}
 
@@ -296,7 +293,6 @@ def _event_mark_mirrored_v268(event_ids,state_token=''):
     for eid in ids:
         row={'event_id':eid,'update_id':eid,'state':'mirrored','mirrored_at':time.time(),'state_token':str(state_token or '')[:120],'last_error':''}
         if _event_local_upsert_v268(row): n+=1
-        _event_redis_store_v268(row)
     with STATE_LOCK:
         STATE['event_mirrored']=int(STATE.get('event_mirrored') or 0)+n; STATE['event_last_at']=time.time()
         try:
@@ -305,7 +301,6 @@ def _event_mark_mirrored_v268(event_ids,state_token=''):
     return n
 
 def _event_pending_rows_v268(limit=100):
-    _event_hydrate_pending_from_redis_v268(limit*2)
     _event_db_init_v268()
     with EVENT_LOCK:
         conn=sqlite3.connect(EVENT_DB,timeout=10)
@@ -324,51 +319,26 @@ def _event_pending_rows_v268(limit=100):
     return out
 
 def _event_reconcile_loop_v268():
+    """OCH12.2: HEAVY event witness is local SQLite; Redis reconciliation was removed."""
     while True:
-        time.sleep(env_int('WORKER_EVENT_REDIS_RECONCILE_SEC',5,1,300))
+        time.sleep(env_int('WORKER_EVENT_RECONCILE_SEC',5,1,300))
         try:
-            if not str(redis_effective_url() or '').strip() or _redis is None:
-                try:
-                    _event_db_init_v268()
-                    with EVENT_LOCK:
-                        conn=sqlite3.connect(EVENT_DB,timeout=10)
-                        pending=int(conn.execute("SELECT COUNT(*) FROM events WHERE state IN ('received','failed_retry','committed')").fetchone()[0])
-                        conn.close()
-                    with STATE_LOCK:
-                        STATE['event_pending']=pending; STATE['event_last_error']=''
-                except Exception:
-                    pass
-                continue
-            _event_hydrate_pending_from_redis_v268(500)
-            # R15: any Worker-local event not yet guaranteed in Redis is retried here.
             _event_db_init_v268()
             with EVENT_LOCK:
                 conn=sqlite3.connect(EVENT_DB,timeout=10)
-                rows=conn.execute("SELECT event_id,update_id,chat_id,update_type,payload_json,payload_sha256,state,received_at,committed_at,state_token,last_error FROM events WHERE state IN ('received','failed_retry','committed') ORDER BY updated_at ASC LIMIT 200").fetchall()
-                conn.close()
-            for r in rows:
-                try: payload=json.loads(r[4] or '{}')
-                except Exception: payload={}
-                row={'event_id':r[0],'update_id':r[1],'chat_id':r[2],'update_type':r[3],'payload':payload,'payload_sha256':r[5],'state':r[6],'received_at':r[7],'committed_at':r[8],'state_token':r[9],'last_error':r[10]}
-                _event_redis_store_v268(row)
-            # prune old mirrored local diagnostics; Redis keys expire independently.
-            cutoff=time.time()-env_int('WORKER_EVENT_RETENTION_SEC',604800,86400,2592000)
-            with EVENT_LOCK:
-                conn=sqlite3.connect(EVENT_DB,timeout=10); conn.execute("DELETE FROM events WHERE state='mirrored' AND updated_at<?",(cutoff,)); conn.commit(); conn.close()
+                try:
+                    pending=int(conn.execute("SELECT COUNT(*) FROM events WHERE state IN ('received','failed_retry','committed')").fetchone()[0])
+                finally:
+                    conn.close()
+            with STATE_LOCK:
+                STATE['event_pending']=pending; STATE['event_last_error']=''
         except Exception as exc:
-            with STATE_LOCK: STATE['event_last_error']=f'{type(exc).__name__}: {str(exc)[:180]}'
+            with STATE_LOCK:
+                STATE['event_last_error']=f'local reconcile {type(exc).__name__}: {str(exc)[:180]}'
 
 def _redis_client():
-    global _REDIS_CLIENT, _R44_TEST_REDIS_CLIENT
-    if _redis is None:
-        return None
-    url = str(redis_effective_url() or '').strip()
-    if not url:
-        return None
-    with _REDIS_LOCK:
-        if _REDIS_CLIENT is None:
-            _REDIS_CLIENT = _redis.Redis.from_url(url, socket_connect_timeout=5, socket_timeout=12, health_check_interval=30)
-        return _REDIS_CLIENT
+    """очнись_12.2: Render #2 never opens Redis/Valkey connections."""
+    return None
 
 def redis_load_snapshot_to_cache():
     client = _redis_client()
@@ -1616,13 +1586,8 @@ def internal_r32_state_events():
 @app.route('/internal/r32/status',methods=['GET'])
 def internal_r32_status():
     if not authorized(): return {'ok':False},404
-    client=_redis_client(); pending=0; total=0
-    try:
-        if client is not None:
-            pending=int(client.llen(_r32_pending_key()) or 0); total=int(client.zcard(_r32_index_key()) or 0)
-    except Exception: pass
     with STATE_LOCK: st={k:v for k,v in STATE.items() if str(k).startswith('r32_')}
-    return {'ok':True,'event_stream':True,'redis_events':total,'mega_pending':pending,'state':st},200
+    return {'ok':True,'event_stream':True,'redis':'removed','mega_event_archive':True,'state':st},200
 
 
 @app.route('/', methods=['GET','HEAD'])
@@ -1647,21 +1612,7 @@ def internal_event_receipt_v268():
     row['state']='received'; row['received_at']=float(row.get('received_at') or time.time()); row['updated_at']=time.time()
     if not _event_local_upsert_v268(row):
         return {'ok':False,'error':'worker local event journal failed'},503
-    # R54 Redis-OFF contract: the user's explicit Redis switch must not eventually
-    # fill EVENT_REDIS_Q and turn every normal Telegram message into HTTP 503.
-    # Worker-local SQLite is FULL-synchronous and is enough for raw-update witness;
-    # committed business state is independently mirrored through the R32 MEGA stream.
-    redis_enabled = bool(str(redis_effective_url() or '').strip()) and (_redis is not None)
-    if redis_enabled:
-        queued=_event_redis_enqueue_v270(row)
-        if not queued:
-            rok,rdetail=_event_redis_store_v268(row)
-            if not rok:
-                with STATE_LOCK: STATE['event_last_error']=str(rdetail)[:220]
-                return {'ok':False,'error':'event witness queue+Redis failed: '+str(rdetail)[:180]},503
-        durability='worker_local+redis_async'
-    else:
-        durability='worker_local_redis_off'
+    durability='worker_local_sqlite'
     with STATE_LOCK:
         STATE['event_received']=int(STATE.get('event_received') or 0)+1; STATE['event_last_at']=time.time(); STATE['event_last_error']=''
     return {'ok':True,'event_id':eid,'state':'received','durable':durability},200
@@ -1676,13 +1627,7 @@ def internal_event_commit_v268():
     if state=='committed' and not float(row.get('committed_at') or 0.0): row['committed_at']=time.time()
     if not _event_local_upsert_v268(row):
         return {'ok':False,'error':'worker local event commit journal failed'},503
-    redis_enabled = bool(str(redis_effective_url() or '').strip()) and (_redis is not None)
-    if redis_enabled:
-        rok,rdetail=_event_redis_store_v268(row)
-        if not rok: return {'ok':False,'error':'Redis event update failed: '+str(rdetail)[:180]},503
-        durability='worker_local+redis'
-    else:
-        durability='worker_local_redis_off'
+    durability='worker_local_sqlite'
     with STATE_LOCK:
         if state=='committed': STATE['event_committed']=int(STATE.get('event_committed') or 0)+1
         STATE['event_last_at']=time.time(); STATE['event_last_error']=''
@@ -1868,6 +1813,40 @@ def internal_google_test():
         return {'ok':True,'spreadsheet_id':spreadsheet_id,'title':title,'service_email':info.get('client_email')},200
     except Exception as exc:
         return {'ok':False,'error':str(exc)[:700]},502
+
+@app.route('/internal/pre-restore/upload', methods=['POST'])
+def internal_pre_restore_upload():
+    """Store a verified pre-restore SQLite image in HEAVY-owned MEGA before FAST mutates live data."""
+    if not authorized(): return {'ok':False},404
+    max_bytes=env_int('WORKER_SNAPSHOT_UPLOAD_MAX_MB',64,4,512)*1024*1024
+    raw=request.get_data(cache=False,as_text=False) or b''
+    if not raw: return {'ok':False,'error':'empty pre-restore snapshot'},400
+    if len(raw)>max_bytes: return {'ok':False,'error':f'pre-restore snapshot too large: {len(raw)} > {max_bytes}'},413
+    work=Path(tempfile.mkdtemp(prefix='och122_pre_restore_'))
+    local=work/'pre_restore.sqlite3.gz'
+    try:
+        local.write_bytes(raw)
+        ok,detail,meta=quick_check_gzip(local)
+        if not ok: return {'ok':False,'error':'invalid pre-restore SQLite snapshot: '+str(detail)[:400]},400
+        stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+        reason=re.sub(r'[^A-Za-z0-9_.-]+','_',str(request.headers.get('X-Pre-Restore-Reason') or 'manual_restore'))[:80].strip('_') or 'manual_restore'
+        filename=f'pre_restore_{stamp}_{reason}.sqlite3.gz'
+        named=work/filename; os.replace(local,named); local=named
+        with MEGA_LOCK:
+            layout_ok,layout_detail=prepare_mega_layout()
+            if not layout_ok: return {'ok':False,'error':str(layout_detail)[:500]},502
+            remote_dir=remote_db_dir().rstrip('/')+'/pre_restore'
+            if not ensure_mega_dir(remote_dir): return {'ok':False,'error':'cannot create MEGA pre_restore directory'},502
+            put=run_cmd(['mega-put',str(local),remote_dir],timeout=env_int('MEGA_TIMEOUT',180,30,900))
+            if put.returncode!=0: return {'ok':False,'error':'mega-put pre_restore failed: '+(put.stderr or put.stdout or '')[:400]},502
+            remote=remote_dir+'/'+filename
+            if not mega_exists(remote): return {'ok':False,'error':'MEGA pre_restore verify failed'},502
+        with STATE_LOCK:
+            STATE['last_pre_restore_at']=time.time(); STATE['last_pre_restore_size']=int(meta.get('size') or len(raw)); STATE['last_pre_restore_sha256']=str(meta.get('sha256_gz') or '')
+        print(f'[OCH12.2 PRE_RESTORE] stored bytes={len(raw)} file={filename}',flush=True)
+        return {'ok':True,'mega_stored':True,'filename':filename,'size':int(meta.get('size') or len(raw)),'sha256':str(meta.get('sha256_gz') or '')},200
+    finally:
+        shutil.rmtree(work,ignore_errors=True)
 
 @app.route('/internal/snapshot/upload', methods=['POST'])
 def internal_snapshot_upload():
@@ -2095,15 +2074,6 @@ def _capsule_merge_r20(*rows):
 
 def _capsule_load_latest_r20(deep_mega=False):
     rows=[]; detail=[]
-    client=_redis_client()
-    if client is not None:
-        try:
-            raw=client.get(_REDIS_CAPSULE_KEY)
-            if raw:
-                obj,err=_capsule_decode_r20(bytes(raw))
-                if obj: rows.append(obj); detail.append('redis')
-                elif err: detail.append('redis:'+err)
-        except Exception as exc: detail.append('redis:'+str(exc)[:100])
     try:
         if CAPSULE_LOCAL.is_file():
             obj,err=_capsule_decode_r20(CAPSULE_LOCAL.read_bytes())
@@ -2126,22 +2096,15 @@ def _capsule_store_r20(obj:dict, packed:bytes):
         packed=gzip.compress(json.dumps(merged,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
         new_t=_capsule_tuple_r20(merged)
         tmp=CAPSULE_LOCAL.with_suffix('.tmp'); tmp.write_bytes(packed); os.replace(tmp,CAPSULE_LOCAL)
-        redis_ok=False; redis_detail='Redis disabled'
-        client=_redis_client()
-        if client is not None:
-            try:
-                meta={'user_state_seq':new_t[0],'config_generation':new_t[1],'saved_at':new_t[2],'size':len(packed),'source':'och12-heavy-cache'}
-                pipe=client.pipeline(transaction=True); pipe.set(_REDIS_CAPSULE_KEY,packed,ex=86400); pipe.set(_REDIS_CAPSULE_KEY+':meta',json.dumps(meta,separators=(',',':')),ex=86400); pipe.execute(); redis_ok=True; redis_detail='cached'
-            except Exception as exc: redis_detail=f'{type(exc).__name__}: {str(exc)[:160]}'
         with STATE_LOCK:
-            STATE['capsule_seq']=new_t[0]; STATE['capsule_generation']=new_t[1]; STATE['capsule_saved_at']=new_t[2]; STATE['capsule_last_error']='' if redis_ok else ('redis-cache: '+redis_detail)[:220]
+            STATE['capsule_seq']=new_t[0]; STATE['capsule_generation']=new_t[1]; STATE['capsule_saved_at']=new_t[2]; STATE['capsule_last_error']=''
         _capsule_mega_enqueue_r20()
-        return True, f'HEAVY local capsule seq={new_t[0]} gen={new_t[1]}; redis_cache={int(redis_ok)}'
+        return True, f'HEAVY local capsule seq={new_t[0]} gen={new_t[1]}; mega_queue=1'
 
 @app.route('/internal/capsule',methods=['POST'])
 def internal_capsule_r20():
     if not authorized(): return {'ok':False},404
-    max_bytes=env_int('WORKER_REDIS_CAPSULE_MAX_MB',8,1,32)*1024*1024
+    max_bytes=env_int('WORKER_CAPSULE_MAX_MB',8,1,32)*1024*1024
     raw=request.get_data(cache=False)
     if not raw or len(raw)>max_bytes: return {'ok':False,'error':'invalid capsule size'},413
     obj,err=_capsule_decode_r20(raw)
@@ -2161,15 +2124,12 @@ def internal_capsule_latest_r20():
     deep=str(request.args.get('deep') or '').strip().lower() in {'1','true','yes','on'}
     obj,detail=_capsule_load_latest_r20(deep_mega=(deep and not _R43_DIRECT_HEAVY))
     if not obj: return {'ok':False,'error':'capsule not available','detail':detail},404
-    # A deep boot restore also heals local/Redis from MEGA without waiting for the next change.
+    # A deep boot restore heals the HEAVY local capsule from MEGA.
     if deep:
         try:
             packed0=gzip.compress(json.dumps(obj,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
             with CAPSULE_LOCK:
                 tmp=CAPSULE_LOCAL.with_suffix('.tmp'); tmp.write_bytes(packed0); os.replace(tmp,CAPSULE_LOCAL)
-            client=_redis_client()
-            if client is not None:
-                pipe=client.pipeline(transaction=True); pipe.set(_REDIS_CAPSULE_KEY,packed0); pipe.set(_REDIS_CAPSULE_KEY+':meta',json.dumps({'user_state_seq':_capsule_tuple_r20(obj)[0],'config_generation':_capsule_tuple_r20(obj)[1],'saved_at':_capsule_tuple_r20(obj)[2],'size':len(packed0),'source':'worker-r20-deep'},separators=(',',':'))); pipe.execute()
         except Exception: pass
     packed=gzip.compress(json.dumps(obj,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
     resp=Response(packed,status=200,mimetype='application/gzip')
@@ -2179,43 +2139,42 @@ def internal_capsule_latest_r20():
 @app.route('/internal/restore/latest', methods=['GET'])
 def internal_restore_latest():
     if not authorized(): return {'ok':False},404
-    # R32: assemble the newest restore image from the latest checkpoint + immutable events.
     try:
-        _r32_replay_state_events_from_redis()
-        with DELTA_APPLY_LOCK:
-            _ok32,_detail32,_meta32=_ensure_cache_db_v267()
-            if _ok32:
-                _gzip_cache_db_v267()
-    except Exception as _r32_restore_exc:
-        with STATE_LOCK: STATE['r32_state_last_error']=f'restore assemble: {type(_r32_restore_exc).__name__}: {str(_r32_restore_exc)[:180]}'
-    cache_max_age=env_int('WORKER_RESTORE_CACHE_MAX_AGE_SEC',120,0,3600)
-    if not CACHE_LATEST.exists():
-        redis_ok, redis_detail = redis_load_snapshot_to_cache()
-        if not redis_ok:
-            started=_schedule_restore_refresh()
-            return {'ok':False,'error':'restore cache not ready','redis':redis_detail,'refresh_queued':bool(started)},503
-    # Never serve corrupt cache just because the file exists.
-    ok, detail, meta = quick_check_gzip(CACHE_LATEST)
-    if not ok:
-        CACHE_LATEST.unlink(missing_ok=True)
-        redis_ok, redis_detail = redis_load_snapshot_to_cache()
-        if not redis_ok:
-            started=_schedule_restore_refresh()
-            return {'ok':False,'error':'restore cache invalid','detail':detail,'redis':redis_detail,'refresh_queued':bool(started)},503
-        ok, detail, meta = quick_check_gzip(CACHE_LATEST)
+        if not CACHE_LATEST.exists():
+            snap,mega_detail=_download_mega_latest()
+            if not snap:
+                return {'ok':False,'error':'restore cache not ready','mega':str(mega_detail)[:300]},503
+        ok,detail,meta=quick_check_gzip(CACHE_LATEST)
         if not ok:
-            return {'ok':False,'error':'Redis restore cache invalid after reload'},503
-    age=max(0.0,time.time()-CACHE_LATEST.stat().st_mtime)
-    if cache_max_age <= 0 or age > cache_max_age:
-        _schedule_restore_refresh()
-    payload=CACHE_LATEST.read_bytes()
-    resp=Response(payload,status=200,mimetype='application/gzip')
-    resp.headers['Content-Disposition']='attachment; filename="latest_bot_state.sqlite3.gz"'
-    resp.headers['X-Worker-Version']=TRANSPORT_VERSION
-    resp.headers['X-SHA256']=hashlib.sha256(payload).hexdigest()
-    resp.headers['X-Cache-Age-Sec']=str(int(age))
-    resp.headers['X-State-Revision']=str(float(meta.get('revision') or 0.0))
-    return resp
+            CACHE_LATEST.unlink(missing_ok=True)
+            snap,mega_detail=_download_mega_latest()
+            if not snap:
+                return {'ok':False,'error':'restore cache invalid','detail':str(detail)[:220],'mega':str(mega_detail)[:300]},503
+            ok,detail,meta=quick_check_gzip(CACHE_LATEST)
+            if not ok:
+                return {'ok':False,'error':'MEGA restore cache invalid','detail':str(detail)[:300]},503
+        # Rebuild post-checkpoint changes from immutable MEGA event pieces.
+        try:
+            ok32,detail32=_r32_replay_state_events_from_mega()
+            if ok32 and CACHE_DB.exists():
+                with DELTA_APPLY_LOCK: _gzip_cache_db_v267()
+                ok,detail,meta=quick_check_gzip(CACHE_LATEST)
+        except Exception as exc:
+            with STATE_LOCK: STATE['r32_state_last_error']=f'restore MEGA replay: {type(exc).__name__}: {str(exc)[:180]}'
+        age=max(0.0,time.time()-CACHE_LATEST.stat().st_mtime)
+        cache_max_age=env_int('WORKER_RESTORE_CACHE_MAX_AGE_SEC',120,0,3600)
+        if cache_max_age <= 0 or age > cache_max_age:
+            _schedule_restore_refresh()
+        payload=CACHE_LATEST.read_bytes()
+        resp=Response(payload,status=200,mimetype='application/gzip')
+        resp.headers['Content-Disposition']='attachment; filename="latest_bot_state.sqlite3.gz"'
+        resp.headers['X-Worker-Version']=TRANSPORT_VERSION
+        resp.headers['X-SHA256']=hashlib.sha256(payload).hexdigest()
+        resp.headers['X-Cache-Age-Sec']=str(int(age))
+        resp.headers['X-State-Revision']=str(float(meta.get('revision') or 0.0))
+        return resp
+    except Exception as exc:
+        return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:500]}'},500
 
 @app.route('/internal/r34/seed-status',methods=['GET'])
 def internal_r34_seed_status():
@@ -3216,10 +3175,8 @@ def _r34_process_state_event_wire(wire,max_wire):
             ok,detail,applied,stale=_r32_apply_events(events)
     except Exception as exc:
         ok=False; detail=f'{type(exc).__name__}: {str(exc)[:220]}'; applied=stale=0
-    # Redis is cache-only: failure never rejects a HEAVY receipt.
-    redis_ok,redis_detail,new_ids=_r32_redis_store_events(events)
-    # MEGA archive is detached from the HTTP receipt; if Redis is absent we also wake
-    # the direct MEGA queue so no Redis dependency exists in the archival path.
+    new_ids=[str(ev.get('event_id') or '') for ev in events if str(ev.get('event_id') or '')]
+    # MEGA archive is detached from the HTTP receipt; HEAVY local FULL SQLite is the immediate witness.
     mega_queued=False
     if mega_enabled():
         try: mega_queued=bool(_och12_enqueue_state_events_mega(events))
@@ -3233,15 +3190,13 @@ def _r34_process_state_event_wire(wire,max_wire):
         STATE['r32_state_events_received']=int(STATE.get('r32_state_events_received') or 0)+len(events)
         STATE['r32_state_event_bytes']=int(STATE.get('r32_state_event_bytes') or 0)+len(wire)
         STATE['r33_last_event_durability']='heavy-sqlite'
-        STATE['redis_cache_ok']=bool(redis_ok)
-        if not redis_ok: STATE['redis_last_error']=str(redis_detail)[:220]
         if ok: STATE['r34_max_applied_revision']=max(int(STATE.get('r34_max_applied_revision') or 0),max_rev)
         else: STATE['r32_state_last_error']='durable receipt; apply pending: '+str(detail)[:180]
     try: applied_revision=_r34_current_applied_revision(refresh=True)
     except Exception: applied_revision=(max_rev if ok else int(STATE.get('r34_max_applied_revision') or 0))
     return {'ok':True,'durable':'heavy-sqlite','events':len(events),'new':len(new_ids),'applied':applied,'stale':stale,'apply_ok':bool(ok),
             'apply_detail':str(detail)[:180],'max_revision':max_rev,'durable_revision':max_rev,'applied_revision':int(applied_revision or 0),
-            'redis_cache_ok':bool(redis_ok),'redis_cache_detail':str(redis_detail)[:160],'mega_queued':bool(mega_queued)},200
+            'mega_queued':bool(mega_queued)},200
 
 def _r33_state_events_view():
     if not authorized(): return {'ok':False},404
@@ -3399,8 +3354,7 @@ def _r36_mega_pending_rows(limit=100):
 def _r35_job_key(jid): return _R35_JOB_PREFIX+str(jid or '')[:80]
 
 def _r35_job_get(jid):
-    # R36: merge process-local spool and Redis by freshness. Local SQLite survives
-    # ordinary process restarts; Redis/MEGA cover container replacement.
+    # OCH12.2: process-local SQLite is the live spool; MEGA covers container replacement.
     best=_r36_local_job_get(jid)
     c=_redis_client()
     try:
@@ -3471,14 +3425,14 @@ def _internal_export_file_durable():
         rec={'status':'admitting','ok':None,'job':job,'recipient_chat_id':cid,'target_chat_id':body.get('target_chat_id'),'durable_backend':''}
         _r36_local_job_put(jid,rec)
         redis_ok=_r35_job_put(jid,rec,pending=True)
-        backend='redis' if redis_ok else ''
+        backend=''  # OCH12.2: HEAVY Redis removed
         mega_detail=''
         if not backend:
             mega_rec=dict(rec); mega_rec.update({'status':'queued','durable_backend':'mega','durable_at':time.time()})
             mega_ok,mega_detail=_r36_mega_job_put(jid,mega_rec)
             if mega_ok: backend='mega'
         if not backend:
-            rec.update({'status':'admission_failed','ok':False,'error':'durable spool unavailable: '+str(mega_detail or 'Redis and MEGA unavailable')[:400]})
+            rec.update({'status':'admission_failed','ok':False,'error':'durable spool unavailable: '+str(mega_detail or 'MEGA unavailable')[:400]})
             _r36_local_job_put(jid,rec)
             with FILE_JOB_LOCK: FILE_JOB_STATUS.pop(jid,None)
             return {'ok':False,'error':rec['error'],'job_id':jid,'durable':False},503
@@ -3873,12 +3827,12 @@ def internal_google_sheet_r38():
             if job and status in {'queued','running'}:_r38_google_enqueue(job)
             return {'ok':True,'duplicate':True,'status':status,'job_id':jid,'url':str(existing.get('url') or ''),'durable':True,'durable_backend':str(existing.get('durable_backend') or '')},200 if status in {'delivered','closed'} else 202
         job={'id':jid,'type':'google_sheet','created_at':time.time(),'payload':body};rec={'job_id':jid,'status':'admitting','ok':None,'job':job,'recipient_chat_id':cid,'durable_backend':''}
-        _r38_google_local_put(jid,rec);redis_ok,_local_ok=_r38_google_put(jid,rec,pending=True);backend='redis' if redis_ok else '';detail=''
+        _r38_google_local_put(jid,rec);redis_ok,_local_ok=_r38_google_put(jid,rec,pending=True);backend=''  # OCH12.2: HEAVY Redis removed;detail=''
         if not backend:
             mrec=dict(rec);mrec.update({'status':'queued','durable_backend':'mega','durable_at':time.time()});mok,detail=_r38_google_mega_put(jid,mrec)
             if mok:backend='mega'
         if not backend:
-            rec.update({'status':'admission_failed','ok':False,'error':'durable Google spool unavailable: '+str(detail or 'Redis and MEGA unavailable')[:400]});_r38_google_local_put(jid,rec)
+            rec.update({'status':'admission_failed','ok':False,'error':'durable Google spool unavailable: '+str(detail or 'MEGA unavailable')[:400]});_r38_google_local_put(jid,rec)
             return {'ok':False,'error':rec['error'],'job_id':jid,'durable':False},503
         rec.update({'status':'queued','ok':None,'durable_backend':backend,'durable_at':time.time()});_r38_google_put(jid,rec,pending=True);queued=_r38_google_enqueue(job)
         return {'ok':True,'status':'queued','job_id':jid,'queue_size':GOOGLE_Q.qsize(),'queued_now':bool(queued),'durable':True,'durable_backend':backend},202
@@ -4334,12 +4288,7 @@ def _r41_front_durable(body):
 
 
 def _r41_heavy_redis_live():
-    try:
-        c=_redis_client()
-        return c is not None and bool(c.ping())
-    except Exception:
-        return False
-
+    return False
 
 def internal_export_file_r41():
     if not authorized(): return {'ok':False},404
@@ -4620,14 +4569,14 @@ def google_loop():
             GOOGLE_Q.task_done()
 
 def _r63_seed_shared_redis_from_front():
-    """OCH12 compatibility entry: never seed a full Redis snapshot."""
-    return _och12_drop_legacy_redis_full_images()
+    """Legacy entry kept callable; Redis was removed from HEAVY in OCH12.2."""
+    return False
 
 _R48_WORKERS_STARTED=False
 _R48_WORKERS_START_LOCK=threading.Lock()
 
 def _start_final_workers():
-    """Start final workers. OCH12 keeps Redis optional/cache-only."""
+    """Start final workers. OCH12.2 HEAVY uses local SQLite + MEGA and has no Redis client."""
     global _R48_WORKERS_STARTED
     with _R48_WORKERS_START_LOCK:
         if _R48_WORKERS_STARTED: return
@@ -4639,24 +4588,14 @@ def _start_final_workers():
         threading.Thread(target=google_loop,name='per-r48-worker-google',daemon=True).start()
         threading.Thread(target=peer_loop,name='per-r48-worker-peer',daemon=True).start()
         threading.Thread(target=_capsule_mega_loop_r20,name='och12-capsule-mega',daemon=True).start()
-        threading.Thread(target=_event_redis_flush_loop_v270,name='och12-event-redis-cache',daemon=True).start()
         threading.Thread(target=_event_reconcile_loop_v268,name='och12-event-reconcile',daemon=True).start()
         threading.Thread(target=_och12_state_mega_loop,name='och12-state-mega',daemon=True).start()
         threading.Thread(target=_checkpoint_loop_v267,name='och12-heavy-checkpoint',daemon=True).start()
-        # Legacy migration only: use an old Redis full image once if present, then retire
-        # those large keys. OCH12 never seeds/writes a new Redis full SQLite image.
-        if _redis_client() is not None:
-            try:
-                rok,rdetail=redis_load_snapshot_to_cache(); print(f'[OCH12 REDIS LEGACY BOOT] snapshot ok={rok} {rdetail}',flush=True)
-                if rok:
-                    eok,edetail=_r32_replay_state_events_from_redis(limit=5000); print(f'[OCH12 REDIS LEGACY BOOT] events ok={eok} {edetail}',flush=True)
-                _och12_drop_legacy_redis_full_images()
-            except Exception as exc:
-                print(f'[OCH12 REDIS LEGACY BOOT] error={type(exc).__name__}: {str(exc)[:220]}',flush=True)
-        # Bootstrap HEAVY from FAST only when no local baseline survived/migrated.
+        # Bootstrap HEAVY from FAST only when no local baseline survived.
+
         if not CACHE_DB.exists():
             threading.Thread(target=_r43_bootstrap_snapshot_loop,name='och12-heavy-bootstrap',daemon=True).start()
-        print('[OCH12 HEAVY] HEAVY ACK + local SQLite/MEGA authority; Redis bounded optional cache',flush=True)
+        print('[OCH12.2 HEAVY] HEAVY ACK + local SQLite + MEGA authority; Redis removed',flush=True)
         return
 
     # Legacy non-direct emergency mode.
@@ -4664,7 +4603,6 @@ def _start_final_workers():
     threading.Thread(target=file_loop,name='per-r48-worker-files-2',daemon=True).start()
     for idx in range(1,5): threading.Thread(target=_r35_result_loop,name=f'per-r48-result-{idx}',daemon=True).start()
     threading.Thread(target=_capsule_mega_loop_r20,name='vys262-worker-capsule-mega-r20',daemon=True).start()
-    threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
     threading.Thread(target=_och12_state_mega_loop,name='och12-state-mega',daemon=True).start()
     threading.Thread(target=worker_loop,name='vys262-worker-jobs',daemon=True).start()
     threading.Thread(target=google_loop,name='per-r48-worker-google',daemon=True).start()
@@ -4716,52 +4654,12 @@ if _R43_DIRECT_HEAVY:
 # ---------------------------------------------------------------------------
 # R44 DIAGNOSTIC INTEROP API
 # Isolated from production job transport.  It lets FAST prove, step by step,
-# what HEAVY can see and return: HTTP, reverse HEAVY->FAST, shared Redis,
+# what HEAVY can see and return: HTTP, reverse HEAVY->FAST,
 # fresh FAST snapshot and MEGA folder/file access.
 import posixpath as _r44_posixpath
-_R44_TEST_KEY_PREFIX='per:r44:test:'
-_R44_TEST_REDIS_LOCK=threading.RLock()
-_R44_TEST_REDIS_CLIENT=None
-_R44_TEST_REDIS_ERROR=''
-
-def _r44_test_redis_client():
-    global _R44_TEST_REDIS_CLIENT,_R44_TEST_REDIS_ERROR
-    with _R44_TEST_REDIS_LOCK:
-        if _R44_TEST_REDIS_CLIENT is not None:
-            try:
-                if _R44_TEST_REDIS_CLIENT.ping(): return _R44_TEST_REDIS_CLIENT
-            except Exception: _R44_TEST_REDIS_CLIENT=None
-        if _redis is None:
-            _R44_TEST_REDIS_ERROR='redis package unavailable'; return None
-        url=str(redis_effective_url() or '').strip()
-        if not url:
-            _R44_TEST_REDIS_ERROR='REDIS_URL not configured'; return None
-        try:
-            c=_redis.Redis.from_url(url,decode_responses=False,socket_connect_timeout=2,socket_timeout=3)
-            if not c.ping(): raise RuntimeError('PING false')
-            _R44_TEST_REDIS_CLIENT=c;_R44_TEST_REDIS_ERROR='';return c
-        except Exception as exc:
-            _R44_TEST_REDIS_ERROR=f'{type(exc).__name__}: {str(exc)[:180]}';return None
-
-def _r44_test_redis_handshake():
-    nonce=str(request.headers.get('X-R44-Redis-Test','') or '').strip()[:80]
-    if not nonce:return {'requested':False,'ok':None}
-    c=_r44_test_redis_client()
-    if c is None:return {'requested':True,'ok':False,'error':_R44_TEST_REDIS_ERROR}
-    key=_R44_TEST_KEY_PREFIX+nonce
-    try:
-        raw=c.get(key)
-        if isinstance(raw,bytes):raw=raw.decode('utf-8','replace')
-        obj=json.loads(raw or '{}') if raw else {}
-        front_seen=str(obj.get('side') or '')=='front'
-        ack={'side':'heavy','front_seen':front_seen,'heavy_ts':time.time(),'worker':VERSION}
-        c.setex(key,90,json.dumps(ack,separators=(',',':')))
-        return {'requested':True,'ok':bool(front_seen),'front_seen':bool(front_seen)}
-    except Exception as exc:return {'requested':True,'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:180]}'}
-
 def _r44_test_wrap(payload,status=200):
-    obj=dict(payload or {});obj.setdefault('ok',200<=int(status)<300);obj['redis_test']=_r44_test_redis_handshake();obj['r44_diag']=True
-    print(f'[R44 TEST] path={request.path} status={status} redis={obj["redis_test"]}',flush=True)
+    obj=dict(payload or {});obj.setdefault('ok',200<=int(status)<300);obj['r44_diag']=True;obj['redis_removed']=True
+    print(f'[R44 TEST] path={request.path} status={status}',flush=True)
     return obj,status
 
 def _r44_safe_mega_path(raw,allow_file=True):
@@ -4859,71 +4757,12 @@ def internal_restore_failed_tasks():
 
 
 def _r59_redis_quick_probe():
-    if _redis is None:
-        return False, 'redis package unavailable'
-    url=str(redis_effective_url() or '').strip()
-    if not url:
-        return False, 'REDIS_URL empty after runtime enable'
-    client=None
-    try:
-        client=_redis.Redis.from_url(url,socket_connect_timeout=0.8,socket_timeout=1.2,health_check_interval=30)
-        ok=bool(client.ping())
-        return (ok,'PING=PONG' if ok else 'PING failed')
-    except Exception as exc:
-        return False,f'{type(exc).__name__}: {str(exc)[:180]}'
-    finally:
-        try:
-            if client is not None: client.close()
-        except Exception: pass
+    return False, 'Redis removed from Render #2 in очнись_12.2'
 
 @app.route('/internal/runtime/redis', methods=['GET','POST'])
 def internal_runtime_redis():
-    """R59 owner-controlled runtime Redis switch with a real short PING."""
-    if not authorized():
-        return {'ok':False},404
-    global _REDIS_CLIENT, _R44_TEST_REDIS_CLIENT
-    if request.method == 'POST':
-        body = request.get_json(silent=True) or {}
-        requested = bool(body.get('enabled'))
-
-        # Close cached clients first so every transition is applied to a fresh socket.
-        with _REDIS_LOCK:
-            old = _REDIS_CLIENT
-            _REDIS_CLIENT = None
-        try:
-            if old is not None: old.close()
-        except Exception: pass
-        try:
-            with _R44_TEST_REDIS_LOCK:
-                test_old = _R44_TEST_REDIS_CLIENT
-                _R44_TEST_REDIS_CLIENT = None
-            if test_old is not None:
-                try: test_old.close()
-                except Exception: pass
-        except Exception: pass
-
-        state = set_redis_runtime_enabled(requested)
-        if requested:
-            if not bool(state.get('enabled')):
-                err=str(state.get('error') or 'HEAVY Redis was not enabled')[:240]
-                return {'ok':False,'role':'heavy','redis':state,'error':err},409
-            ping_ok,ping_detail=_r59_redis_quick_probe()
-            if not ping_ok:
-                state=set_redis_runtime_enabled(False)
-                state['error']=ping_detail
-                with STATE_LOCK:
-                    STATE['redis_cache_ok']=False; STATE['redis_last_error']=ping_detail
-                return {'ok':False,'role':'heavy','redis':state,'error':ping_detail},503
-            state['ping']='PONG'
-            with STATE_LOCK:
-                STATE['redis_cache_ok']=True; STATE['redis_last_error']=''
-        else:
-            with STATE_LOCK:
-                STATE['redis_cache_ok']=False; STATE['redis_last_error']='runtime Redis disabled by owner'
-    else:
-        state = redis_runtime_state()
-    return {'ok':True,'role':'heavy','redis':state},200
-
+    if not authorized(): return {'ok':False},404
+    return {'ok':False,'role':'heavy','redis':{'enabled':False,'configured':False,'mode':'removed'},'error':'Redis removed from Render #2 in очнись_12.2'},410
 
 def _r60_redis_decode(value, limit=220):
     if value is None:
@@ -5014,89 +4853,18 @@ def _r60_redis_prefix(name):
 
 @app.route('/internal/runtime/redis/inspect', methods=['GET'])
 def internal_runtime_redis_inspect():
-    """R60 owner Redis inspector. Read-only, bounded and secret-masked."""
-    if not authorized():
-        return {'ok':False},404
-    state=redis_runtime_state()
-    if not bool(state.get('master_enabled')):
-        return {'ok':False,'error':'REDIS_ENABLED=0 in Render','redis':state},409
-    if not bool(state.get('enabled')):
-        return {'ok':False,'error':'Redis runtime is OFF','redis':state},409
-    if _redis is None:
-        return {'ok':False,'error':'redis package unavailable','redis':state},503
-    url=str(redis_effective_url() or '').strip()
-    if not url:
-        return {'ok':False,'error':'REDIS_URL empty','redis':state},409
-    try:
-        page=max(0,min(99,int(request.args.get('page','0') or 0)))
-        page_size=max(5,min(20,int(request.args.get('page_size','10') or 10)))
-    except Exception:
-        page=0; page_size=10
-    client=None
-    try:
-        client=_redis.Redis.from_url(url,socket_connect_timeout=0.9,socket_timeout=1.5,health_check_interval=30)
-        pong=bool(client.ping())
-        info_mem=client.info('memory') or {}
-        info_stats=client.info('stats') or {}
-        info_clients=client.info('clients') or {}
-        try: dbsize=int(client.dbsize() or 0)
-        except Exception: dbsize=0
-        keys=[]; cursor=0; truncated=False
-        # Bound diagnostics even if Redis grows unexpectedly.
-        for raw in client.scan_iter(match='*',count=200):
-            keys.append(raw)
-            if len(keys)>=500:
-                truncated=True; break
-        keys.sort(key=lambda x: (x.decode('utf-8',errors='replace') if isinstance(x,(bytes,bytearray)) else str(x)))
-        prefix_counts={}
-        decoded=[]
-        for raw in keys:
-            name=raw.decode('utf-8',errors='replace') if isinstance(raw,(bytes,bytearray)) else str(raw)
-            decoded.append((name,raw))
-            pref=_r60_redis_prefix(name); prefix_counts[pref]=int(prefix_counts.get(pref,0))+1
-        total_seen=len(decoded)
-        pages=max(1,(total_seen+page_size-1)//page_size)
-        page=max(0,min(page,pages-1))
-        chosen=decoded[page*page_size:(page+1)*page_size]
-        entries=[_r60_redis_key_row(client,raw) for _,raw in chosen]
-        top_prefix=sorted(prefix_counts.items(),key=lambda kv:(-kv[1],kv[0]))[:12]
-        payload={
-            'ok':True,'role':'heavy','redis':state,'ping':'PONG' if pong else 'FAIL',
-            'dbsize':dbsize,'scanned':total_seen,'truncated':truncated,
-            'page':page,'pages':pages,'page_size':page_size,'entries':entries,
-            'prefixes':[{'prefix':k,'count':v} for k,v in top_prefix],
-            'memory':{
-                'used_memory':int(info_mem.get('used_memory') or 0),
-                'used_memory_human':str(info_mem.get('used_memory_human') or ''),
-                'maxmemory':int(info_mem.get('maxmemory') or 0),
-                'maxmemory_human':str(info_mem.get('maxmemory_human') or ''),
-            },
-            'stats':{
-                'keyspace_hits':int(info_stats.get('keyspace_hits') or 0),
-                'keyspace_misses':int(info_stats.get('keyspace_misses') or 0),
-                'evicted_keys':int(info_stats.get('evicted_keys') or 0),
-                'expired_keys':int(info_stats.get('expired_keys') or 0),
-                'connected_clients':int(info_clients.get('connected_clients') or 0),
-            },
-        }
-        return payload,200
-    except Exception as exc:
-        return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:260]}','redis':state},503
-    finally:
-        try:
-            if client is not None: client.close()
-        except Exception: pass
-
+    if not authorized(): return {'ok':False},404
+    return {'ok':False,'role':'heavy','error':'Redis removed from Render #2 in очнись_12.2'},410
 
 @app.route('/internal/r44/test/status',methods=['GET'])
 def r44_test_status():
     if not authorized():return {'ok':False},404
-    rclient=_r44_test_redis_client();mega_cfg=bool(os.getenv('MEGA_SESSION') or (os.getenv('MEGA_EMAIL') and os.getenv('MEGA_PASSWORD')))
+    mega_cfg=bool(os.getenv('MEGA_SESSION') or (os.getenv('MEGA_EMAIL') and os.getenv('MEGA_PASSWORD')))
     mega_ok=False;mega_detail='not configured'
     if mega_cfg:
         try:mega_ok,mega_detail=mega_login()
         except Exception as exc:mega_detail=f'{type(exc).__name__}: {str(exc)[:160]}'
-    payload={'ok':True,'role':'heavy','version':VERSION,'transport':TRANSPORT_VERSION,'direct_mode':bool(_R43_DIRECT_HEAVY),'front_configured':bool(front_base()),'front_url_host':re.sub(r'^https?://','',front_base()).split('/')[0] if front_base() else '', 'mega_configured':mega_cfg,'mega_ok':bool(mega_ok),'mega_detail':str(mega_detail)[:220],'mega_root':mega_root(),'redis_configured':bool(redis_runtime_state().get('configured')),'redis_runtime_enabled':bool(redis_runtime_state().get('enabled')),'redis_ok':rclient is not None,'redis_error':_R44_TEST_REDIS_ERROR,'file_queue':FILE_Q.qsize(),'google_queue':GOOGLE_Q.qsize(),'snapshot_state':dict(_R43_SNAPSHOT_STATE)}
+    payload={'ok':True,'role':'heavy','version':VERSION,'transport':TRANSPORT_VERSION,'direct_mode':bool(_R43_DIRECT_HEAVY),'front_configured':bool(front_base()),'front_url_host':re.sub(r'^https?://','',front_base()).split('/')[0] if front_base() else '', 'mega_configured':mega_cfg,'mega_ok':bool(mega_ok),'mega_detail':str(mega_detail)[:220],'mega_root':mega_root(),'redis_removed':True,'file_queue':FILE_Q.qsize(),'google_queue':GOOGLE_Q.qsize(),'snapshot_state':dict(_R43_SNAPSHOT_STATE)}
     return _r44_test_wrap(payload,200)
 
 @app.route('/internal/r44/test/echo',methods=['POST'])
@@ -5201,9 +4969,8 @@ def r44_test_mega_file():
         if size>limit:
             shutil.rmtree(work,ignore_errors=True);return {'ok':False,'error':f'file too large for diagnostic transfer: {size} bytes > {limit}'},413
         resp=send_file(str(local),as_attachment=True,download_name=local.name,mimetype='application/octet-stream',conditional=False,max_age=0)
-        resp.headers['X-R44-Mega-Path']=path[:500];resp.headers['X-R44-File-Size']=str(size)
+        resp.headers['X-R44-File-Size']=str(size)
         resp.call_on_close(lambda: shutil.rmtree(work,ignore_errors=True))
-        _r44_test_redis_handshake()
         print(f'[R44 TEST] mega-file path={path} bytes={size}',flush=True)
         return resp
     except Exception as exc:
@@ -5304,7 +5071,6 @@ def r65_manual_mega_file():
             shutil.rmtree(work,ignore_errors=True)
             return {'ok':False,'error':f'file too large for recovery transfer: {size} > {limit}'},413
         resp=send_file(str(local),as_attachment=True,download_name=local.name,mimetype='application/octet-stream',conditional=False,max_age=0)
-        resp.headers['X-R65-Mega-Path']=path[:700]
         resp.headers['X-R65-File-Size']=str(size)
         resp.call_on_close(lambda: shutil.rmtree(work,ignore_errors=True))
         print(f'[R65 MEGA BROWSER] file path={path} bytes={size}',flush=True)
@@ -5313,10 +5079,10 @@ def r65_manual_mega_file():
         shutil.rmtree(work,ignore_errors=True)
         return {'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:700]}'},500
 
-print('[R45 TEST] diagnostic API ready: status/echo/reverse/snapshot/mega-list/mega-file; Redis optional/test-only; probes do not block FAST callbacks',flush=True)
+print('[R45 TEST] diagnostic API ready: status/echo/reverse/snapshot/mega-list/mega-file; HEAVY Redis removed',flush=True)
 
 
-print('[R65 STABLE] FAST authority; Redis recovery; priority-nav compatible; manual all-MEGA recovery browser ready; automatic MEGA root remains strict',flush=True)
+print('[R65/OCH12.2] FAST authority; HEAVY local+MEGA recovery; manual all-MEGA browser ready',flush=True)
 
 if __name__ == '__main__':
     _start_final_workers()

@@ -189,47 +189,46 @@ elif ROLE=='heavy':
     try: threads=int(env.get('HEAVY_HTTP_THREADS',999))
     except Exception: threads=999
     ok('heavy_http_threads',threads<=4,f'HEAVY_HTTP_THREADS={threads}')
-    try: q=int(env.get('WORKER_EVENT_REDIS_QUEUE_MAX',999999))
-    except Exception: q=999999
-    ok('heavy_event_queue',q<=1024,f'WORKER_EVENT_REDIS_QUEUE_MAX={q}')
-    ok('r61_redis_render_owned_master_and_start',
-       '_REDIS_START_ENABLED = _render_flag("REDIS_START_ENABLED", False)' in text('runtime_config.py') and
-       '_apply_redis_runtime_state(_REDIS_RENDER_ENABLED and _REDIS_START_ENABLED)' in text('runtime_config.py') and
-       'def redis_effective_url' in text('runtime_config.py') and
-       'os.environ["REDIS_ENABLED"]' not in text('runtime_config.py') and 'os.environ["REDIS_URL"]' not in text('runtime_config.py') and
-       '/internal/runtime/redis' in s,
-       'HEAVY Redis master/start/URL must remain Render-owned')
-    ok('r60_redis_runtime_ping_and_inspector',
-       'def _r59_redis_quick_probe' in s and "state['ping']='PONG'" in s and
-       'global _REDIS_CLIENT, _R44_TEST_REDIS_CLIENT' in s and 'set_redis_runtime_enabled(False)' in s and
-       "/internal/runtime/redis/inspect" in s and 'def _r60_redis_key_row' in s,
-       'HEAVY Redis transition must close clients, PING and rollback on failure')
-    ok('r59_render_env_snapshot',
-       'def render_env_snapshot' in text('runtime_config.py'),
-       'HEAVY must preserve raw Render ENV for diagnostics')
+    req=text('requirements.txt')
+    cfg=text('runtime_config.py')
+    restore_latest_src=_fn_source(s,'internal_restore_latest')
     process_events_src=_fn_source(s,'_r34_process_state_event_wire')
-    redis_events_src=_fn_source(s,'_r32_redis_store_events')
     full_cp_src=_fn_source(s,'_full_checkpoint_v267')
     capsule_store_src=_fn_source(s,'_capsule_store_r20')
-    ok('och12_heavy_sqlite_is_required_event_witness',
+    pre_restore_src=_fn_source(s,'internal_pre_restore_upload')
+    ok('och122_heavy_redis_package_removed',
+       not re.search(r'(?mi)^\s*redis(?:[<>=].*)?$',req) and 'import redis' not in s and '_redis.Redis' not in s,
+       'Render #2 must install/open no Redis client')
+    ok('och122_heavy_redis_runtime_config_removed',
+       '_REDIS_RENDER_ENABLED' not in cfg and 'def redis_effective_url' not in cfg and 'WORKER_EVENT_REDIS_QUEUE_MAX' not in cfg,
+       'HEAVY runtime config must have no Redis master/url/queue controls')
+    ok('och122_heavy_redis_runtime_endpoint_retired',
+       "/internal/runtime/redis" in s and 'Redis removed from Render #2 in очнись_12.2' in s,
+       'legacy Redis endpoints must fail closed with an explicit removed response')
+    ok('r59_render_env_snapshot',
+       'def render_env_snapshot' in cfg,
+       'HEAVY must preserve raw Render ENV for diagnostics')
+    ok('och122_heavy_sqlite_is_required_event_witness',
        process_events_src.find('_event_local_upsert_v268(row)') < process_events_src.find('_r32_apply_events(events)') and
-       "'durable':'heavy-sqlite'" in process_events_src and 'Redis state durability unavailable' not in process_events_src,
-       'HEAVY FULL-synchronous local event journal must acknowledge receipt independently of Redis')
-    ok('och12_redis_is_bounded_optional_cache',
-       "WORKER_R32_EVENT_RETENTION_SEC',86400" in redis_events_src and "WORKER_R32_REDIS_EVENT_MAX_ITEMS',2000" in redis_events_src and
-       'pipe.zrem(_r32_index_key(),*ids)' in redis_events_src and 'Redis cache stored' in redis_events_src,
-       'HEAVY Redis event mirror must be TTL/count bounded and optional')
-    ok('och12_full_checkpoint_owned_by_heavy_mega',
+       "'durable':'heavy-sqlite'" in process_events_src and '_r32_redis_store_events(events)' not in process_events_src,
+       'HEAVY FULL-synchronous local SQLite must acknowledge state events without Redis')
+    ok('och122_full_checkpoint_owned_by_heavy_mega',
        'redis_store_snapshot(' not in full_cp_src and 'mega_promote_snapshot(CACHE_LATEST)' in full_cp_src and 'redis_full_snapshot=disabled-och12' in full_cp_src,
-       'full checkpoints must be generated on HEAVY and remotely persisted to MEGA, not Redis full images')
-    ok('och12_legacy_redis_full_image_cleanup',
-       'def _och12_drop_legacy_redis_full_images' in s and 'client.delete(_REDIS_SNAPSHOT_KEY,_REDIS_META_KEY,_REDIS_DELTA_KEY,_REDIS_DELTA_META_KEY)' in s and
-       '_och12_drop_legacy_redis_full_images()' in s,
-       'after a safe HEAVY boot/migration, old large Redis full-image keys must be retired to reclaim memory')
-    ok('och12_capsule_local_mega_redis_optional',
-       'tmp=CAPSULE_LOCAL.with_suffix' in capsule_store_src and '_capsule_mega_enqueue_r20()' in capsule_store_src and
-       'redis_cache=' in capsule_store_src,
-       'capsule durability must be HEAVY-local + MEGA queued; Redis may only cache it')
+       'full checkpoints must be HEAVY local + MEGA, never Redis')
+    ok('och122_capsule_local_mega_only',
+       'tmp=CAPSULE_LOCAL.with_suffix' in capsule_store_src and '_capsule_mega_enqueue_r20()' in capsule_store_src and '_redis_client' not in capsule_store_src,
+       'capsule must be HEAVY-local + MEGA only')
+    ok('och122_restore_latest_mega_not_redis',
+       '_download_mega_latest()' in restore_latest_src and '_r32_replay_state_events_from_mega()' in restore_latest_src and
+       'redis_load_snapshot_to_cache' not in restore_latest_src and '_r32_replay_state_events_from_redis' not in restore_latest_src,
+       'cold HEAVY recovery must use MEGA checkpoint + MEGA event pieces')
+    ok('och122_pre_restore_heavy_mega_required',
+       '/internal/pre-restore/upload' in s and 'quick_check_gzip(local)' in pre_restore_src and
+       "run_cmd(['mega-put',str(local),remote_dir]" in pre_restore_src and 'mega_exists(remote)' in pre_restore_src,
+       'pre-restore image must be validated, uploaded to MEGA and verified before ACK')
+    ok('och122_waitress_unicode_header_fix',
+       'X-R65-Mega-Path' not in s and 'X-R44-Mega-Path' not in s and "resp.headers['X-R65-File-Size']" in s,
+       'MEGA path must not be emitted in latin-1 HTTP headers; size header may remain')
     ok('r49_snapshot_sync_promote',
        "X-Snapshot-Promote-Mode" in s and 'mega_promote_snapshot(incoming)' in s and "'mega_promoted':True" in s,
        'exact snapshot sync promotion contract missing')
@@ -242,9 +241,6 @@ elif ROLE=='heavy':
     ok('r49_mega_autocreate_config',
        str(env.get('MEGA_AUTOCREATE_LAYOUT','')) == '1',
        f"MEGA_AUTOCREATE_LAYOUT={env.get('MEGA_AUTOCREATE_LAYOUT')}")
-    ok('r49_worker_redis_snapshot_key',
-       'vys262:bot_state:latest_gz' in s and 'redis_load_snapshot_to_cache' in s,
-       'HEAVY emergency cache must understand the same Redis snapshot key')
     ok('r65_manual_all_mega_recovery_browser',
        'def _r65_manual_mega_path' in s and '/internal/r65/mega/list' in s and '/internal/r65/mega/file' in s and
        "run_cmd(['mega-get',path,str(work)]" in s,

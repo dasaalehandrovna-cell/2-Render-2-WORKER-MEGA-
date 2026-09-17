@@ -103,29 +103,16 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
     "PEER_PING_ENABLED": "1",
     "PEER_PING_INTERVAL_SEC": "120",
 
-    # Redis keys / retention
-    "WORKER_REDIS_SNAPSHOT_KEY": "vys262:bot_state:latest_gz",
-    "WORKER_REDIS_SNAPSHOT_MAX_MB": "16",
-    "WORKER_REDIS_DELTA_KEY": "vys262:bot_state:latest_gz:deltas_v1",
-    "WORKER_REDIS_DELTA_MAX_ITEMS": "2000",
-    "WORKER_REDIS_EVENT_PREFIX": "vys262:tg_events:v1",
-    "WORKER_REDIS_CAPSULE_KEY": "vys262:durable_capsule:r20",
-        "WORKER_CAPSULE_MEGA_ENABLED": "1",
-        "WORKER_CAPSULE_MEGA_KEEP": "10",
-    "WORKER_REDIS_CAPSULE_MAX_MB": "8",
+    # OCH12.2: Render #2 has no Redis/Valkey dependency.
+    # Event durability is HEAVY local SQLite + MEGA event/archive/checkpoint paths.
     "WORKER_EVENT_RETENTION_SEC": "604800",
     "WORKER_EVENT_MAX_WIRE_KB": "512",
-    "WORKER_EVENT_REDIS_QUEUE_MAX": "1024",
-    "WORKER_EVENT_REDIS_RETRY_MS": "250",
-    "WORKER_EVENT_REDIS_RECONCILE_SEC": "5",
-    "WORKER_R32_EVENT_RETENTION_SEC": "86400",
-    "WORKER_R32_REDIS_EVENT_MAX_ITEMS": "2000",
+    "WORKER_EVENT_RECONCILE_SEC": "5",
     "WORKER_R32_EVENT_MAX_WIRE_KB": "8192",
     "WORKER_R34_EVENT_LARGE_MAX_MB": "64",
     "WORKER_R34_EXPORT_REVISION_WAIT_SEC": "180",
     "WORKER_R34_RESULT_RETRY_SEC": "8",
     "WORKER_R34_RESULT_RETRY_WINDOW_SEC": "900",
-    # R36 durable transport when REDIS_URL is absent.
     "WORKER_R36_RESULT_ATTEMPT_WINDOW_SEC": "45",
     "R36_MEGA_JOB_TIMEOUT": "180",
     "R36_MEGA_RECOVERY_SCAN_SEC": "45",
@@ -165,7 +152,7 @@ WORKER_INTERNAL_ENV: Dict[str, str] = {
 
 
 # R57: Render master switches are captured before packaged tuning is installed.
-# MEGA_ENABLED=0 disables every MEGA path; REDIS_ENABLED=0 disables every Redis path.
+# MEGA_ENABLED=0 disables every MEGA path. Render #2 has no Redis path in OCH12.2.
 # TELEGRAM_BACKUP_ENABLED=0 disables the Telegram backup/durable channel on FAST.
 # R59: preserve the exact process environment as it arrived from Render before
 # packaged runtime_config mutates/overwrites operational values.  This is used
@@ -180,74 +167,7 @@ def _render_flag(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on", "да"}
 
 _MEGA_RENDER_ENABLED = _render_flag("MEGA_ENABLED", True)
-_REDIS_RENDER_ENABLED = _render_flag("REDIS_ENABLED", False)
-_REDIS_START_ENABLED = _render_flag("REDIS_START_ENABLED", False)
 _TELEGRAM_BACKUP_RENDER_ENABLED = _render_flag("TELEGRAM_BACKUP_ENABLED", True)
-
-# R61: Redis configuration belongs to Render only. The code never rewrites
-# REDIS_ENABLED, REDIS_START_ENABLED or REDIS_URL. Menu switches change only
-# an in-memory runtime flag until the next process restart.
-_REDIS_EXTERNAL_URL = str(
-    os.environ.get("REDIS_URL")
-    or os.environ.get("RENDER_KEY_VALUE_URL")
-    or os.environ.get("KEY_VALUE_URL")
-    or os.environ.get("VALKEY_URL")
-    or ""
-).strip()
-_REDIS_RUNTIME_ENABLED = False
-_REDIS_RUNTIME_INITIALIZED = False
-
-def redis_render_url() -> str:
-    """Exact Redis/Valkey URL supplied by Render. Never mutated by runtime code."""
-    return str(_REDIS_EXTERNAL_URL or "").strip()
-
-def redis_effective_url() -> str:
-    """Operational Redis URL only when the runtime switch is currently ON."""
-    if not (_REDIS_RENDER_ENABLED and _REDIS_RUNTIME_ENABLED and _REDIS_EXTERNAL_URL):
-        return ""
-    return str(_REDIS_EXTERNAL_URL).strip()
-
-def _apply_redis_runtime_state(enabled: bool) -> None:
-    global _REDIS_RUNTIME_ENABLED
-    _REDIS_RUNTIME_ENABLED = bool(enabled and _REDIS_RENDER_ENABLED and _REDIS_EXTERNAL_URL)
-
-def redis_runtime_state() -> Dict[str, object]:
-    enabled = bool(redis_effective_url())
-    if not _REDIS_RENDER_ENABLED:
-        mode = "locked_off"
-    elif enabled:
-        mode = "cache_on"
-    else:
-        mode = "runtime_off"
-    return {
-        "configured": bool(_REDIS_EXTERNAL_URL),
-        "master_enabled": bool(_REDIS_RENDER_ENABLED),
-        "start_enabled": bool(_REDIS_START_ENABLED),
-        "enabled": enabled,
-        "default_enabled": bool(_REDIS_RENDER_ENABLED and _REDIS_START_ENABLED),
-        "restart_enabled": bool(_REDIS_RENDER_ENABLED and _REDIS_START_ENABLED),
-        "mode": mode,
-        "role": "background-cache-outbox",
-        "source_of_truth": "sqlite",
-        "url_source_present": bool(_REDIS_EXTERNAL_URL),
-        "render_env_owned": True,
-    }
-
-def set_redis_runtime_enabled(enabled: bool) -> Dict[str, object]:
-    _apply_redis_runtime_state(bool(enabled))
-    state = redis_runtime_state()
-    if bool(enabled) and not state["master_enabled"]:
-        state["error"] = "REDIS_ENABLED=0 in Render"
-    elif bool(enabled) and not state["configured"]:
-        state["error"] = "REDIS_URL is not configured in Render"
-    return state
-
-def _init_redis_runtime_default() -> None:
-    global _REDIS_RUNTIME_INITIALIZED
-    if not _REDIS_RUNTIME_INITIALIZED:
-        # Render owns restart behavior: master permission + explicit startup switch.
-        _apply_redis_runtime_state(_REDIS_RENDER_ENABLED and _REDIS_START_ENABLED)
-        _REDIS_RUNTIME_INITIALIZED = True
 
 def install_internal_runtime_config(role: str) -> Dict[str, str]:
     """Install packaged tunables before the rest of the service reads os.environ."""
@@ -255,7 +175,7 @@ def install_internal_runtime_config(role: str) -> Dict[str, str]:
     values = FRONT_INTERNAL_ENV if role == "front" else WORKER_INTERNAL_ENV if role == "worker" else {}
     for key, value in values.items():
         # External master switches must never be overwritten by packaged defaults.
-        if str(key) in {"MEGA_ENABLED", "REDIS_ENABLED", "TELEGRAM_BACKUP_ENABLED", "REDIS_START_ENABLED", "REDIS_URL"}:
+        if str(key) in {"MEGA_ENABLED", "TELEGRAM_BACKUP_ENABLED"}:
             continue
         os.environ[str(key)] = str(value)
     fast_runtime_mega_disabled = role == "front" and str(os.environ.get("FAST_RUNTIME_MEGA_DISABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -273,7 +193,6 @@ def install_internal_runtime_config(role: str) -> Dict[str, str]:
         os.environ["MEGA_AUTORESTORE"] = "0"
         os.environ["SPLIT_EMERGENCY_MEGA"] = "0"
         os.environ["WORKER_CAPSULE_MEGA_ENABLED"] = "0"
-    _init_redis_runtime_default()
     os.environ["VYS262_INTERNAL_CONFIG_VERSION"] = CONFIG_VERSION
     return dict(values)
 
