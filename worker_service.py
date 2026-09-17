@@ -44,7 +44,7 @@ from runtime_config import install_internal_runtime_config, CONFIG_VERSION as IN
 install_internal_runtime_config("worker")
 
 app = Flask(__name__)
-VERSION = 'vys-262-worker-r70-e2e-release'
+VERSION = 'очнись_12-heavy'
 TRANSPORT_VERSION = 'vys-262-worker-r52-forensic-transport'
 R52_FORENSIC_LOG = str(os.getenv('R52_FORENSIC_LOG','1') or '1').strip().lower() not in {'0','false','no','off'}
 
@@ -370,49 +370,6 @@ def _redis_client():
             _REDIS_CLIENT = _redis.Redis.from_url(url, socket_connect_timeout=5, socket_timeout=12, health_check_interval=30)
         return _REDIS_CLIENT
 
-def redis_store_snapshot(local_gz: Path, meta: dict, clear_deltas: bool=False):
-    client = _redis_client()
-    if client is None:
-        return False, 'REDIS_URL not configured'
-    try:
-        payload = local_gz.read_bytes()
-        max_bytes = env_int('WORKER_REDIS_SNAPSHOT_MAX_MB',16,1,128) * 1024 * 1024
-        if len(payload) > max_bytes:
-            return False, f'snapshot too large for Redis: {len(payload)} > {max_bytes}'
-        incoming_revision = float((meta or {}).get('revision') or 0.0)
-        existing_revision = 0.0
-        try:
-            existing_raw = client.get(_REDIS_META_KEY)
-            if isinstance(existing_raw, (bytes, bytearray)):
-                existing_raw = existing_raw.decode('utf-8', 'replace')
-            existing_meta = json.loads(existing_raw) if isinstance(existing_raw, str) and existing_raw else {}
-            existing_revision = float((existing_meta or {}).get('revision') or 0.0)
-        except Exception:
-            existing_revision = 0.0
-        if existing_revision > incoming_revision + 0.000001:
-            with STATE_LOCK:
-                STATE['redis_cache_ok'] = True; STATE['redis_last_write'] = time.time(); STATE['redis_last_error'] = 'newer Redis snapshot preserved'
-            return True, f'Redis newer snapshot preserved existing={existing_revision} incoming={incoming_revision}'
-        row = {
-            'revision': incoming_revision,
-            'sha256_gz': str((meta or {}).get('sha256_gz') or hashlib.sha256(payload).hexdigest()),
-            'size': len(payload), 'saved_at': time.time(), 'version': TRANSPORT_VERSION,
-        }
-        pipe = client.pipeline(transaction=True)
-        pipe.set(_REDIS_SNAPSHOT_KEY, payload)
-        pipe.set(_REDIS_META_KEY, json.dumps(row, separators=(',',':')))
-        if clear_deltas:
-            pipe.delete(_REDIS_DELTA_KEY)
-            pipe.delete(_REDIS_DELTA_META_KEY)
-        pipe.execute()
-        with STATE_LOCK:
-            STATE['redis_cache_ok'] = True; STATE['redis_last_write'] = time.time(); STATE['redis_last_error'] = ''
-        return True, 'Redis snapshot cached'
-    except Exception as exc:
-        with STATE_LOCK:
-            STATE['redis_cache_ok'] = False; STATE['redis_last_error'] = f'{type(exc).__name__}: {str(exc)[:220]}'
-        return False, STATE['redis_last_error']
-
 def redis_load_snapshot_to_cache():
     client = _redis_client()
     if client is None:
@@ -729,7 +686,7 @@ def _apply_delta_payload_v267(payload: dict, *, journal_wire: bytes|None=None, r
         if (not replay) and journal_wire is not None and _redis_client() is not None:
             redis_ok,redis_detail=_redis_append_delta_v267(journal_wire,payload)
             if not redis_ok:
-                return False,'Redis delta append failed: '+str(redis_detail)[:180],'redis_unavailable'
+                with STATE_LOCK: STATE['redis_last_error']='delta cache: '+str(redis_detail)[:180]
         os.replace(tmp,CACHE_DB)
         gz_ok,gz_detail,gz_meta=_gzip_cache_db_v267()
         if not gz_ok:
@@ -781,34 +738,27 @@ def redis_replay_deltas_v267():
         return False,f'{type(exc).__name__}: {str(exc)[:220]}'
 
 def _full_checkpoint_v267(reason='periodic'):
+    """OCH12: HEAVY creates full checkpoints; MEGA is the remote full-image backend."""
     with DELTA_APPLY_LOCK:
         ok,detail,meta=_ensure_cache_db_v267()
-        if not ok:
-            return False,detail
+        if not ok: return False,detail
         gz_ok,gz_detail,gz_meta=_gzip_cache_db_v267()
-        if not gz_ok:
-            return False,gz_detail
-        redis_configured=_redis_client() is not None
-        redis_ok,redis_detail=redis_store_snapshot(CACHE_LATEST,gz_meta,clear_deltas=True)
+        if not gz_ok: return False,gz_detail
         with STATE_LOCK: last_mega=float(STATE.get('last_mega_upload_at') or 0.0)
         mega_every=env_int('WORKER_MEGA_CHECKPOINT_SEC',86400,3600,604800)
-        # R36: with no Redis, MEGA becomes the checkpoint durability backend. A
-        # threshold checkpoint is therefore not allowed to be a permanent false/spam
-        # loop merely because REDIS_URL is intentionally absent.
-        force_mega=(not redis_ok) or str(reason).startswith(('manual','shutdown','reconcile'))
-        mega_due=(force_mega or last_mega<=0.0 or time.time()-last_mega>=mega_every)
+        force_mega=str(reason).startswith(('manual','shutdown','reconcile'))
+        mega_due=bool(mega_enabled() and (force_mega or last_mega<=0.0 or time.time()-last_mega>=mega_every))
         if mega_due:
             mega_ok,mega_detail=mega_promote_snapshot(CACHE_LATEST)
-        else:
+        elif mega_enabled():
             mega_ok,mega_detail=True,f'deferred until {mega_every}s interval'
-        durable_ok=bool(redis_ok or (mega_due and mega_ok))
+        else:
+            mega_ok,mega_detail=True,'MEGA disabled; HEAVY local checkpoint only'
         with STATE_LOCK:
             if mega_due and mega_ok: STATE['last_mega_upload_at']=time.time()
             STATE['full_checkpoint_at']=time.time(); STATE['full_checkpoint_count']=int(STATE.get('full_checkpoint_count') or 0)+1
-            if redis_ok or ((not redis_ok) and mega_due and mega_ok):
-                STATE['delta_since_checkpoint']=0; STATE['delta_bytes_since_checkpoint']=0
-        backend='redis' if redis_ok else ('mega' if mega_due and mega_ok else 'none')
-        return durable_ok,f'{reason}: backend={backend}; redis={redis_ok} {redis_detail}; mega={mega_ok} {mega_detail}'
+            if mega_ok: STATE['delta_since_checkpoint']=0; STATE['delta_bytes_since_checkpoint']=0
+        return bool(mega_ok),f'{reason}: backend={"mega" if mega_due else "heavy-local"}; mega={mega_ok} {mega_detail}; redis_full_snapshot=disabled-och12'
 
 def _checkpoint_loop_v267():
     while True:
@@ -933,8 +883,8 @@ def sync_state_job(job):
                 STATE['delta_bytes_since_checkpoint'] = 0
         except Exception:
             pass
-        # Fast durable cache is written before slow archival MEGA.
-        redis_ok, redis_detail = redis_store_snapshot(CACHE_LATEST, meta, clear_deltas=True)
+        # OCH12: full-image durability belongs to HEAVY/MEGA; Redis keeps only bounded caches/events.
+        redis_ok, redis_detail = False, 'full Redis snapshot disabled in OCH12'
         mega_ok, mega_detail = mega_promote_snapshot(CACHE_LATEST)
         with STATE_LOCK:
             if mega_ok:
@@ -985,7 +935,6 @@ def _download_mega_latest():
                     try:
                         CACHE_DB.unlink(missing_ok=True)
                         _ensure_cache_db_v267()
-                        redis_store_snapshot(CACHE_LATEST, meta)
                     except Exception:
                         pass
                 with STATE_LOCK:
@@ -1427,33 +1376,31 @@ def _r32_event_valid(ev):
     return str(ev.get('kind') or '') in {'set_kv','save_chat','prune_chats','delete_chat','set_meta','set_cold','set_cold_many','delete_cold'}
 
 def _r32_redis_store_events(events):
+    """OCH12 bounded optional Redis cache for recent logical state events."""
     client=_redis_client()
     if client is None: return False,'REDIS_URL not configured',[]
-    ttl=env_int('WORKER_R32_EVENT_RETENTION_SEC',2592000,604800,7776000)
+    ttl=env_int('WORKER_R32_EVENT_RETENTION_SEC',86400,3600,604800)
+    max_items=env_int('WORKER_R32_REDIS_EVENT_MAX_ITEMS',2000,200,5000)
     new_ids=[]
     try:
-        # First phase: SET NX lets retries be idempotent.
-        pipe=client.pipeline(transaction=False)
-        packed=[]
+        pipe=client.pipeline(transaction=False); packed=[]
         for ev in events:
-            eid=str(ev.get('event_id') or '')
-            raw=json.dumps(ev,ensure_ascii=False,separators=(',',':'),default=str)
-            packed.append((eid,raw,float(ev.get('created_at') or time.time())))
-            pipe.set(_r32_event_key(eid),raw,nx=True,ex=ttl)
-        results=pipe.execute()
-        pipe=client.pipeline(transaction=True)
+            eid=str(ev.get('event_id') or ''); raw=json.dumps(ev,ensure_ascii=False,separators=(',',':'),default=str)
+            packed.append((eid,raw,float(ev.get('created_at') or time.time()))); pipe.set(_r32_event_key(eid),raw,nx=True,ex=ttl)
+        results=pipe.execute(); pipe=client.pipeline(transaction=True)
         for (eid,raw,score),created in zip(packed,results):
-            if created:
-                new_ids.append(eid)
-                pipe.zadd(_r32_index_key(),{eid:score})
-                pipe.rpush(_r32_pending_key(),eid)
-            else:
-                pipe.expire(_r32_event_key(eid),ttl)
-        # Index/pending metadata live longer than event rows but are compact.
-        pipe.expire(_r32_index_key(),ttl)
-        pipe.expire(_r32_pending_key(),ttl)
-        pipe.execute()
-        return True,f'Redis state events stored new={len(new_ids)} total={len(events)}',new_ids
+            if created: new_ids.append(eid); pipe.zadd(_r32_index_key(),{eid:score})
+            else: pipe.expire(_r32_event_key(eid),ttl)
+        pipe.expire(_r32_index_key(),ttl); pipe.execute()
+        total=int(client.zcard(_r32_index_key()) or 0)
+        if total>max_items:
+            old=client.zrange(_r32_index_key(),0,total-max_items-1) or []
+            if old:
+                ids=[x.decode() if isinstance(x,(bytes,bytearray)) else str(x) for x in old]
+                pipe=client.pipeline(transaction=True); pipe.zrem(_r32_index_key(),*ids)
+                for eid in ids: pipe.delete(_r32_event_key(eid))
+                pipe.execute()
+        return True,f'Redis cache stored new={len(new_ids)} total={len(events)} max={max_items} ttl={ttl}',new_ids
     except Exception as exc:
         return False,f'{type(exc).__name__}: {str(exc)[:220]}',[]
 
@@ -1663,33 +1610,8 @@ def _r32_mega_event_loop():
 def internal_r32_state_events():
     if not authorized(): return {'ok':False},404
     wire=request.get_data(cache=False,as_text=False) or b''
-    max_wire=env_int('WORKER_R32_EVENT_MAX_WIRE_KB',1024,32,8192)*1024
-    if not wire or len(wire)>max_wire: return {'ok':False,'error':'R32 event batch size invalid'},413
-    try:
-        raw=gzip.decompress(wire) if str(request.headers.get('Content-Encoding') or '').lower()=='gzip' else wire
-        body=json.loads(raw.decode('utf-8')); events=body.get('events') if isinstance(body,dict) else None
-        if not isinstance(events,list) or not events or len(events)>512: raise ValueError('events invalid')
-        events=[x for x in events if _r32_event_valid(x)]
-        if not events: raise ValueError('no valid events')
-    except Exception as exc:
-        return {'ok':False,'error':f'R32 event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
-    rok,rdetail,new_ids=_r32_redis_store_events(events)
-    if not rok:
-        with STATE_LOCK: STATE['r32_state_last_error']=str(rdetail)[:220]
-        return {'ok':False,'error':'R32 Redis durability failed: '+str(rdetail)[:180]},503
-    try:
-        ok,detail,applied,stale=_r32_apply_events(events)
-    except Exception as exc:
-        ok=False; detail=f'{type(exc).__name__}: {str(exc)[:220]}'; applied=stale=0
-    if not ok:
-        with STATE_LOCK: STATE['r32_state_last_error']=str(detail)[:220]
-        # Events are already durable in Redis; a retry/replay can apply them later.
-        return {'ok':False,'durable':True,'error':'R32 cache apply failed: '+str(detail)[:180]},503
-    with STATE_LOCK:
-        STATE['r32_state_events_received']=int(STATE.get('r32_state_events_received') or 0)+len(events)
-        STATE['r32_state_event_bytes']=int(STATE.get('r32_state_event_bytes') or 0)+len(wire)
-    if new_ids: _R32_MEGA_WAKE.set()
-    return {'ok':True,'durable':'redis','events':len(events),'new':len(new_ids),'applied':applied,'stale':stale},200
+    max_wire=env_int('WORKER_R32_EVENT_MAX_WIRE_KB',8192,32,32768)*1024
+    return _r34_process_state_event_wire(wire,max_wire)
 
 @app.route('/internal/r32/status',methods=['GET'])
 def internal_r32_status():
@@ -1995,7 +1917,6 @@ def internal_snapshot_upload():
             with STATE_LOCK:
                 STATE['last_state_sha256'] = _sha256_file_v267(CACHE_DB) if CACHE_DB.exists() else ''
                 STATE['delta_since_checkpoint'] = 0
-            redis_store_snapshot(CACHE_LATEST, meta, clear_deltas=True)
         except Exception:
             pass
         promote_sync = str(request.headers.get('X-Snapshot-Promote-Mode') or 'async').strip().lower() == 'sync'
@@ -2197,39 +2118,25 @@ def _capsule_load_latest_r20(deep_mega=False):
 
 def _capsule_store_r20(obj:dict, packed:bytes):
     with CAPSULE_LOCK:
-        if _R43_DIRECT_HEAVY:
-            merged=dict(obj or {})
-            packed=gzip.compress(json.dumps(merged,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
-            new_t=_capsule_tuple_r20(merged)
-            tmp=CAPSULE_LOCAL.with_suffix('.tmp'); tmp.write_bytes(packed); os.replace(tmp,CAPSULE_LOCAL)
-            with STATE_LOCK:
-                STATE['capsule_seq']=new_t[0]; STATE['capsule_generation']=new_t[1]; STATE['capsule_saved_at']=new_t[2]; STATE['capsule_last_error']=''
-            return True, f'R43 local mirror seq={new_t[0]} gen={new_t[1]}'
-        old,_=_capsule_load_latest_r20()
-        merged=dict(obj or {})
-        if isinstance(old,dict) and old:
-            old_seq,old_gen,_old_at=_capsule_tuple_r20(old)
-            new_seq,new_gen,_new_at=_capsule_tuple_r20(merged)
-            if old_seq > new_seq:
-                merged['user_state']=old.get('user_state') or {}; merged['user_state_seq']=old_seq
-            if old_gen > new_gen:
-                merged['config_checkpoint']=old.get('config_checkpoint') or {}; merged['config_generation']=old_gen
-            try:
-                if float(((old.get('state_revision') or {}).get('saved_at') or 0.0)) > float(((merged.get('state_revision') or {}).get('saved_at') or 0.0)):
-                    merged['state_revision']=old.get('state_revision') or {}
-            except Exception: pass
-            merged['saved_at']=max(float(old.get('saved_at') or 0.0),float(merged.get('saved_at') or 0.0))
+        old={}
+        try:
+            if CAPSULE_LOCAL.is_file(): old,_=_capsule_decode_r20(CAPSULE_LOCAL.read_bytes())
+        except Exception: old={}
+        merged=_capsule_merge_r20(old,obj) if old else dict(obj or {})
         packed=gzip.compress(json.dumps(merged,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8'),compresslevel=3)
         new_t=_capsule_tuple_r20(merged)
         tmp=CAPSULE_LOCAL.with_suffix('.tmp'); tmp.write_bytes(packed); os.replace(tmp,CAPSULE_LOCAL)
+        redis_ok=False; redis_detail='Redis disabled'
         client=_redis_client()
         if client is not None:
-            meta={'user_state_seq':new_t[0],'config_generation':new_t[1],'saved_at':new_t[2],'size':len(packed),'source':'worker-r20'}
-            pipe=client.pipeline(transaction=True); pipe.set(_REDIS_CAPSULE_KEY,packed); pipe.set(_REDIS_CAPSULE_KEY+':meta',json.dumps(meta,separators=(',',':'))); pipe.execute()
+            try:
+                meta={'user_state_seq':new_t[0],'config_generation':new_t[1],'saved_at':new_t[2],'size':len(packed),'source':'och12-heavy-cache'}
+                pipe=client.pipeline(transaction=True); pipe.set(_REDIS_CAPSULE_KEY,packed,ex=86400); pipe.set(_REDIS_CAPSULE_KEY+':meta',json.dumps(meta,separators=(',',':')),ex=86400); pipe.execute(); redis_ok=True; redis_detail='cached'
+            except Exception as exc: redis_detail=f'{type(exc).__name__}: {str(exc)[:160]}'
         with STATE_LOCK:
-            STATE['capsule_seq']=new_t[0]; STATE['capsule_generation']=new_t[1]; STATE['capsule_saved_at']=new_t[2]; STATE['capsule_last_error']=''
+            STATE['capsule_seq']=new_t[0]; STATE['capsule_generation']=new_t[1]; STATE['capsule_saved_at']=new_t[2]; STATE['capsule_last_error']='' if redis_ok else ('redis-cache: '+redis_detail)[:220]
         _capsule_mega_enqueue_r20()
-        return True, f'stored seq={new_t[0]} gen={new_t[1]}'
+        return True, f'HEAVY local capsule seq={new_t[0]} gen={new_t[1]}; redis_cache={int(redis_ok)}'
 
 @app.route('/internal/capsule',methods=['POST'])
 def internal_capsule_r20():
@@ -3239,68 +3146,102 @@ def _r33_archive_events_direct(events):
         shutil.rmtree(work,ignore_errors=True)
 
 
+_OCH12_STATE_MEGA_Q=queue.Queue(maxsize=64)
+
+def _och12_enqueue_state_events_mega(events):
+    if not mega_enabled(): return False
+    try:
+        _OCH12_STATE_MEGA_Q.put_nowait([dict(x) for x in (events or []) if isinstance(x,dict)])
+        return True
+    except queue.Full:
+        return False
+
+def _och12_state_mega_loop():
+    while True:
+        events=_OCH12_STATE_MEGA_Q.get()
+        try:
+            if events and mega_enabled():
+                ok,detail,_bytes=_r33_archive_events_direct(events)
+                if ok:
+                    now=time.time()
+                    for ev in events:
+                        try: _event_local_upsert_v268({'event_id':str(ev.get('event_id') or ''),'state':'mirrored','mirrored_at':now,'last_error':''})
+                        except Exception: pass
+                    with STATE_LOCK: STATE['r32_mega_last_ok']=now; STATE['r32_mega_last_error']=''
+                else:
+                    with STATE_LOCK: STATE['r32_mega_last_error']=str(detail)[:220]
+                    time.sleep(1.0)
+                    try: _OCH12_STATE_MEGA_Q.put_nowait(events)
+                    except queue.Full: pass
+        except Exception as exc:
+            with STATE_LOCK: STATE['r32_mega_last_error']=f'{type(exc).__name__}: {str(exc)[:220]}'
+        finally:
+            _OCH12_STATE_MEGA_Q.task_done()
+
+def _och12_drop_legacy_redis_full_images():
+    """After a HEAVY cache exists, remove old large full-image keys from shared Redis."""
+    client=_redis_client()
+    if client is None or not (CACHE_DB.exists() or CACHE_LATEST.exists()): return False
+    try:
+        client.delete(_REDIS_SNAPSHOT_KEY,_REDIS_META_KEY,_REDIS_DELTA_KEY,_REDIS_DELTA_META_KEY)
+        with STATE_LOCK: STATE['redis_full_snapshot_retired_och12']=True
+        return True
+    except Exception as exc:
+        with STATE_LOCK: STATE['redis_last_error']='legacy cleanup: '+f'{type(exc).__name__}: {str(exc)[:180]}'
+        return False
+
 def _r34_process_state_event_wire(wire,max_wire):
-    if not wire or len(wire)>int(max_wire): return {'ok':False,'error':f'R34 event batch size invalid bytes={len(wire)} max={int(max_wire)}'},413
+    if not wire or len(wire)>int(max_wire): return {'ok':False,'error':f'OCH12 event batch size invalid bytes={len(wire)} max={int(max_wire)}'},413
     try:
         raw=gzip.decompress(wire) if str(request.headers.get('Content-Encoding') or '').lower()=='gzip' else wire
         body=json.loads(raw.decode('utf-8')); events=body.get('events') if isinstance(body,dict) else None
         if not isinstance(events,list) or not events or len(events)>512: raise ValueError('events invalid')
         events=[x for x in events if _r32_event_valid(x)]
         if not events: raise ValueError('no valid events')
-    except Exception as exc: return {'ok':False,'error':f'R34 event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
-    # R63 shared-Redis durability. When Redis runtime is ON, every acknowledged
-    # logical state batch is stored there first, even in direct R43 mode.  MEGA is
-    # then only an archival/fallback backend, so FAST no longer waits on MEGA for
-    # normal changes.  When Redis is intentionally OFF, preserve the strict MEGA
-    # direct path (or local-only mode if MEGA is also OFF).
-    redis_active = _redis_client() is not None
-    new_ids=[]
-    if redis_active:
-        rok,rdetail,new_ids=_r32_redis_store_events(events)
-        if not rok:
-            with STATE_LOCK: STATE['r32_state_last_error']='Redis durability failed: '+str(rdetail)[:180]
-            return {'ok':False,'error':'Redis state durability unavailable: '+str(rdetail)[:180]},503
-        durable='redis'
-        if mega_enabled() and new_ids:
-            _R32_MEGA_WAKE.set()
-    elif _R43_DIRECT_HEAVY:
-        if mega_enabled():
-            mok,mdetail,_bytes=_r33_archive_events_direct(events)
-            if not mok:
-                with STATE_LOCK: STATE['r32_state_last_error']=str(mdetail)[:220]
-                return {'ok':False,'error':'MEGA event durability unavailable: '+str(mdetail)[:180]},503
-            durable='mega-direct'
-        else:
-            durable='local-only-redis-mega-disabled'
-    else:
-        durable=''; rok,rdetail,new_ids=_r32_redis_store_events(events)
-        if rok:
-            durable='redis'
-            if new_ids: _R32_MEGA_WAKE.set()
-        else:
-            mok,mdetail,_bytes=_r33_archive_events_direct(events)
-            if not mok:
-                with STATE_LOCK: STATE['r32_state_last_error']=f'Redis={rdetail}; MEGA={mdetail}'[:220]
-                return {'ok':False,'error':'R34 durability unavailable: '+str(rdetail)[:80]+'; '+str(mdetail)[:100]},503
-            durable='mega-direct'
+    except Exception as exc:
+        return {'ok':False,'error':f'OCH12 event decode: {type(exc).__name__}: {str(exc)[:180]}'},400
+    # HEAVY-local FULL synchronous SQLite is the required receipt witness.
+    local_ok=True
+    for ev in events:
+        row={'event_id':str(ev.get('event_id') or ''),'update_id':str(ev.get('event_id') or ''),'chat_id':'','update_type':'state32','payload':ev,
+             'payload_sha256':hashlib.sha256(json.dumps(ev,ensure_ascii=False,separators=(',',':'),default=str).encode('utf-8')).hexdigest(),
+             'state':'received','received_at':time.time(),'state_token':str(ev.get('state_token') or '')[:120]}
+        if not _event_local_upsert_v268(row): local_ok=False; break
+    if not local_ok:
+        return {'ok':False,'error':'OCH12 HEAVY local event journal write failed'},503
     try:
         if _R43_DIRECT_HEAVY:
-            with _R43_SNAPSHOT_LOCK:
-                ok,detail,applied,stale=_r32_apply_events(events)
+            with _R43_SNAPSHOT_LOCK: ok,detail,applied,stale=_r32_apply_events(events)
         else:
             ok,detail,applied,stale=_r32_apply_events(events)
-    except Exception as exc: ok=False; detail=f'{type(exc).__name__}: {str(exc)[:220]}'; applied=stale=0
+    except Exception as exc:
+        ok=False; detail=f'{type(exc).__name__}: {str(exc)[:220]}'; applied=stale=0
+    # Redis is cache-only: failure never rejects a HEAVY receipt.
+    redis_ok,redis_detail,new_ids=_r32_redis_store_events(events)
+    # MEGA archive is detached from the HTTP receipt; if Redis is absent we also wake
+    # the direct MEGA queue so no Redis dependency exists in the archival path.
+    mega_queued=False
+    if mega_enabled():
+        try: mega_queued=bool(_och12_enqueue_state_events_mega(events))
+        except Exception: mega_queued=False
+    now=time.time()
+    for ev in events:
+        try: _event_local_upsert_v268({'event_id':str(ev.get('event_id') or ''),'state':'committed' if ok else 'failed_retry','committed_at':now if ok else 0.0,'last_error':'' if ok else str(detail)[:220]})
+        except Exception: pass
     max_rev=max([int(x.get('revision') or 0) for x in events] or [0])
     with STATE_LOCK:
         STATE['r32_state_events_received']=int(STATE.get('r32_state_events_received') or 0)+len(events)
         STATE['r32_state_event_bytes']=int(STATE.get('r32_state_event_bytes') or 0)+len(wire)
-        STATE['r33_last_event_durability']=durable
+        STATE['r33_last_event_durability']='heavy-sqlite'
+        STATE['redis_cache_ok']=bool(redis_ok)
+        if not redis_ok: STATE['redis_last_error']=str(redis_detail)[:220]
         if ok: STATE['r34_max_applied_revision']=max(int(STATE.get('r34_max_applied_revision') or 0),max_rev)
-        else: STATE['r32_state_last_error']='durable but apply pending: '+str(detail)[:180]
+        else: STATE['r32_state_last_error']='durable receipt; apply pending: '+str(detail)[:180]
     try: applied_revision=_r34_current_applied_revision(refresh=True)
     except Exception: applied_revision=(max_rev if ok else int(STATE.get('r34_max_applied_revision') or 0))
-    return {'ok':True,'durable':durable,'events':len(events),'new':len(new_ids),'applied':applied,'stale':stale,'apply_ok':bool(ok),'apply_detail':str(detail)[:180],'max_revision':max_rev,'durable_revision':max_rev,'applied_revision':int(applied_revision or 0)},200
-
+    return {'ok':True,'durable':'heavy-sqlite','events':len(events),'new':len(new_ids),'applied':applied,'stale':stale,'apply_ok':bool(ok),
+            'apply_detail':str(detail)[:180],'max_revision':max_rev,'durable_revision':max_rev,'applied_revision':int(applied_revision or 0),
+            'redis_cache_ok':bool(redis_ok),'redis_cache_detail':str(redis_detail)[:160],'mega_queued':bool(mega_queued)},200
 
 def _r33_state_events_view():
     if not authorized(): return {'ok':False},404
@@ -4679,40 +4620,17 @@ def google_loop():
             GOOGLE_Q.task_done()
 
 def _r63_seed_shared_redis_from_front():
-    """Ensure shared Redis has a full baseline without blocking FAST UI.
-
-    State events alone cannot rebuild an empty database.  On HEAVY startup, if Redis
-    is enabled but the full snapshot key is absent, fetch one exact FAST snapshot,
-    gzip the local mirror, and store it in Redis.
-    """
-    client=_redis_client()
-    if client is None:
-        return
-    try:
-        if client.exists(_REDIS_SNAPSHOT_KEY):
-            return
-    except Exception as exc:
-        print(f'[R63 REDIS SEED] exists error={type(exc).__name__}: {str(exc)[:180]}',flush=True)
-        return
-    try:
-        _r43_refresh_front_snapshot('r63-redis-seed')
-        ok,detail,meta=_gzip_cache_db_v267()
-        if not ok:
-            raise RuntimeError(detail)
-        rok,rdetail=redis_store_snapshot(CACHE_LATEST,meta,clear_deltas=True)
-        print(f'[R63 REDIS SEED] ok={rok} {rdetail}',flush=True)
-    except Exception as exc:
-        print(f'[R63 REDIS SEED] error={type(exc).__name__}: {str(exc)[:240]}',flush=True)
+    """OCH12 compatibility entry: never seed a full Redis snapshot."""
+    return _och12_drop_legacy_redis_full_images()
 
 _R48_WORKERS_STARTED=False
 _R48_WORKERS_START_LOCK=threading.Lock()
 
 def _start_final_workers():
-    """Start queues only after final R43 file/Google owners exist."""
+    """Start final workers. OCH12 keeps Redis optional/cache-only."""
     global _R48_WORKERS_STARTED
     with _R48_WORKERS_START_LOCK:
-        if _R48_WORKERS_STARTED:
-            return
+        if _R48_WORKERS_STARTED: return
         _R48_WORKERS_STARTED=True
     if _R43_DIRECT_HEAVY:
         threading.Thread(target=file_loop,name='per-r48-worker-files-1',daemon=True).start()
@@ -4720,44 +4638,43 @@ def _start_final_workers():
         threading.Thread(target=_r35_result_loop,name='per-r48-result-2',daemon=True).start()
         threading.Thread(target=google_loop,name='per-r48-worker-google',daemon=True).start()
         threading.Thread(target=peer_loop,name='per-r48-worker-peer',daemon=True).start()
+        threading.Thread(target=_capsule_mega_loop_r20,name='och12-capsule-mega',daemon=True).start()
+        threading.Thread(target=_event_redis_flush_loop_v270,name='och12-event-redis-cache',daemon=True).start()
+        threading.Thread(target=_event_reconcile_loop_v268,name='och12-event-reconcile',daemon=True).start()
+        threading.Thread(target=_och12_state_mega_loop,name='och12-state-mega',daemon=True).start()
+        threading.Thread(target=_checkpoint_loop_v267,name='och12-heavy-checkpoint',daemon=True).start()
+        # Legacy migration only: use an old Redis full image once if present, then retire
+        # those large keys. OCH12 never seeds/writes a new Redis full SQLite image.
         if _redis_client() is not None:
             try:
-                rok,rdetail=redis_load_snapshot_to_cache()
-                print(f'[R63 REDIS BOOT] snapshot ok={rok} {rdetail}',flush=True)
+                rok,rdetail=redis_load_snapshot_to_cache(); print(f'[OCH12 REDIS LEGACY BOOT] snapshot ok={rok} {rdetail}',flush=True)
                 if rok:
-                    eok,edetail=_r32_replay_state_events_from_redis(limit=50000)
-                    print(f'[R63 REDIS BOOT] events ok={eok} {edetail}',flush=True)
+                    eok,edetail=_r32_replay_state_events_from_redis(limit=5000); print(f'[OCH12 REDIS LEGACY BOOT] events ok={eok} {edetail}',flush=True)
+                _och12_drop_legacy_redis_full_images()
             except Exception as exc:
-                print(f'[R63 REDIS BOOT] error={type(exc).__name__}: {str(exc)[:220]}',flush=True)
-            threading.Thread(target=_r63_seed_shared_redis_from_front,name='r63-redis-seed',daemon=True).start()
-            threading.Thread(target=_checkpoint_loop_v267,name='r63-redis-checkpoint',daemon=True).start()
-            if mega_enabled():
-                threading.Thread(target=_r32_mega_event_loop,name='r63-redis-mega-archive',daemon=True).start()
-        print('[R63 HEAVY] direct FAST compute + shared Redis mirror/recovery',flush=True)
+                print(f'[OCH12 REDIS LEGACY BOOT] error={type(exc).__name__}: {str(exc)[:220]}',flush=True)
+        # Bootstrap HEAVY from FAST only when no local baseline survived/migrated.
+        if not CACHE_DB.exists():
+            threading.Thread(target=_r43_bootstrap_snapshot_loop,name='och12-heavy-bootstrap',daemon=True).start()
+        print('[OCH12 HEAVY] HEAVY ACK + local SQLite/MEGA authority; Redis bounded optional cache',flush=True)
         return
 
-    # Legacy non-direct mode is kept only for explicit emergency configuration.
+    # Legacy non-direct emergency mode.
     threading.Thread(target=file_loop,name='per-r48-worker-files-1',daemon=True).start()
     threading.Thread(target=file_loop,name='per-r48-worker-files-2',daemon=True).start()
-    for idx in range(1,5):
-        threading.Thread(target=_r35_result_loop,name=f'per-r48-result-{idx}',daemon=True).start()
+    for idx in range(1,5): threading.Thread(target=_r35_result_loop,name=f'per-r48-result-{idx}',daemon=True).start()
     threading.Thread(target=_capsule_mega_loop_r20,name='vys262-worker-capsule-mega-r20',daemon=True).start()
     threading.Thread(target=_event_redis_flush_loop_v270,name='vys262-worker-event-redis-r15',daemon=True).start()
-    threading.Thread(target=_r32_mega_event_loop,name='per-r32-mega-events',daemon=True).start()
+    threading.Thread(target=_och12_state_mega_loop,name='och12-state-mega',daemon=True).start()
     threading.Thread(target=worker_loop,name='vys262-worker-jobs',daemon=True).start()
     threading.Thread(target=google_loop,name='per-r48-worker-google',daemon=True).start()
     threading.Thread(target=peer_loop,name='per-r48-worker-peer',daemon=True).start()
-    try:
-        _r6_redis_ok, _r6_redis_detail = redis_load_snapshot_to_cache()
-        print(f'[R6 RESTORE CACHE] redis ok={_r6_redis_ok} {_r6_redis_detail}', flush=True)
-    except Exception as _r6_exc:
-        print(f'[R6 RESTORE CACHE] redis error={type(_r6_exc).__name__}: {str(_r6_exc)[:180]}', flush=True)
     threading.Thread(target=_r35_recover_loop,name='per-r36-job-recovery',daemon=True).start()
     threading.Thread(target=_r38_google_recover_loop,name='per-r38-google-recovery',daemon=True).start()
     threading.Thread(target=_restore_refresh_background,name='vys262-worker-mega-warmup',daemon=True).start()
     threading.Thread(target=_checkpoint_loop_v267,name='vys262-worker-checkpoint-r13',daemon=True).start()
-    threading.Thread(target=_event_reconcile_loop_v268,name='vys262-worker-events-r13',daemon=True).start()
-    threading.Thread(target=_reconcile_hash_loop_v268,name='vys262-worker-reconcile-r13',daemon=True).start()
+    threading.Thread(target=_event_reconcile_loop_v268,name='vys262-worker-reconcile-r13',daemon=True).start()
+    threading.Thread(target=_reconcile_hash_loop_v268,name='vys262-worker-reconcile-r13-hash',daemon=True).start()
 
 # R43 file admission accepts only current FAST jobs for the direct protocol.
 def internal_export_file_r43():

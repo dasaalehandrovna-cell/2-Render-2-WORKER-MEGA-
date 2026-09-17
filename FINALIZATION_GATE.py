@@ -14,6 +14,10 @@ def ok(name, cond, detail=''):
 def text(name): return (ROOT/name).read_text(encoding='utf-8',errors='replace')
 def count(pattern,s,flags=0): return len(re.findall(pattern,s,flags))
 
+def _fn_source(src,name):
+    m=re.search(rf'(?ms)^def {re.escape(name)}\([^\n]*\):\n.*?(?=^def |^@app\.route|^# ---|^# ---------------------------------------------------------------------------|\Z)',src)
+    return m.group(0) if m else ''
+
 def compile_all():
     bad=[]
     for p in ROOT.rglob('*.py'):
@@ -203,17 +207,29 @@ elif ROLE=='heavy':
     ok('r59_render_env_snapshot',
        'def render_env_snapshot' in text('runtime_config.py'),
        'HEAVY must preserve raw Render ENV for diagnostics')
-    ok('r56_state_events_respect_mega_master_switch',
-       'def _r33_archive_events_direct' in s and "if mega_enabled():" in s and
-       "durable='mega-direct'" in s and "durable='local-only-redis-mega-disabled'" in s and
-       "MEGA event durability unavailable" in s,
-       'HEAVY must use MEGA durability only when enabled and local-only mode when both remote stores are disabled')
-    ok('r63_shared_redis_state_durability',
-       'redis_active = _redis_client() is not None' in s and '_r32_redis_store_events(events)' in s and
-       "durable='redis'" in s and '_R32_MEGA_WAKE.set()' in s and
-       'def _r63_seed_shared_redis_from_front' in s and 'redis_load_snapshot_to_cache()' in s and
-       '_r32_replay_state_events_from_redis(limit=50000)' in s and 'r63-redis-checkpoint' in s,
-       'direct HEAVY must keep shared Redis full snapshot + logical state-event tail durable and recoverable')
+    process_events_src=_fn_source(s,'_r34_process_state_event_wire')
+    redis_events_src=_fn_source(s,'_r32_redis_store_events')
+    full_cp_src=_fn_source(s,'_full_checkpoint_v267')
+    capsule_store_src=_fn_source(s,'_capsule_store_r20')
+    ok('och12_heavy_sqlite_is_required_event_witness',
+       process_events_src.find('_event_local_upsert_v268(row)') < process_events_src.find('_r32_apply_events(events)') and
+       "'durable':'heavy-sqlite'" in process_events_src and 'Redis state durability unavailable' not in process_events_src,
+       'HEAVY FULL-synchronous local event journal must acknowledge receipt independently of Redis')
+    ok('och12_redis_is_bounded_optional_cache',
+       "WORKER_R32_EVENT_RETENTION_SEC',86400" in redis_events_src and "WORKER_R32_REDIS_EVENT_MAX_ITEMS',2000" in redis_events_src and
+       'pipe.zrem(_r32_index_key(),*ids)' in redis_events_src and 'Redis cache stored' in redis_events_src,
+       'HEAVY Redis event mirror must be TTL/count bounded and optional')
+    ok('och12_full_checkpoint_owned_by_heavy_mega',
+       'redis_store_snapshot(' not in full_cp_src and 'mega_promote_snapshot(CACHE_LATEST)' in full_cp_src and 'redis_full_snapshot=disabled-och12' in full_cp_src,
+       'full checkpoints must be generated on HEAVY and remotely persisted to MEGA, not Redis full images')
+    ok('och12_legacy_redis_full_image_cleanup',
+       'def _och12_drop_legacy_redis_full_images' in s and 'client.delete(_REDIS_SNAPSHOT_KEY,_REDIS_META_KEY,_REDIS_DELTA_KEY,_REDIS_DELTA_META_KEY)' in s and
+       '_och12_drop_legacy_redis_full_images()' in s,
+       'after a safe HEAVY boot/migration, old large Redis full-image keys must be retired to reclaim memory')
+    ok('och12_capsule_local_mega_redis_optional',
+       'tmp=CAPSULE_LOCAL.with_suffix' in capsule_store_src and '_capsule_mega_enqueue_r20()' in capsule_store_src and
+       'redis_cache=' in capsule_store_src,
+       'capsule durability must be HEAVY-local + MEGA queued; Redis may only cache it')
     ok('r49_snapshot_sync_promote',
        "X-Snapshot-Promote-Mode" in s and 'mega_promote_snapshot(incoming)' in s and "'mega_promoted':True" in s,
        'exact snapshot sync promotion contract missing')
